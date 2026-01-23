@@ -11,6 +11,7 @@ type Config struct {
 	Port        int    `env:"PORT" default:"7601"`
 	RootDir     string `env:"ROOT_DIR" default:""`
 	RootDirName string `default:".cachydb"`
+	DBName      string `env:"DB_NAME" default:"main"`
 }
 
 var cfg Config
