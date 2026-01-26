@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"context"
+
 	"github.com/hop-/cachydb/internal/app"
 	"github.com/hop-/cachydb/internal/config"
 	"github.com/spf13/cobra"
@@ -42,7 +44,8 @@ func executeApp() {
 		return
 	}
 
-	err = application.Start()
+	ctx := context.Background()
+	err = application.Start(ctx)
 	if err != nil {
 		// TODO: handle error appropriately
 		return

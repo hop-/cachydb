@@ -9,9 +9,9 @@ import (
 
 var (
 	rootCmd = &cobra.Command{
-		Use:   "gotchat",
-		Short: "A simple chat application",
-		Long:  `A simple terminal based chat application built with Go.`,
+		Use:   "cachydb",
+		Short: "A lightweight document-based database with MCP support",
+		Long:  `CachyDB is a lightweight document-based database similar to MongoDB, with Model Context Protocol (MCP) support for AI integration.`,
 		Run: func(cmd *cobra.Command, args []string) {
 			executeApp()
 		},

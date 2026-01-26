@@ -5,3 +5,11 @@ build
 bin
 cachydb
 .cachydb
+
+# Example binaries - ignore everything except .go and .md files
+examples/*
+!examples/*.md
+!examples/*/
+examples/*/*
+!examples/*/*.go
+!examples/*/*.md
