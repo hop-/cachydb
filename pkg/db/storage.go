@@ -185,6 +185,48 @@ func (sm *StorageManager) DeleteDatabase(dbName string) error {
 	return os.RemoveAll(dbDir)
 }
 
+// LoadAllDatabases loads all databases from disk into a DatabaseManager
+func (sm *StorageManager) LoadAllDatabases() (*DatabaseManager, error) {
+	dm := NewDatabaseManager()
+
+	// Create root dir if it doesn't exist
+	if err := os.MkdirAll(sm.RootDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create root directory: %w", err)
+	}
+
+	// Read all subdirectories (each is a database)
+	entries, err := os.ReadDir(sm.RootDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read root directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			db, err := sm.LoadDatabase(entry.Name())
+			if err != nil {
+				return nil, fmt.Errorf("failed to load database '%s': %w", entry.Name(), err)
+			}
+			dm.Databases[db.Name] = db
+		}
+	}
+
+	return dm, nil
+}
+
+// SaveAllDatabases saves all databases from a DatabaseManager
+func (sm *StorageManager) SaveAllDatabases(dm *DatabaseManager) error {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	for _, db := range dm.Databases {
+		if err := sm.SaveDatabase(db); err != nil {
+			return fmt.Errorf("failed to save database '%s': %w", db.Name, err)
+		}
+	}
+
+	return nil
+}
+
 // Helper functions
 func (sm *StorageManager) writeJSON(path string, data any) error {
 	file, err := os.Create(path)

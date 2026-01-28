@@ -5,6 +5,7 @@ A lightweight document-based database with Model Context Protocol (MCP) support,
 ## Features
 
 - **Document-based storage**: Store JSON-like documents in collections
+- **Multiple databases**: Create and manage multiple databases within a single instance
 - **Schema validation**: Define and enforce schemas for your collections
 - **Indexing**: Automatic ID indexing plus custom hash-based indexes on any field
 - **Query operations**: Find documents with filters (eq, ne, gt, lt, gte, lte, in)
@@ -13,8 +14,9 @@ A lightweight document-based database with Model Context Protocol (MCP) support,
 
 ## Database Structure
 
-- **Database**: Single database per instance
-- **Collections**: Multiple collections within the database
+- **Database Manager**: Manages multiple databases
+- **Databases**: Multiple isolated databases within the instance
+- **Collections**: Multiple collections within each database
 - **Documents**: JSON-like documents with automatic `_id` field
 - **Schemas**: Optional field definitions with type validation
 - **Indexes**: Hash-based indexes (automatic on `_id`, custom on any field)
@@ -74,12 +76,45 @@ Add to your MCP settings (e.g., Claude Desktop config):
 
 ## MCP Tools
 
-### create_collection
+### Database Management
+
+#### create_database
+
+Create a new database.
+
+```json
+{
+  "name": "users_db"
+}
+```
+
+#### list_databases
+
+List all databases.
+
+```json
+{}
+```
+
+#### delete_database
+
+Delete a database.
+
+```json
+{
+  "name": "old_db"
+}
+```
+
+### Collection Management
+
+#### create_collection
 
 Create a new collection with optional schema.
 
 ```json
 {
+  "database": "users_db",
   "name": "users",
   "schema": {
     "fields": {
@@ -100,14 +135,29 @@ Create a new collection with optional schema.
 }
 ```
 
+**Note**: `database` parameter is optional and defaults to the configured `DB_NAME`.
+
 **Field Types**: `string`, `number`, `boolean`, `object`, `array`, `date`
 
-### insert_document
+#### list_collections
+
+List all collections in a database.
+
+```json
+{
+  "database": "users_db"
+}
+```
+
+### Document Management
+
+#### insert_document
 
 Insert a document into a collection.
 
 ```json
 {
+  "database": "users_db",
   "collection": "users",
   "document": {
     "name": "John Doe",
@@ -119,12 +169,13 @@ Insert a document into a collection.
 
 If `_id` is not provided, it will be auto-generated.
 
-### find_documents
+#### find_documents
 
 Query documents in a collection.
 
 ```json
 {
+  "database": "users_db",
   "collection": "users",
   "query": {
     "filters": [
@@ -142,12 +193,13 @@ Query documents in a collection.
 
 **Operators**: `eq`, `ne`, `gt`, `lt`, `gte`, `lte`, `in`
 
-### update_document
+#### update_document
 
 Update a document by ID.
 
 ```json
 {
+  "database": "users_db",
   "collection": "users",
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "updates": {
@@ -157,35 +209,31 @@ Update a document by ID.
 }
 ```
 
-### delete_document
+#### delete_document
 
 Delete a document by ID.
 
 ```json
 {
+  "database": "users_db",
   "collection": "users",
   "id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
-### create_index
+### Index Management
+
+#### create_index
 
 Create an index on a collection field for faster queries.
 
 ```json
 {
+  "database": "users_db",
   "collection": "users",
   "index_name": "email_idx",
   "field_name": "email"
 }
-```
-
-### list_collections
-
-List all collections in the database.
-
-```json
-{}
 ```
 
 ## Architecture
@@ -197,14 +245,18 @@ cachydb/
 │   ├── app/               # Application setup
 │   ├── cmd/               # CLI commands
 │   ├── config/            # Configuration
-│   ├── db/                # Database core
-│   │   ├── types.go       # Core data structures
-│   │   ├── schema.go      # Schema validation
-│   │   ├── index.go       # Indexing system
-│   │   ├── query.go       # Query engine
-│   │   └── storage.go     # File persistence
 │   └── mcp/               # MCP server
-│       └── server.go      # JSON-RPC handler
+│       └── server.go      # MCP tool handlers
+├── pkg/
+│   └── db/                # Public database API
+│       ├── types.go       # Core data structures (DatabaseManager, Database, Collection)
+│       ├── schema.go      # Schema validation
+│       ├── index.go       # Hash indexing system
+│       ├── query.go       # Query engine (CRUD operations)
+│       └── storage.go     # File-based persistence
+└── examples/
+    ├── basic/             # Direct library usage example
+    └── mcp-client/        # MCP client example
 ```
 
 ## Storage Format

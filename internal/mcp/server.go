@@ -10,32 +10,34 @@ import (
 
 // Server represents the MCP server state
 type Server struct {
-	database *db.Database
-	storage  *db.StorageManager
-	server   *mcp.Server
+	dbManager     *db.DatabaseManager
+	storage       *db.StorageManager
+	server        *mcp.Server
+	defaultDBName string
 }
 
 // NewServer creates a new MCP server
-func NewServer(dbName, rootDir string) (*Server, error) {
+func NewServer(defaultDBName, rootDir string) (*Server, error) {
 	storage := db.NewStorageManager(rootDir)
 
-	var database *db.Database
-	if storage.DatabaseExists(dbName) {
-		loadedDB, err := storage.LoadDatabase(dbName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load database: %w", err)
-		}
-		database = loadedDB
-	} else {
-		database = db.NewDatabase(dbName)
-		if err := storage.SaveDatabase(database); err != nil {
-			return nil, fmt.Errorf("failed to create database: %w", err)
+	// Load all existing databases
+	dbManager, err := storage.LoadAllDatabases()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load databases: %w", err)
+	}
+
+	// Ensure default database exists
+	if dbManager.GetDatabase(defaultDBName) == nil {
+		db := dbManager.CreateDatabase(defaultDBName)
+		if err := storage.SaveDatabase(db); err != nil {
+			return nil, fmt.Errorf("failed to create default database: %w", err)
 		}
 	}
 
 	s := &Server{
-		database: database,
-		storage:  storage,
+		dbManager:     dbManager,
+		storage:       storage,
+		defaultDBName: defaultDBName,
 	}
 
 	// Create MCP server with implementation info
@@ -58,11 +60,34 @@ func (s *Server) Start(ctx context.Context) error {
 
 // registerTools registers all MCP tools
 func (s *Server) registerTools(server *mcp.Server) {
+	// Database management tools
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "create_database",
+		Description: "Create a new database",
+	}, s.createDatabaseTool)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "list_databases",
+		Description: "List all databases",
+	}, s.listDatabasesTool)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "delete_database",
+		Description: "Delete a database",
+	}, s.deleteDatabaseTool)
+
+	// Collection management tools
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "create_collection",
 		Description: "Create a new collection with optional schema",
 	}, s.createCollectionTool)
 
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "list_collections",
+		Description: "List all collections in a database",
+	}, s.listCollectionsTool)
+
+	// Document management tools
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "insert_document",
 		Description: "Insert a document into a collection",
@@ -83,58 +108,148 @@ func (s *Server) registerTools(server *mcp.Server) {
 		Description: "Delete a document by ID",
 	}, s.deleteDocumentTool)
 
+	// Index management tools
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "create_index",
 		Description: "Create an index on a collection field",
 	}, s.createIndexTool)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "list_collections",
-		Description: "List all collections in the database",
-	}, s.listCollectionsTool)
 }
 
 // Tool input/output types
+
+// Database management inputs
+type CreateDatabaseInput struct {
+	Name string `json:"name" jsonschema:"Name of the database"`
+}
+
+type ListDatabasesInput struct{}
+
+type DeleteDatabaseInput struct {
+	Name string `json:"name" jsonschema:"Name of the database to delete"`
+}
+
+// Collection management inputs
 type CreateCollectionInput struct {
-	Name   string                 `json:"name" jsonschema:"Name of the collection"`
-	Schema map[string]interface{} `json:"schema,omitempty" jsonschema:"Optional schema definition with fields"`
+	Database string                 `json:"database,omitempty" jsonschema:"Database name (optional, defaults to configured database)"`
+	Name     string                 `json:"name" jsonschema:"Name of the collection"`
+	Schema   map[string]interface{} `json:"schema,omitempty" jsonschema:"Optional schema definition with fields"`
 }
 
 type InsertDocumentInput struct {
+	Database   string                 `json:"database,omitempty" jsonschema:"Database name (optional, defaults to configured database)"`
 	Collection string                 `json:"collection" jsonschema:"Name of the collection"`
 	Document   map[string]interface{} `json:"document" jsonschema:"Document data to insert"`
 }
 
 type FindDocumentsInput struct {
+	Database   string                 `json:"database,omitempty" jsonschema:"Database name (optional, defaults to configured database)"`
 	Collection string                 `json:"collection" jsonschema:"Name of the collection"`
 	Query      map[string]interface{} `json:"query,omitempty" jsonschema:"Query filters, limit, and skip"`
 }
 
 type UpdateDocumentInput struct {
+	Database   string                 `json:"database,omitempty" jsonschema:"Database name (optional, defaults to configured database)"`
 	Collection string                 `json:"collection" jsonschema:"Name of the collection"`
 	ID         string                 `json:"id" jsonschema:"Document ID"`
 	Updates    map[string]interface{} `json:"updates" jsonschema:"Fields to update"`
 }
 
 type DeleteDocumentInput struct {
+	Database   string `json:"database,omitempty" jsonschema:"Database name (optional, defaults to configured database)"`
 	Collection string `json:"collection" jsonschema:"Name of the collection"`
 	ID         string `json:"id" jsonschema:"Document ID"`
 }
 
 type CreateIndexInput struct {
+	Database   string `json:"database,omitempty" jsonschema:"Database name (optional, defaults to configured database)"`
 	Collection string `json:"collection" jsonschema:"Name of the collection"`
 	IndexName  string `json:"index_name" jsonschema:"Name for the index"`
 	FieldName  string `json:"field_name" jsonschema:"Field to index"`
 }
 
-type ListCollectionsInput struct{}
+type ListCollectionsInput struct {
+	Database string `json:"database,omitempty" jsonschema:"Database name (optional, defaults to configured database)"`
+}
+
+// Helper methods
+
+// getDatabase retrieves the database by name, using default if not specified
+func (s *Server) getDatabase(dbName string) (*db.Database, error) {
+	if dbName == "" {
+		dbName = s.defaultDBName
+	}
+
+	database := s.dbManager.GetDatabase(dbName)
+	if database == nil {
+		return nil, fmt.Errorf("database '%s' not found", dbName)
+	}
+
+	return database, nil
+}
 
 // Tool handlers
+
+// Database management handlers
+func (s *Server) createDatabaseTool(
+	ctx context.Context,
+	req *mcp.CallToolRequest,
+	input CreateDatabaseInput,
+) (*mcp.CallToolResult, map[string]interface{}, error) {
+	database := s.dbManager.CreateDatabase(input.Name)
+
+	if err := s.storage.SaveDatabase(database); err != nil {
+		return nil, nil, fmt.Errorf("failed to save database: %w", err)
+	}
+
+	return nil, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("Database '%s' created successfully", input.Name),
+	}, nil
+}
+
+func (s *Server) listDatabasesTool(
+	ctx context.Context,
+	req *mcp.CallToolRequest,
+	input ListDatabasesInput,
+) (*mcp.CallToolResult, map[string]interface{}, error) {
+	databases := s.dbManager.ListDatabases()
+
+	return nil, map[string]interface{}{
+		"success":   true,
+		"databases": databases,
+	}, nil
+}
+
+func (s *Server) deleteDatabaseTool(
+	ctx context.Context,
+	req *mcp.CallToolRequest,
+	input DeleteDatabaseInput,
+) (*mcp.CallToolResult, map[string]interface{}, error) {
+	if !s.dbManager.DeleteDatabase(input.Name) {
+		return nil, nil, fmt.Errorf("database '%s' not found", input.Name)
+	}
+
+	if err := s.storage.DeleteDatabase(input.Name); err != nil {
+		return nil, nil, fmt.Errorf("failed to delete database from disk: %w", err)
+	}
+
+	return nil, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("Database '%s' deleted successfully", input.Name),
+	}, nil
+}
+
+// Collection management handlers
 func (s *Server) createCollectionTool(
 	ctx context.Context,
 	req *mcp.CallToolRequest,
 	input CreateCollectionInput,
 ) (*mcp.CallToolResult, map[string]interface{}, error) {
+	database, err := s.getDatabase(input.Database)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	var schema *db.Schema
 	if input.Schema != nil {
 		schema = &db.Schema{
@@ -156,26 +271,51 @@ func (s *Server) createCollectionTool(
 		}
 	}
 
-	if err := s.database.CreateCollection(input.Name, schema); err != nil {
+	if err := database.CreateCollection(input.Name, schema); err != nil {
 		return nil, nil, err
 	}
 
-	if err := s.storage.SaveDatabase(s.database); err != nil {
+	if err := s.storage.SaveDatabase(database); err != nil {
 		return nil, nil, err
 	}
 
 	return nil, map[string]interface{}{
 		"success": true,
-		"message": fmt.Sprintf("Collection '%s' created", input.Name),
+		"message": fmt.Sprintf("Collection '%s' created in database '%s'", input.Name, database.Name),
 	}, nil
 }
 
+func (s *Server) listCollectionsTool(
+	ctx context.Context,
+	req *mcp.CallToolRequest,
+	input ListCollectionsInput,
+) (*mcp.CallToolResult, map[string]interface{}, error) {
+	database, err := s.getDatabase(input.Database)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	collections := database.ListCollections()
+
+	return nil, map[string]interface{}{
+		"success":     true,
+		"collections": collections,
+		"database":    database.Name,
+	}, nil
+}
+
+// Document management handlers
 func (s *Server) insertDocumentTool(
 	ctx context.Context,
 	req *mcp.CallToolRequest,
 	input InsertDocumentInput,
 ) (*mcp.CallToolResult, map[string]interface{}, error) {
-	coll, err := s.database.GetCollection(input.Collection)
+	database, err := s.getDatabase(input.Database)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	coll, err := database.GetCollection(input.Collection)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -192,7 +332,7 @@ func (s *Server) insertDocumentTool(
 		return nil, nil, err
 	}
 
-	if err := s.storage.SaveCollection(s.database.Name, coll); err != nil {
+	if err := s.storage.SaveCollection(database.Name, coll); err != nil {
 		return nil, nil, err
 	}
 
@@ -208,7 +348,12 @@ func (s *Server) findDocumentsTool(
 	req *mcp.CallToolRequest,
 	input FindDocumentsInput,
 ) (*mcp.CallToolResult, map[string]interface{}, error) {
-	coll, err := s.database.GetCollection(input.Collection)
+	database, err := s.getDatabase(input.Database)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	coll, err := database.GetCollection(input.Collection)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -268,7 +413,12 @@ func (s *Server) updateDocumentTool(
 	req *mcp.CallToolRequest,
 	input UpdateDocumentInput,
 ) (*mcp.CallToolResult, map[string]interface{}, error) {
-	coll, err := s.database.GetCollection(input.Collection)
+	database, err := s.getDatabase(input.Database)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	coll, err := database.GetCollection(input.Collection)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -277,7 +427,7 @@ func (s *Server) updateDocumentTool(
 		return nil, nil, err
 	}
 
-	if err := s.storage.SaveCollection(s.database.Name, coll); err != nil {
+	if err := s.storage.SaveCollection(database.Name, coll); err != nil {
 		return nil, nil, err
 	}
 
@@ -292,7 +442,12 @@ func (s *Server) deleteDocumentTool(
 	req *mcp.CallToolRequest,
 	input DeleteDocumentInput,
 ) (*mcp.CallToolResult, map[string]interface{}, error) {
-	coll, err := s.database.GetCollection(input.Collection)
+	database, err := s.getDatabase(input.Database)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	coll, err := database.GetCollection(input.Collection)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -301,7 +456,7 @@ func (s *Server) deleteDocumentTool(
 		return nil, nil, err
 	}
 
-	if err := s.storage.SaveCollection(s.database.Name, coll); err != nil {
+	if err := s.storage.SaveCollection(database.Name, coll); err != nil {
 		return nil, nil, err
 	}
 
@@ -316,7 +471,12 @@ func (s *Server) createIndexTool(
 	req *mcp.CallToolRequest,
 	input CreateIndexInput,
 ) (*mcp.CallToolResult, map[string]interface{}, error) {
-	coll, err := s.database.GetCollection(input.Collection)
+	database, err := s.getDatabase(input.Database)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	coll, err := database.GetCollection(input.Collection)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -325,24 +485,12 @@ func (s *Server) createIndexTool(
 		return nil, nil, err
 	}
 
-	if err := s.storage.SaveCollection(s.database.Name, coll); err != nil {
+	if err := s.storage.SaveCollection(database.Name, coll); err != nil {
 		return nil, nil, err
 	}
 
 	return nil, map[string]interface{}{
 		"success": true,
 		"message": fmt.Sprintf("Index '%s' created on field '%s'", input.IndexName, input.FieldName),
-	}, nil
-}
-
-func (s *Server) listCollectionsTool(
-	ctx context.Context,
-	req *mcp.CallToolRequest,
-	input ListCollectionsInput,
-) (*mcp.CallToolResult, map[string]interface{}, error) {
-	collections := s.database.ListCollections()
-	return nil, map[string]interface{}{
-		"success":     true,
-		"collections": collections,
 	}, nil
 }

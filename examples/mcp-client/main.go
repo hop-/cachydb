@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -19,13 +21,30 @@ func main() {
 		Version: "1.0.0",
 	}, nil)
 
+	// Find the cachydb binary
+	// Try multiple locations: project root from PWD, or from executable location
+	var binPath string
+	cwd, _ := os.Getwd()
+
+	// If running from project root
+	if filepath.Base(cwd) == "cachydb" {
+		binPath = filepath.Join(cwd, "cachydb")
+	} else {
+		// If running from examples/mcp-client
+		binPath = filepath.Join(cwd, "..", "..", "cachydb")
+	}
+
+	if _, err := os.Stat(binPath); os.IsNotExist(err) {
+		log.Fatalf("Binary not found at %s\nPlease build first from project root: go build -o cachydb", binPath)
+	}
+
 	// Connect to CachyDB server
 	transport := &mcp.CommandTransport{
-		Command: exec.Command("../../cachydb"),
+		Command: exec.Command(binPath),
 	}
 	session, err := client.Connect(ctx, transport, nil)
 	if err != nil {
-		log.Fatalf("Failed to connect: %v", err)
+		log.Fatalf("Failed to connect: %v\nMake sure to build the binary first: go build -o cachydb", err)
 	}
 	defer session.Close()
 
@@ -44,12 +63,46 @@ func main() {
 	}
 	fmt.Println()
 
-	// Create a collection
-	fmt.Println("Creating 'users' collection with schema...")
+	// === Database Management ===
+
+	fmt.Println("=== Database Management ===")
+
+	// List databases
+	fmt.Println("Listing databases...")
+	listDBsResult, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "list_databases",
+		Arguments: map[string]any{},
+	})
+	if err != nil {
+		log.Fatalf("Failed to list databases: %v", err)
+	}
+	printResult(listDBsResult)
+
+	// Create a test database
+	fmt.Println("Creating 'test_db' database...")
+	createDBResult, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "create_database",
+		Arguments: map[string]any{
+			"name": "test_db",
+		},
+	})
+	if err != nil {
+		log.Fatalf("Failed to create database: %v", err)
+	}
+	printResult(createDBResult)
+
+	fmt.Println("=== Collection & Document Operations ===")
+
+	// Create a collection in the test database
+	fmt.Println("=== Collection & Document Operations ===")
+
+	// Create a collection in the test database
+	fmt.Println("Creating 'users' collection in 'test_db' with schema...")
 	createResult, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "create_collection",
 		Arguments: map[string]any{
-			"name": "users",
+			"database": "test_db",
+			"name":     "users",
 			"schema": map[string]any{
 				"fields": map[string]any{
 					"name": map[string]any{
@@ -78,6 +131,7 @@ func main() {
 	insertResult, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "insert_document",
 		Arguments: map[string]any{
+			"database":   "test_db",
 			"collection": "users",
 			"document": map[string]any{
 				"name":  "Alice Johnson",
@@ -96,6 +150,7 @@ func main() {
 	insertResult2, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "insert_document",
 		Arguments: map[string]any{
+			"database":   "test_db",
 			"collection": "users",
 			"document": map[string]any{
 				"name":  "Bob Smith",
@@ -114,6 +169,7 @@ func main() {
 	indexResult, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "create_index",
 		Arguments: map[string]any{
+			"database":   "test_db",
 			"collection": "users",
 			"index_name": "email_idx",
 			"field_name": "email",
@@ -129,6 +185,7 @@ func main() {
 	findResult, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "find_documents",
 		Arguments: map[string]any{
+			"database":   "test_db",
 			"collection": "users",
 			"query":      map[string]any{},
 		},
@@ -143,6 +200,7 @@ func main() {
 	filterResult, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "find_documents",
 		Arguments: map[string]any{
+			"database":   "test_db",
 			"collection": "users",
 			"query": map[string]any{
 				"filters": []map[string]any{
@@ -161,10 +219,12 @@ func main() {
 	printResult(filterResult)
 
 	// List collections
-	fmt.Println("Listing all collections...")
+	fmt.Println("Listing all collections in 'test_db'...")
 	listResult, err := session.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "list_collections",
-		Arguments: map[string]any{},
+		Name: "list_collections",
+		Arguments: map[string]any{
+			"database": "test_db",
+		},
 	})
 	if err != nil {
 		log.Fatalf("Failed to list collections: %v", err)

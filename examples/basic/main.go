@@ -9,9 +9,17 @@ import (
 )
 
 func main() {
-	// Create a database
-	database := db.NewDatabase("example")
+	// Create a database manager
+	dbManager := db.NewDatabaseManager()
 	storage := db.NewStorageManager("/tmp/cachydb-example")
+
+	// Create multiple databases
+	userDB := dbManager.CreateDatabase("users_db")
+	productsDB := dbManager.CreateDatabase("products_db")
+
+	fmt.Println("Created databases:", dbManager.ListDatabases())
+
+	// === Work with users database ===
 
 	// Create a schema for users collection
 	userSchema := &db.Schema{
@@ -31,14 +39,14 @@ func main() {
 		},
 	}
 
-	// Create collection with schema
-	err := database.CreateCollection("users", userSchema)
+	// Create collection with schema in users_db
+	err := userDB.CreateCollection("users", userSchema)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	// Get the collection
-	users, err := database.GetCollection("users")
+	users, err := userDB.GetCollection("users")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -137,29 +145,61 @@ func main() {
 	fmt.Println("Updated document:")
 	printDocs([]*db.Document{updatedDoc})
 
-	// Save to disk
-	err = storage.SaveDatabase(database)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("\nDatabase saved to disk")
+	// === Work with products database ===
 
-	// Load from disk
-	loadedDB, err := storage.LoadDatabase("example")
+	fmt.Println("\n=== Products Database ===")
+
+	// Create products collection without schema
+	err = productsDB.CreateCollection("products", nil)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("Database loaded from disk. Collections: %v\n", loadedDB.ListCollections())
+
+	products, err := productsDB.GetCollection("products")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Insert product documents
+	product1 := &db.Document{
+		Data: map[string]any{
+			"name":  "Laptop",
+			"price": 999.99,
+			"stock": 50,
+		},
+	}
+	err = products.Insert(product1)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Inserted product: %s\n", product1.ID)
+
+	// === Save all databases ===
+
+	err = storage.SaveAllDatabases(dbManager)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("\nAll databases saved to disk")
+
+	// Load all databases
+	loadedManager, err := storage.LoadAllDatabases()
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Databases loaded from disk: %v\n", loadedManager.ListDatabases())
 
 	// Delete a document
 	err = users.Delete(doc2.ID)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("\nDeleted document %s\n", doc2.ID)
+	fmt.Printf("\nDeleted document %s from users\n", doc2.ID)
 
-	// Final count
-	fmt.Printf("Final document count: %d\n", users.Count())
+	// Final counts
+	fmt.Printf("\nFinal counts:\n")
+	fmt.Printf("  Users DB - users collection: %d documents\n", users.Count())
+	fmt.Printf("  Products DB - products collection: %d documents\n", products.Count())
 }
 
 func printDocs(docs []*db.Document) {

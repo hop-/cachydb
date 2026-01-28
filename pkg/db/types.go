@@ -60,6 +60,12 @@ type Database struct {
 	mu          sync.RWMutex
 }
 
+// DatabaseManager manages multiple databases
+type DatabaseManager struct {
+	Databases map[string]*Database `json:"databases"`
+	mu        sync.RWMutex
+}
+
 // QueryFilter represents a query filter
 type QueryFilter struct {
 	Field    string `json:"field"`
@@ -130,6 +136,58 @@ func NewDatabase(name string) *Database {
 		Name:        name,
 		Collections: make(map[string]*Collection),
 	}
+}
+
+// NewDatabaseManager creates a new database manager
+func NewDatabaseManager() *DatabaseManager {
+	return &DatabaseManager{
+		Databases: make(map[string]*Database),
+	}
+}
+
+// GetDatabase gets a database by name, returns nil if not found
+func (dm *DatabaseManager) GetDatabase(name string) *Database {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+	return dm.Databases[name]
+}
+
+// CreateDatabase creates a new database or returns existing one
+func (dm *DatabaseManager) CreateDatabase(name string) *Database {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	if db, exists := dm.Databases[name]; exists {
+		return db
+	}
+
+	db := NewDatabase(name)
+	dm.Databases[name] = db
+	return db
+}
+
+// ListDatabases returns a list of all database names
+func (dm *DatabaseManager) ListDatabases() []string {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	names := make([]string, 0, len(dm.Databases))
+	for name := range dm.Databases {
+		names = append(names, name)
+	}
+	return names
+}
+
+// DeleteDatabase removes a database
+func (dm *DatabaseManager) DeleteDatabase(name string) bool {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	if _, exists := dm.Databases[name]; exists {
+		delete(dm.Databases, name)
+		return true
+	}
+	return false
 }
 
 // GetValue safely extracts a value from a document by field name
