@@ -72,3 +72,16 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 ## Direct Library Usage
 
 If you want to use CachyDB as a Go library (without MCP), see the [`examples/basic/`](examples/basic/) directory for a complete example.
+
+## Testing Commands
+
+```JSON
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"current_database","arguments":{}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_databases","arguments":{}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"create_database","arguments":{"name":"analytics"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"use_database","arguments":{"name":"analytics"}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"current_database","arguments":{}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"create_collection","arguments":{"name":"events"}}}
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"list_collections","arguments":{}}}
+```

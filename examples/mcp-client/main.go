@@ -67,6 +67,17 @@ func main() {
 
 	fmt.Println("=== Database Management ===")
 
+	// Check current database
+	fmt.Println("Checking current database...")
+	currentDBResult, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "current_database",
+		Arguments: map[string]any{},
+	})
+	if err != nil {
+		log.Fatalf("Failed to get current database: %v", err)
+	}
+	printResult(currentDBResult)
+
 	// List databases
 	fmt.Println("Listing databases...")
 	listDBsResult, err := session.CallTool(ctx, &mcp.CallToolParams{
@@ -91,18 +102,41 @@ func main() {
 	}
 	printResult(createDBResult)
 
+	// Switch to test_db
+	fmt.Println("Switching to 'test_db' database...")
+	useDBResult, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "use_database",
+		Arguments: map[string]any{
+			"name": "test_db",
+		},
+	})
+	if err != nil {
+		log.Fatalf("Failed to switch database: %v", err)
+	}
+	printResult(useDBResult)
+
+	// Verify current database changed
+	fmt.Println("Verifying current database...")
+	currentDBResult2, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "current_database",
+		Arguments: map[string]any{},
+	})
+	if err != nil {
+		log.Fatalf("Failed to get current database: %v", err)
+	}
+	printResult(currentDBResult2)
+
 	fmt.Println("=== Collection & Document Operations ===")
 
 	// Create a collection in the test database
 	fmt.Println("=== Collection & Document Operations ===")
 
-	// Create a collection in the test database
-	fmt.Println("Creating 'users' collection in 'test_db' with schema...")
+	// Create a collection in the test database (using current default)
+	fmt.Println("Creating 'users' collection (in current database: test_db)...")
 	createResult, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "create_collection",
 		Arguments: map[string]any{
-			"database": "test_db",
-			"name":     "users",
+			"name": "users",
 			"schema": map[string]any{
 				"fields": map[string]any{
 					"name": map[string]any{
@@ -131,7 +165,6 @@ func main() {
 	insertResult, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "insert_document",
 		Arguments: map[string]any{
-			"database":   "test_db",
 			"collection": "users",
 			"document": map[string]any{
 				"name":  "Alice Johnson",
@@ -150,7 +183,6 @@ func main() {
 	insertResult2, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "insert_document",
 		Arguments: map[string]any{
-			"database":   "test_db",
 			"collection": "users",
 			"document": map[string]any{
 				"name":  "Bob Smith",
@@ -169,7 +201,6 @@ func main() {
 	indexResult, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "create_index",
 		Arguments: map[string]any{
-			"database":   "test_db",
 			"collection": "users",
 			"index_name": "email_idx",
 			"field_name": "email",
@@ -185,7 +216,6 @@ func main() {
 	findResult, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "find_documents",
 		Arguments: map[string]any{
-			"database":   "test_db",
 			"collection": "users",
 			"query":      map[string]any{},
 		},
@@ -200,7 +230,6 @@ func main() {
 	filterResult, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "find_documents",
 		Arguments: map[string]any{
-			"database":   "test_db",
 			"collection": "users",
 			"query": map[string]any{
 				"filters": []map[string]any{
@@ -219,12 +248,10 @@ func main() {
 	printResult(filterResult)
 
 	// List collections
-	fmt.Println("Listing all collections in 'test_db'...")
+	fmt.Println("Listing all collections in current database...")
 	listResult, err := session.CallTool(ctx, &mcp.CallToolParams{
-		Name: "list_collections",
-		Arguments: map[string]any{
-			"database": "test_db",
-		},
+		Name:      "list_collections",
+		Arguments: map[string]any{},
 	})
 	if err != nil {
 		log.Fatalf("Failed to list collections: %v", err)

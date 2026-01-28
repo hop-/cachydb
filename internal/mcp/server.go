@@ -76,6 +76,16 @@ func (s *Server) registerTools(server *mcp.Server) {
 		Description: "Delete a database",
 	}, s.deleteDatabaseTool)
 
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "use_database",
+		Description: "Switch default database for subsequent operations",
+	}, s.useDatabaseTool)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "current_database",
+		Description: "Get the current default database name",
+	}, s.currentDatabaseTool)
+
 	// Collection management tools
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "create_collection",
@@ -127,6 +137,12 @@ type ListDatabasesInput struct{}
 type DeleteDatabaseInput struct {
 	Name string `json:"name" jsonschema:"Name of the database to delete"`
 }
+
+type UseDatabaseInput struct {
+	Name string `json:"name" jsonschema:"Name of the database to use as default"`
+}
+
+type CurrentDatabaseInput struct{}
 
 // Collection management inputs
 type CreateCollectionInput struct {
@@ -236,6 +252,38 @@ func (s *Server) deleteDatabaseTool(
 	return nil, map[string]interface{}{
 		"success": true,
 		"message": fmt.Sprintf("Database '%s' deleted successfully", input.Name),
+	}, nil
+}
+
+func (s *Server) useDatabaseTool(
+	ctx context.Context,
+	req *mcp.CallToolRequest,
+	input UseDatabaseInput,
+) (*mcp.CallToolResult, map[string]interface{}, error) {
+	// Check if database exists
+	database := s.dbManager.GetDatabase(input.Name)
+	if database == nil {
+		return nil, nil, fmt.Errorf("database '%s' not found", input.Name)
+	}
+
+	// Update default database
+	s.defaultDBName = input.Name
+
+	return nil, map[string]interface{}{
+		"success":          true,
+		"message":          fmt.Sprintf("Now using database '%s' as default", input.Name),
+		"current_database": input.Name,
+	}, nil
+}
+
+func (s *Server) currentDatabaseTool(
+	ctx context.Context,
+	req *mcp.CallToolRequest,
+	input CurrentDatabaseInput,
+) (*mcp.CallToolResult, map[string]interface{}, error) {
+	return nil, map[string]interface{}{
+		"success":          true,
+		"current_database": s.defaultDBName,
 	}, nil
 }
 

@@ -106,6 +106,35 @@ Delete a database.
 }
 ```
 
+#### use_database
+
+Switch the default database for subsequent operations. All operations without an explicit `database` parameter will use this database.
+
+```json
+{
+  "name": "users_db"
+}
+```
+
+#### current_database
+
+Get the current default database name.
+
+```json
+{}
+```
+
+**Example workflow:**
+
+```json
+{"name": "create_database", "arguments": {"name": "analytics"}}
+{"name": "current_database", "arguments": {}}  // Returns: "main"
+{"name": "use_database", "arguments": {"name": "analytics"}}
+{"name": "current_database", "arguments": {}}  // Returns: "analytics"
+{"name": "create_collection", "arguments": {"name": "events"}}
+// Collection created in "analytics" database
+```
+
 ### Collection Management
 
 #### create_collection
