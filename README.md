@@ -10,7 +10,9 @@ A lightweight document-based database with Model Context Protocol (MCP) support,
 - **Indexing**: Automatic ID indexing plus custom hash-based indexes on any field
 - **Query operations**: Find documents with filters (eq, ne, gt, lt, gte, lte, in)
 - **MCP integration**: Built-in MCP server for seamless AI assistant integration
-- **File-based persistence**: Simple file storage for reliability
+- **Binary storage**: High-performance binary format with gzip compression
+- **Write-Ahead Log (WAL)**: Crash recovery and durability guarantees
+- **Persisted indexes**: Fast startup with indexes saved to disk
 
 ## Database Structure
 
@@ -272,7 +274,7 @@ cachydb/
 ├── main.go                 # Entry point
 ├── internal/
 │   ├── app/               # Application setup
-│   ├── cmd/               # CLI commands
+│   ├── cmd/               # CLI commands (including migrate)
 │   ├── config/            # Configuration
 │   └── mcp/               # MCP server
 │       └── server.go      # MCP tool handlers
@@ -280,29 +282,129 @@ cachydb/
 │   └── db/                # Public database API
 │       ├── types.go       # Core data structures (DatabaseManager, Database, Collection)
 │       ├── schema.go      # Schema validation
-│       ├── index.go       # Hash indexing system
+│       ├── index.go       # Hash indexing system (with persistence)
 │       ├── query.go       # Query engine (CRUD operations)
-│       └── storage.go     # File-based persistence
+│       ├── storage.go     # Storage manager with WAL integration
+│       ├── binary_storage.go  # Binary format reader/writer
+│       ├── wal.go         # Write-Ahead Log implementation
+│       ├── compression.go # Gzip compression utilities
+│       └── migration.go   # JSON to binary migration tool
 └── examples/
     ├── basic/             # Direct library usage example
     └── mcp-client/        # MCP client example
 ```
 
-## Storage Format
+## Storage Architecture
+
+CachyDB uses a modern storage architecture designed for performance, durability, and reliability:
+
+### Write-Ahead Log (WAL)
+
+- **Crash recovery**: All write operations are logged before being applied
+- **Batch writes**: Operations are batched for performance (100 entries or 100ms)
+- **Rotation**: WAL files rotate at 64MB to keep file sizes manageable
+- **Retention**: Last 2 WAL files are kept for recovery
+- **Checkpointing**: Periodic checkpoints mark successfully persisted data
+
+### Binary Storage Format
+
+- **Compression**: All documents are compressed using gzip
+- **Offset index**: Fast document lookups using in-memory offset index
+- **Checksums**: CRC32 checksums verify data integrity
+- **File structure**:
+  - `collection.data`: Binary file with compressed documents
+  - `collection.idx`: Offset index mapping document IDs to file offsets
+  - Header: Magic number, version, flags
+
+### Persisted Indexes
+
+- Indexes are saved to disk and loaded on startup
+- No need to rebuild indexes from documents
+- Faster database initialization
+
+### Storage Format
 
 Data is stored in `~/.cachydb/` (or custom `ROOT_DIR`):
 
 ```none
 .cachydb/
+├── wal-0000000001.bin        # WAL file (current)
+├── wal-0000000002.bin        # WAL file (previous)
+├── wal.checkpoint            # Checkpoint tracking
 └── main/                      # Database name
     ├── db.meta.json          # Database metadata
-    ├── users/                # Collection
+    ├── users/                # Collection (binary format)
+    │   ├── collection.meta.json  # Schema & storage format
+    │   ├── collection.data   # Binary document storage (compressed)
+    │   ├── collection.idx    # Offset index
+    │   └── indexes/          # Persisted indexes
+    │       ├── _id.json      # ID index
+    │       └── email_idx.json  # Custom index
+    └── posts/                # Another collection
+        ├── collection.meta.json
+        ├── collection.data
+        ├── collection.idx
+        └── indexes/
+            └── _id.json
+```
+
+## Migration from JSON to Binary
+
+If you have existing databases in JSON format, you can migrate them to the new binary format:
+
+### Migrate a Single Database
+
+```bash
+./cachydb migrate --database mydb
+```
+
+This will:
+1. Create a backup (`.backup` directory)
+2. Load data from JSON format
+3. Save to binary format with compression
+4. Verify the migration was successful
+
+### Migrate All Databases
+
+```bash
+./cachydb migrate --all
+```
+
+### Skip Backup (not recommended)
+
+```bash
+./cachydb migrate --database mydb --skip-backup
+```
+
+### Verify Migration
+
+```bash
+./cachydb migrate --database mydb --verify
+```
+
+### Restore from Backup
+
+```bash
+./cachydb migrate --database mydb --restore
+```
+
+## Storage Format
+
+Legacy data is stored in JSON format (for backward compatibility):
+
+```none
+.cachydb/
+└── main/                      # Database name
+    ├── db.meta.json          # Database metadata
+    ├── users/                # Collection (JSON format - legacy)
     │   ├── collection.meta.json  # Schema & indexes
     │   └── documents.json    # All documents
     └── posts/                # Another collection
         ├── collection.meta.json
         └── documents.json
 ```
+
+New databases automatically use the binary format.
 
 ## Examples
 

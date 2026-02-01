@@ -11,7 +11,10 @@ import (
 func main() {
 	// Create a database manager
 	dbManager := db.NewDatabaseManager()
-	storage := db.NewStorageManager("/tmp/cachydb-example")
+	storage, err := db.NewStorageManager("/tmp/cachydb-example")
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// Create multiple databases
 	userDB := dbManager.CreateDatabase("users_db")
@@ -40,7 +43,7 @@ func main() {
 	}
 
 	// Create collection with schema in users_db
-	err := userDB.CreateCollection("users", userSchema)
+	err = userDB.CreateCollection("users", userSchema)
 	if err != nil {
 		log.Fatal(err)
 	}

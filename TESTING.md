@@ -84,4 +84,7 @@ If you want to use CachyDB as a Go library (without MCP), see the [`examples/bas
 {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"current_database","arguments":{}}}
 {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"create_collection","arguments":{"name":"events"}}}
 {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"list_collections","arguments":{}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"insert_document","arguments":{"collection":"events","document":{"type":"page_view","user":"alice","timestamp":"2026-02-01T10:00:00Z"}}}}
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"insert_document","arguments":{"collection":"events","document":{"type":"click","user":"bob","timestamp":"2026-02-01T10:05:00Z"}}}}
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"find_documents","arguments":{"collection":"events","query":{}}}}
 ```
