@@ -2,7 +2,6 @@ package db
 
 import (
 	"encoding/json"
-	"sync"
 	"time"
 )
 
@@ -34,37 +33,6 @@ type Field struct {
 // Schema represents a collection schema
 type Schema struct {
 	Fields map[string]Field `json:"fields"`
-}
-
-// Index represents an index on a collection
-type Index struct {
-	Name      string            `json:"name"`
-	FieldName string            `json:"field_name"`
-	Data      map[string]string `json:"-"` // maps field value to document ID
-	mu        sync.RWMutex
-}
-
-// Collection represents a collection of documents
-type Collection struct {
-	Name      string               `json:"name"`
-	Schema    *Schema              `json:"schema,omitempty"`
-	Documents map[string]*Document `json:"-"` // maps document ID to document
-	Indexes   map[string]*Index    `json:"indexes"`
-	mu        sync.RWMutex
-}
-
-// Database represents the database
-type Database struct {
-	Name          string                 `json:"name"`
-	SchemaVersion int                    `json:"schema_version"` // Schema version for migrations
-	Collections   map[string]*Collection `json:"collections"`
-	mu            sync.RWMutex
-}
-
-// DatabaseManager manages multiple databases
-type DatabaseManager struct {
-	Databases map[string]*Database `json:"databases"`
-	mu        sync.RWMutex
 }
 
 // QueryFilter represents a query filter
@@ -105,90 +73,6 @@ func (d *Document) UnmarshalJSON(data []byte) error {
 
 	d.Data = raw
 	return nil
-}
-
-// NewIndex creates a new index
-func NewIndex(name, fieldName string) *Index {
-	return &Index{
-		Name:      name,
-		FieldName: fieldName,
-		Data:      make(map[string]string),
-	}
-}
-
-// NewCollection creates a new collection
-func NewCollection(name string, schema *Schema) *Collection {
-	coll := &Collection{
-		Name:      name,
-		Schema:    schema,
-		Documents: make(map[string]*Document),
-		Indexes:   make(map[string]*Index),
-	}
-
-	// Create automatic ID index
-	coll.Indexes["_id"] = NewIndex("_id", "_id")
-
-	return coll
-}
-
-// NewDatabase creates a new database
-func NewDatabase(name string) *Database {
-	return &Database{
-		Name:        name,
-		Collections: make(map[string]*Collection),
-	}
-}
-
-// NewDatabaseManager creates a new database manager
-func NewDatabaseManager() *DatabaseManager {
-	return &DatabaseManager{
-		Databases: make(map[string]*Database),
-	}
-}
-
-// GetDatabase gets a database by name, returns nil if not found
-func (dm *DatabaseManager) GetDatabase(name string) *Database {
-	dm.mu.RLock()
-	defer dm.mu.RUnlock()
-	return dm.Databases[name]
-}
-
-// CreateDatabase creates a new database or returns existing one
-func (dm *DatabaseManager) CreateDatabase(name string) *Database {
-	dm.mu.Lock()
-	defer dm.mu.Unlock()
-
-	if db, exists := dm.Databases[name]; exists {
-		return db
-	}
-
-	db := NewDatabase(name)
-	dm.Databases[name] = db
-	return db
-}
-
-// ListDatabases returns a list of all database names
-func (dm *DatabaseManager) ListDatabases() []string {
-	dm.mu.RLock()
-	defer dm.mu.RUnlock()
-
-	names := make([]string, 0, len(dm.Databases))
-	for name := range dm.Databases {
-		names = append(names, name)
-	}
-	return names
-}
-
-// DeleteDatabase removes a database
-func (dm *DatabaseManager) DeleteDatabase(name string) bool {
-	dm.mu.Lock()
-	defer dm.mu.Unlock()
-
-	if _, exists := dm.Databases[name]; exists {
-		delete(dm.Databases, name)
-		return true
-	}
-	return false
 }
 
 // GetValue safely extracts a value from a document by field name
