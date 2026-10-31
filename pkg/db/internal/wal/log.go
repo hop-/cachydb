@@ -5,7 +5,8 @@
 // Segments live directly in the engine root as wal-<first offset>.log, the
 // offset zero-padded to 20 digits. Open scans every segment, truncates a
 // torn tail of the newest one, and continues appending to it; damage
-// anywhere else is reported as ErrCorrupt. Formats are specified in §3 of
+// anywhere else is reported as ErrCorrupt. Processed sealed segments are
+// deleted by retention (see StartRetention). Formats are specified in §3 of
 // the storage-engine design.
 package wal
 
@@ -45,8 +46,8 @@ var (
 type Options struct {
 	Dir           string        // the engine root (WAL files live directly in it)
 	SegmentSize   int64         // rotate once the active segment reaches this size; <= 0 means DefaultSegmentSize
-	RetentionAge  time.Duration // 0 = no age limit         (task 04)
-	RetentionSize int64         // 0 = no size limit        (task 04)
+	RetentionAge  time.Duration // delete processed segments whose newest record is older; <= 0 = no age limit
+	RetentionSize int64         // delete processed segments while the WAL is larger; <= 0 = no size limit
 	Logger        *slog.Logger  // nil means slog.Default()
 }
 
@@ -69,12 +70,37 @@ type Log struct {
 	segmentSize int64
 	logger      *slog.Logger
 	syncFn      func(*os.File) error // fsync; replaced in tests for fault injection
+	now         func() time.Time     // record timestamps and retention age; replaced in tests
+
+	retentionAge  time.Duration
+	retentionSize int64
 
 	reqs chan request
 	done chan struct{} // closed when the writer goroutine has exited
 
-	mu     sync.RWMutex // guards closed and sending on / closing reqs
+	mu     sync.RWMutex // guards closed, sending on / closing reqs, and the retention start fields below
 	closed bool
+
+	// Retention goroutine (StartRetention); guarded by mu.
+	lowWater   func() uint64
+	retStarted bool
+	retStop    chan struct{} // closed by Close
+	retDone    chan struct{} // closed when the retention goroutine has exited
+	rotated    chan struct{} // buffered (1); the writer signals each rotation
+
+	// retMu serializes retention passes and guards pins and lastWarn. A
+	// pass holds it from computing the deletable set until the deletions
+	// are durable, so a reader that pinned its start offset first never
+	// loses a segment it still needs.
+	retMu    sync.Mutex
+	pins     map[uint64]uint64 // reader id -> smallest offset it may still read
+	pinSeq   uint64
+	lastWarn time.Time
+
+	// segTimes holds the newest record time of each sealed segment, keyed
+	// by first offset. Filled by recovery and rotation; guarded by metaMu.
+	metaMu   sync.Mutex
+	segTimes map[uint64]time.Time
 
 	nextOff atomic.Uint64           // next offset to assign; everything below is durable
 	failed  atomic.Pointer[failure] // set once a write or fsync fails
@@ -82,7 +108,9 @@ type Log struct {
 	// Owned by the writer goroutine after Open returns.
 	f        *os.File // active segment
 	fname    string
+	fstart   uint64 // first offset of the active segment
 	fsize    int64
+	ftime    time.Time // newest record time in the active segment
 	next     uint64
 	buf      []byte
 	carry    *request // received but did not fit into the previous batch
@@ -96,20 +124,26 @@ type Log struct {
 // anywhere but the final record of the newest segment, or a gap in the
 // offset sequence, fails with an error wrapping ErrCorrupt.
 func Open(opts Options) (*Log, error) {
-	return open(opts, syncFile)
+	return open(opts, syncFile, time.Now)
 }
 
 func syncFile(f *os.File) error { return f.Sync() }
 
-func open(opts Options, syncFn func(*os.File) error) (*Log, error) {
+func open(opts Options, syncFn func(*os.File) error, now func() time.Time) (*Log, error) {
 	if opts.Dir == "" {
 		return nil, errors.New("wal: Options.Dir is required")
 	}
 	l := &Log{
-		dir:         opts.Dir,
-		segmentSize: opts.SegmentSize,
-		logger:      opts.Logger,
-		syncFn:      syncFn,
+		dir:           opts.Dir,
+		segmentSize:   opts.SegmentSize,
+		logger:        opts.Logger,
+		syncFn:        syncFn,
+		now:           now,
+		retentionAge:  max(opts.RetentionAge, 0),
+		retentionSize: max(opts.RetentionSize, 0),
+		pins:          make(map[uint64]uint64),
+		segTimes:      make(map[uint64]time.Time),
+		rotated:       make(chan struct{}, 1),
 	}
 	if l.segmentSize <= 0 {
 		l.segmentSize = DefaultSegmentSize
@@ -147,7 +181,7 @@ func (l *Log) recover() error {
 			_ = f.Close() // already failing; the sync error is reported
 			return fmt.Errorf("wal: %w", err)
 		}
-		l.f, l.fname, l.fsize, l.next = f, path, segmentHeaderSize, 1
+		l.f, l.fname, l.fstart, l.fsize, l.next = f, path, 1, segmentHeaderSize, 1
 		return nil
 	}
 
@@ -168,7 +202,8 @@ func (l *Log) recover() error {
 		if err != nil {
 			return fmt.Errorf("wal: opening %s: %w", s.path, err)
 		}
-		end, err := l.scanSegment(f, s.path, newest, &expected)
+		var last time.Time
+		end, err := l.scanSegment(f, s.path, newest, &expected, &last)
 		if err != nil {
 			_ = f.Close() // already failing; the scan error is reported
 			return err
@@ -177,13 +212,14 @@ func (l *Log) recover() error {
 			if err := f.Close(); err != nil {
 				return fmt.Errorf("wal: closing %s: %w", s.path, err)
 			}
+			l.segTimes[s.start] = last
 			continue
 		}
 		if _, err := f.Seek(end, io.SeekStart); err != nil {
 			_ = f.Close() // already failing; the seek error is reported
 			return fmt.Errorf("wal: seeking %s: %w", s.path, err)
 		}
-		l.f, l.fname, l.fsize = f, s.path, end
+		l.f, l.fname, l.fstart, l.fsize, l.ftime = f, s.path, s.start, end, last
 	}
 	l.next = expected
 	return nil
@@ -191,8 +227,9 @@ func (l *Log) recover() error {
 
 // scanSegment validates one segment, advancing *expected past every record.
 // For the newest segment a torn tail is truncated (and a torn header
-// rewritten). It returns the end of the last valid record.
-func (l *Log) scanSegment(f *os.File, path string, newest bool, expected *uint64) (int64, error) {
+// rewritten). It returns the end of the last valid record and sets *last
+// to that record's time (left unchanged if the segment holds no records).
+func (l *Log) scanSegment(f *os.File, path string, newest bool, expected *uint64, last *time.Time) (int64, error) {
 	fi, err := f.Stat()
 	if err != nil {
 		return 0, fmt.Errorf("wal: stat %s: %w", path, err)
@@ -267,6 +304,7 @@ func (l *Log) scanSegment(f *os.File, path string, newest bool, expected *uint64
 			return 0, corruptErr(path, rr.pos-recordSize(&rec), fmt.Sprintf("record offset %d, expected %d", rec.Offset, *expected))
 		}
 		*expected++
+		*last = rec.Time
 	}
 }
 
@@ -406,7 +444,7 @@ func (l *Log) commit(batch []request) {
 		replyAll(batch, err)
 		return
 	}
-	now := time.Now()
+	now := l.now()
 	buf := l.buf[:0]
 	for i := range batch {
 		batch[i].rec.Offset = l.next + uint64(i)
@@ -435,6 +473,7 @@ func (l *Log) commit(batch []request) {
 	first := l.next
 	l.next += uint64(len(batch))
 	l.fsize += int64(len(buf))
+	l.ftime = now
 	l.nextOff.Store(l.next)
 	for i := range batch {
 		batch[i].reply <- result{off: first + uint64(i)}
@@ -443,6 +482,11 @@ func (l *Log) commit(batch []request) {
 	if l.fsize >= l.segmentSize {
 		if err := l.rotate(); err != nil {
 			l.fail(fmt.Errorf("%w: rotating segment: %w", ErrFailed, err))
+			return
+		}
+		select {
+		case l.rotated <- struct{}{}:
+		default: // a retention pass is already pending
 		}
 	}
 }
@@ -466,7 +510,10 @@ func (l *Log) rotate() error {
 		return fmt.Errorf("wal: %w", err)
 	}
 	old, oldName := l.f, l.fname
-	l.f, l.fname, l.fsize = nf, path, segmentHeaderSize
+	l.metaMu.Lock()
+	l.segTimes[l.fstart] = l.ftime
+	l.metaMu.Unlock()
+	l.f, l.fname, l.fstart, l.fsize, l.ftime = nf, path, l.next, segmentHeaderSize, time.Time{}
 	if err := old.Close(); err != nil {
 		// Its contents were already synced; the new segment is in use.
 		l.logger.Warn("wal: closing rotated segment", "file", oldName, "err", err)
@@ -489,16 +536,24 @@ func (l *Log) shutdown() error {
 }
 
 // Close stops accepting appends, lets the writer finish every queued
-// request, syncs and closes the active segment, and waits for the writer to
-// exit. It is idempotent; later Appends return ErrClosed.
+// request, syncs and closes the active segment, stops the retention
+// goroutine, and waits for both to exit. It is idempotent; later Appends
+// return ErrClosed.
 func (l *Log) Close() error {
 	l.mu.Lock()
 	if !l.closed {
 		l.closed = true
 		close(l.reqs)
+		if l.retStarted {
+			close(l.retStop)
+		}
 	}
+	retDone := l.retDone
 	l.mu.Unlock()
 	<-l.done
+	if retDone != nil {
+		<-retDone
+	}
 	return l.closeErr
 }
 
@@ -508,11 +563,17 @@ func (l *Log) Close() error {
 // reads one segment at a time and never loads the whole log into memory.
 // An error returned by fn is returned unchanged; damage or an offset gap
 // returns an error wrapping ErrCorrupt.
+//
+// Retention never deletes a segment holding offsets >= from while ReadFrom
+// runs. If from is below the oldest retained record, reading starts at the
+// oldest retained record. fn may call any Log method.
 func (l *Log) ReadFrom(from uint64, fn func(Record) error) error {
 	limit := l.nextOff.Load() // exclusive
 	if from >= limit {
 		return nil
 	}
+	unpin := l.pin(from)
+	defer unpin()
 	segs, err := listSegments(l.dir)
 	if err != nil {
 		return err

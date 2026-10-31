@@ -63,6 +63,12 @@ type testEnv struct {
 	dir     string
 	segSize int64
 	logs    *syncBuffer
+
+	// Optional; zero values keep the defaults of newEnv / Open.
+	retentionAge  time.Duration
+	retentionSize int64
+	logger        *slog.Logger
+	now           func() time.Time
 }
 
 func newEnv(t *testing.T, segSize int64) *testEnv {
@@ -75,11 +81,21 @@ func (e *testEnv) open(t *testing.T, s *testSyncer) (*Log, error) {
 	if s == nil {
 		s = &testSyncer{}
 	}
+	logger := e.logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(e.logs, nil))
+	}
+	now := e.now
+	if now == nil {
+		now = time.Now
+	}
 	l, err := open(Options{
-		Dir:         e.dir,
-		SegmentSize: e.segSize,
-		Logger:      slog.New(slog.NewTextHandler(e.logs, nil)),
-	}, s.sync)
+		Dir:           e.dir,
+		SegmentSize:   e.segSize,
+		RetentionAge:  e.retentionAge,
+		RetentionSize: e.retentionSize,
+		Logger:        logger,
+	}, s.sync, now)
 	if err == nil {
 		t.Cleanup(func() { _ = l.Close() }) // idempotent; tests check Close explicitly where it matters
 	}
