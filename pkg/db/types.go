@@ -2,6 +2,7 @@ package db
 
 import (
 	"encoding/json"
+	"reflect"
 	"time"
 )
 
@@ -84,16 +85,95 @@ func (d *Document) GetValue(fieldName string) (any, bool) {
 	return val, ok
 }
 
-// Clone creates a deep copy of the document
+// Clone returns a deep copy of the document: nested maps, slices, and
+// arrays are copied recursively, so mutating the clone never changes the
+// original. Pointers, structs, and other values are copied shallowly.
+// Clone of a nil document is nil.
 func (d *Document) Clone() *Document {
+	if d == nil {
+		return nil
+	}
 	clone := &Document{
 		ID:   d.ID,
-		Data: make(map[string]any),
+		Data: make(map[string]any, len(d.Data)),
 	}
 	for k, v := range d.Data {
-		clone.Data[k] = v
+		clone.Data[k] = deepCopy(v)
 	}
 	return clone
+}
+
+// deepCopy returns a copy of v that shares no map, slice, or array storage
+// with it. The common JSON shapes take a fast path; other map, slice, and
+// array types are copied through reflection with their types preserved.
+func deepCopy(v any) any {
+	switch t := v.(type) {
+	case nil, string, bool, float64, json.Number:
+		return v
+	case map[string]any:
+		if t == nil {
+			return t
+		}
+		m := make(map[string]any, len(t))
+		for k, x := range t {
+			m[k] = deepCopy(x)
+		}
+		return m
+	case []any:
+		if t == nil {
+			return t
+		}
+		s := make([]any, len(t))
+		for i, x := range t {
+			s[i] = deepCopy(x)
+		}
+		return s
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Map, reflect.Slice, reflect.Array:
+		return deepCopyValue(rv).Interface()
+	}
+	return v
+}
+
+// deepCopyValue is deepCopy for reflect values.
+func deepCopyValue(rv reflect.Value) reflect.Value {
+	switch rv.Kind() {
+	case reflect.Interface:
+		if rv.IsNil() {
+			return rv
+		}
+		out := reflect.New(rv.Type()).Elem()
+		out.Set(deepCopyValue(rv.Elem()))
+		return out
+	case reflect.Map:
+		if rv.IsNil() {
+			return rv
+		}
+		out := reflect.MakeMapWithSize(rv.Type(), rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			out.SetMapIndex(iter.Key(), deepCopyValue(iter.Value()))
+		}
+		return out
+	case reflect.Slice:
+		if rv.IsNil() {
+			return rv
+		}
+		out := reflect.MakeSlice(rv.Type(), rv.Len(), rv.Len())
+		for i := range rv.Len() {
+			out.Index(i).Set(deepCopyValue(rv.Index(i)))
+		}
+		return out
+	case reflect.Array:
+		out := reflect.New(rv.Type()).Elem()
+		for i := range rv.Len() {
+			out.Index(i).Set(deepCopyValue(rv.Index(i)))
+		}
+		return out
+	}
+	return rv
 }
 
 // ValidateType checks if a value matches the expected field type
