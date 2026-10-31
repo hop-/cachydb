@@ -529,7 +529,7 @@ func TestIndexDefinitions(t *testing.T) {
 	if got := readCollMetaFile(t, metaPath).Indexes; !slices.Equal(got, want) {
 		t.Fatalf("coll.meta indexes = %v, want %v", got, want)
 	}
-	if got := sortedIndexDefs(c.indexes); !slices.Equal(got, want) {
+	if got := sortedIndexDefs(c.indexDefs()); !slices.Equal(got, want) {
 		t.Fatalf("indexes after reopen = %v, want %v", got, want)
 	}
 
@@ -546,7 +546,7 @@ func TestIndexDefinitions(t *testing.T) {
 
 	e = reopen(t, e)
 	c = mustColl(t, mustDB(t, e, "app"), "users")
-	if got := sortedIndexDefs(c.indexes); !slices.Equal(got, []indexDef{{"by_age", "age"}}) {
+	if got := sortedIndexDefs(c.indexDefs()); !slices.Equal(got, []indexDef{{"by_age", "age"}}) {
 		t.Fatalf("indexes after drop and reopen = %v", got)
 	}
 	if m := readCollMetaFile(t, metaPath); m.WALOffset != off {
@@ -913,21 +913,5 @@ func TestConcurrentMetadata(t *testing.T) {
 		if _, ok := mustColl(t, d, name).indexes["ix"]; !ok {
 			t.Errorf("%s: index missing after reopen", name)
 		}
-	}
-}
-
-func TestDocumentOpsNotImplemented(t *testing.T) {
-	ctx := context.Background()
-	e := openEngine(t, testOptions(t.TempDir()))
-	d := mustCreateDB(t, e, "app")
-	if err := d.CreateCollection(ctx, "users", nil); err != nil {
-		t.Fatal(err)
-	}
-	c := mustColl(t, d, "users")
-	if c.Count() != 0 {
-		t.Errorf("Count = %d, want 0", c.Count())
-	}
-	if _, err := c.Insert(ctx, &Document{}); !errors.Is(err, errNotImplemented) {
-		t.Errorf("Insert = %v", err)
 	}
 }

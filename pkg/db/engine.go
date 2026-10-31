@@ -11,15 +11,12 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/hop-/cachydb/pkg/db/internal/cache"
 	"github.com/hop-/cachydb/pkg/db/internal/fsutil"
 	"github.com/hop-/cachydb/pkg/db/internal/wal"
 )
 
 const lockFileName = "cachydb.lock"
-
-// errNotImplemented is returned by API methods whose implementation
-// arrives in a later step of the engine rewrite.
-var errNotImplemented = errors.New("not implemented")
 
 // Engine is an open cachydb data directory. It owns durability: every
 // change is committed to the write-ahead log before it becomes visible.
@@ -34,6 +31,7 @@ type Engine struct {
 	logger *slog.Logger
 	lock   *fsutil.Lock
 	wal    *wal.Log
+	cache  *cache.LRU // encoded documents read from data segments
 
 	// metaMu serializes database-level metadata operations (create/drop
 	// database) including their I/O.
@@ -131,6 +129,7 @@ func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 		logger:    opts.Logger,
 		lock:      lock,
 		wal:       wlog,
+		cache:     cache.New(opts.CacheSize),
 		databases: make(map[string]*Database),
 	}
 	if err := e.loadMetadata(ctx); err != nil {
@@ -213,8 +212,8 @@ func (e *Engine) loadDatabase(name string) (*Database, error) {
 }
 
 // Close flushes nothing yet (flushing arrives with the flusher), waits for
-// in-flight operations and background goroutines, closes the WAL, and
-// releases the data-directory lock. It is idempotent: later calls return
+// in-flight operations and background goroutines, closes the open data
+// segments and the WAL, and releases the data-directory lock. It is idempotent: later calls return
 // the first call's result. If ctx ends while waiting, Close still closes
 // the WAL and releases the lock and returns an error including ctx.Err().
 func (e *Engine) Close(ctx context.Context) error {
@@ -236,6 +235,18 @@ func (e *Engine) close(ctx context.Context) error {
 	if err := waitCtx(ctx, &e.bg); err != nil {
 		errs = append(errs, fmt.Errorf("waiting for background work: %w", err))
 	}
+
+	e.mu.RLock()
+	for _, d := range e.databases {
+		d.mu.RLock()
+		for _, c := range d.collections {
+			if err := c.closeReaders(); err != nil {
+				errs = append(errs, fmt.Errorf("closing segments of %s/%s: %w", d.name, c.name, err))
+			}
+		}
+		d.mu.RUnlock()
+	}
+	e.mu.RUnlock()
 
 	if err := e.wal.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("closing WAL: %w", mapWALErr(err)))

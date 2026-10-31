@@ -3,8 +3,8 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"maps"
 	"sync"
 	"sync/atomic"
 
@@ -42,17 +42,24 @@ type Collection struct {
 	// written by metadata operations (indexes, metaOffset, dropped) are
 	// only changed while Database.mu is held exclusively, so holding that
 	// lock is enough to read them.
-	mu         sync.RWMutex
-	keydir     map[string]keyEntry // id -> live on-disk version
-	memtable   map[string]memEntry // durable-in-WAL, not yet flushed
-	flushing   map[string]memEntry // immutable memtable being flushed; nil when idle
-	indexes    map[string]indexDef // name -> definition; index data structures arrive with the query/index step
-	inflight   []uint64            // WAL offsets durable but not yet applied (min-heap; document write path)
-	metaOffset uint64              // coll.meta wal_offset
-	dropped    bool
+	mu       sync.RWMutex
+	keydir   map[string]keyEntry // id -> live on-disk version
+	memtable map[string]memEntry // durable-in-WAL, not yet flushed
+	flushing map[string]memEntry // immutable memtable being flushed; nil when idle
+	indexes  map[string]*index   // name -> secondary index; contents change only under mu
+	// inflight holds, in ascending order, a lower bound of the WAL offset
+	// of every document write that is between "registered before the WAL
+	// append" and "applied to the memtable". Together with the memtable it
+	// keeps the low-water mark (§7.1) from passing a durable record that
+	// is not yet visible in memory. See registerInflight.
+	inflight      []uint64
+	readers       map[uint32]*segment.Reader // open data segments, opened on first read
+	readersClosed bool                       // engine shutdown: no new readers
+	metaOffset    uint64                     // coll.meta wal_offset
+	dropped       bool
 
 	// docLocks serializes read-modify-write of one document; stripe chosen
-	// by FNV-1a of the id (document write path).
+	// by FNV-1a of the id (see docLock).
 	docLocks [numDocLocks]sync.Mutex
 
 	count atomic.Int64 // live documents, kept in sync with keydir and memtable
@@ -66,7 +73,8 @@ func newCollection(d *Database, name string, s *Schema, metaOffset uint64) *Coll
 		schema:     s,
 		keydir:     make(map[string]keyEntry),
 		memtable:   make(map[string]memEntry),
-		indexes:    make(map[string]indexDef),
+		indexes:    make(map[string]*index),
+		readers:    make(map[uint32]*segment.Reader),
 		metaOffset: metaOffset,
 	}
 }
@@ -75,48 +83,57 @@ func newCollection(d *Database, name string, s *Schema, metaOffset uint64) *Coll
 func (c *Collection) Name() string { return c.name }
 
 // markDropped flags the collection as dropped so background work and
-// late callers stop using it. Callers hold Database.mu exclusively.
+// late callers stop using it, closes its segment readers, and evicts its
+// documents from the cache. Callers hold Database.mu exclusively.
 func (c *Collection) markDropped() {
 	c.mu.Lock()
 	c.dropped = true
+	readers := c.readers
+	c.readers = make(map[uint32]*segment.Reader)
 	c.mu.Unlock()
+	for _, r := range readers {
+		// Best effort: the files are read-only and the directory is about
+		// to be removed; a reader still in use closes on its last Release.
+		_ = r.Close()
+	}
+	c.db.e.cache.InvalidateCollection(c.db.name, c.name)
+}
+
+// closeReaders closes every open segment reader (engine shutdown).
+func (c *Collection) closeReaders() error {
+	c.mu.Lock()
+	readers := c.readers
+	c.readers = make(map[uint32]*segment.Reader)
+	c.readersClosed = true
+	c.mu.Unlock()
+	var errs []error
+	for _, r := range readers {
+		if err := r.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// indexDefs returns the definitions of the collection's indexes. Callers
+// hold Database.mu (the index set changes only under it exclusively).
+func (c *Collection) indexDefs() map[string]indexDef {
+	defs := make(map[string]indexDef, len(c.indexes))
+	for name, ix := range c.indexes {
+		defs[name] = indexDef{Name: name, Field: ix.field}
+	}
+	return defs
 }
 
 func (c *Collection) errDropped() error {
 	return fmt.Errorf("collection %q in database %q: %w", c.name, c.db.name, ErrNotFound)
 }
 
-// Insert adds doc and returns its id (generated when doc.ID is empty).
-func (c *Collection) Insert(ctx context.Context, doc *Document) (string, error) {
-	return "", fmt.Errorf("Collection.Insert: %w", errNotImplemented)
-}
-
-// Get returns a copy of the document id.
-func (c *Collection) Get(ctx context.Context, id string) (*Document, error) {
-	return nil, fmt.Errorf("Collection.Get: %w", errNotImplemented)
-}
-
-// Find returns copies of the documents matching q, sorted by id.
-func (c *Collection) Find(ctx context.Context, q *Query) ([]*Document, error) {
-	return nil, fmt.Errorf("Collection.Find: %w", errNotImplemented)
-}
-
-// Update merges set into the document id and returns the new version.
-func (c *Collection) Update(ctx context.Context, id string, set map[string]any) (*Document, error) {
-	return nil, fmt.Errorf("Collection.Update: %w", errNotImplemented)
-}
-
-// Delete removes the document id.
-func (c *Collection) Delete(ctx context.Context, id string) error {
-	return fmt.Errorf("Collection.Delete: %w", errNotImplemented)
-}
-
-// Count returns the number of live documents in O(1).
-func (c *Collection) Count() int { return int(c.count.Load()) }
-
-// CreateIndex defines the secondary index name on field. It fails with
-// ErrExists if an index with that name exists. It holds the database's
-// metadata lock, so writes to the database wait while it runs.
+// CreateIndex creates the secondary index name on field and builds it
+// from the documents already in the collection. It fails with ErrExists if
+// an index with that name exists. It holds the database's metadata lock
+// for the whole build, so writes to the database wait while it runs
+// (known limitation: index creation is rare).
 func (c *Collection) CreateIndex(ctx context.Context, name, field string) error {
 	if err := ValidateName("index", name); err != nil {
 		return err
@@ -139,6 +156,14 @@ func (c *Collection) CreateIndex(ctx context.Context, name, field string) error 
 		return fmt.Errorf("index %q on collection %q: %w", name, c.name, ErrExists)
 	}
 
+	// Build before the commit point: a read error aborts the operation
+	// with nothing written. Document writes are blocked by Database.mu, so
+	// the index stays exact until it is published below.
+	ix, err := c.buildIndex(ctx, name, field)
+	if err != nil {
+		return fmt.Errorf("creating index %q: %w", name, err)
+	}
+
 	def := indexDef{Name: name, Field: field}
 	payload, err := json.Marshal(def)
 	if err != nil {
@@ -151,14 +176,14 @@ func (c *Collection) CreateIndex(ctx context.Context, name, field string) error 
 	if err := e.hook(hookMetaWrite); err != nil {
 		return err
 	}
-	defs := maps.Clone(c.indexes)
+	defs := c.indexDefs()
 	defs[name] = def
 	if err := c.writeMeta(defs, off); err != nil {
 		return fmt.Errorf("creating index %q: %w", name, err)
 	}
 
 	c.mu.Lock()
-	c.indexes = defs
+	c.indexes[name] = ix
 	c.metaOffset = off
 	c.mu.Unlock()
 	return nil
@@ -195,14 +220,14 @@ func (c *Collection) DropIndex(ctx context.Context, name string) error {
 	if err := e.hook(hookMetaWrite); err != nil {
 		return err
 	}
-	defs := maps.Clone(c.indexes)
+	defs := c.indexDefs()
 	delete(defs, name)
 	if err := c.writeMeta(defs, off); err != nil {
 		return fmt.Errorf("dropping index %q: %w", name, err)
 	}
 
 	c.mu.Lock()
-	c.indexes = defs
+	delete(c.indexes, name)
 	c.metaOffset = off
 	c.mu.Unlock()
 

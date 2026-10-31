@@ -76,8 +76,10 @@ func (d *Database) loadCollection(name string) (*Collection, error) {
 		return nil, fmt.Errorf("%s: name %q does not match directory %q", filepath.Join(dir, collMetaFile), m.Name, name)
 	}
 	c := newCollection(d, name, m.Schema, m.WALOffset)
+	// Indexes start empty: documents are loaded (and indexes rebuilt) by
+	// the recovery step of the engine.
 	for _, def := range m.Indexes {
-		c.indexes[def.Name] = def
+		c.indexes[def.Name] = newIndex(def.Name, def.Field)
 	}
 	return c, nil
 }
