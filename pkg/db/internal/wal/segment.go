@@ -26,6 +26,10 @@ const (
 	segmentDigits     = 20
 )
 
+// FormatVersion is the WAL segment format version this build reads and
+// writes (the version field of the segment header).
+const FormatVersion = segmentVersion
+
 type segmentInfo struct {
 	start uint64 // offset of the first record (the name)
 	path  string

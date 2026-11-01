@@ -14,11 +14,16 @@ import (
 var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List databases and their schema versions",
-	Long: `List all available databases in the data directory along with their schema versions.
-This command helps you see what databases exist and their current state.
+	Long: `List the databases in the data directory with their schema versions and,
+with -c, their collections and document counts.
 
 It opens the engine (taking the data-directory lock), so it fails while a
 cachydb server is running on the same data directory.`,
+	Example: `  cachydb utils list                       # databases in ~/.cachydb
+  cachydb utils list -c                    # with collections and document counts
+  cachydb utils list -c -R /path/to/data   # another data directory
+  ROOT_DIR=/path/to/data cachydb utils list`,
+	Args: cobra.NoArgs,
 	RunE: runList,
 }
 
@@ -29,7 +34,7 @@ var (
 func init() {
 	utilsCmd.AddCommand(listCmd)
 
-	listCmd.Flags().BoolVarP(&showCollections, "collections", "c", false, "Show collections for each database")
+	listCmd.Flags().BoolVarP(&showCollections, "collections", "c", false, "also list each database's collections with their document counts")
 }
 
 func runList(cmd *cobra.Command, args []string) error {

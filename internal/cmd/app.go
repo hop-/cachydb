@@ -11,8 +11,15 @@ import (
 
 var appCmd = &cobra.Command{
 	Use:   "app",
-	Short: "Run the application (same as default)",
-	RunE:  runApp,
+	Short: "Run the MCP server (same as running cachydb with no command)",
+	Long: `Open the data directory and run the MCP server until the client closes
+stdin (stdio), or SIGINT/SIGTERM arrives. On shutdown every change is
+flushed to the data segments. See "cachydb docs mcp" for client setup.`,
+	Example: `  cachydb app -R /path/to/data             # stdio
+  cachydb app -t http -p 8080              # Streamable HTTP at http://localhost:8080/mcp
+  TRANSPORT=http PORT=8080 cachydb app     # the same settings from the environment`,
+	Args: cobra.NoArgs,
+	RunE: runApp,
 }
 
 // autorun: This function is called automatically to initialize the command

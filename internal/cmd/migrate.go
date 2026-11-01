@@ -22,6 +22,11 @@ Each migration step is registered in code and can perform schema transformations
 data migrations, or any other necessary updates. Migrations run on the opened
 engine (after recovery) and take the data-directory lock, so this command fails
 while a cachydb server is running on the same data directory.`,
+	Example: `  cachydb utils migrate --list                       # registered migrations
+  cachydb utils migrate --show-version --database main
+  cachydb utils migrate --database main              # migrate one database to the latest version
+  cachydb utils migrate --all --target 1             # migrate every database to version 1`,
+	Args: cobra.NoArgs,
 	RunE: runMigrate,
 }
 
@@ -36,11 +41,11 @@ var (
 func init() {
 	utilsCmd.AddCommand(migrateCmd)
 
-	migrateCmd.Flags().StringVarP(&migrateDatabase, "database", "d", "", "Database name to migrate")
-	migrateCmd.Flags().BoolVarP(&migrateAll, "all", "a", false, "Migrate all databases")
-	migrateCmd.Flags().IntVarP(&targetVersion, "target", "t", db.CurrentSchemaVersion, "Target schema version (default: latest)")
-	migrateCmd.Flags().BoolVarP(&showVersion, "show-version", "v", false, "Show current schema version of database")
-	migrateCmd.Flags().BoolVarP(&listMigrations, "list", "l", false, "List all registered migrations")
+	migrateCmd.Flags().StringVarP(&migrateDatabase, "database", "d", "", "database to migrate")
+	migrateCmd.Flags().BoolVarP(&migrateAll, "all", "a", false, "migrate every database")
+	migrateCmd.Flags().IntVarP(&targetVersion, "target", "t", db.CurrentSchemaVersion, "target schema version")
+	migrateCmd.Flags().BoolVarP(&showVersion, "show-version", "v", false, "print the schema version of --database")
+	migrateCmd.Flags().BoolVarP(&listMigrations, "list", "l", false, "list the registered migrations (does not open the engine)")
 }
 
 // migrateParams are the parsed flags of the migrate command.

@@ -13,9 +13,35 @@ import (
 var (
 	rootCmd = &cobra.Command{
 		Use:   "cachydb",
-		Short: "A lightweight document-based database with MCP support",
-		Long:  `CachyDB is a lightweight document-based database similar to MongoDB, with Model Context Protocol (MCP) support for AI integration.`,
-		RunE:  runApp,
+		Short: "A lightweight document database with a built-in MCP server",
+		Long: `CachyDB is a lightweight document database with a built-in MCP (Model
+Context Protocol) server. Databases hold collections of JSON documents,
+with optional schemas and hash indexes. Every acknowledged write is
+fsynced to a write-ahead log first, so it survives a crash.
+
+Running:
+  With no command, cachydb runs the MCP server over stdio (an MCP client
+  starts it as a child process). "-t http -p 7601" serves Streamable HTTP
+  at http://localhost:7601/mcp instead.
+
+Data:
+  Data lives in -R/--root (default ~/.cachydb). Only one cachydb process
+  may use a data directory at a time; utils commands fail while a server
+  runs on it.
+
+For AI agents:
+  Run "cachydb docs" to list the built-in topics (overview, quickstart,
+  mcp, tools, query, schema, config, errors), for example
+  "cachydb docs quickstart" or "cachydb docs tools --format json". Over
+  MCP, read the resources cachydb://docs/<topic>.
+
+Settings: flag > environment variable > default; see "cachydb docs config".`,
+		Example: `  cachydb                                  # MCP server over stdio, data in ~/.cachydb
+  cachydb -R /srv/cachydb -d app           # custom data directory and default database
+  cachydb -t http -p 7601                  # Streamable HTTP at http://localhost:7601/mcp
+  cachydb docs                             # built-in documentation topics`,
+		Args: cobra.NoArgs,
+		RunE: runApp,
 		// Execute prints the error once (cobra.CheckErr); commands silence
 		// the usage text themselves once their arguments are valid.
 		SilenceErrors: true,
