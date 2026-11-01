@@ -1,71 +1,76 @@
 # CachyDB Examples
 
-This directory contains example programs demonstrating different ways to use CachyDB.
+Example programs showing the two ways to use CachyDB. Run them from the
+repository root (both also work from their own directory).
 
-## Examples
+## 1. basic/ - Direct Library Usage
 
-### 1. basic/ - Direct Library Usage
-
-Demonstrates using CachyDB as a Go library directly, without MCP.
+Embeds CachyDB as a Go library (`pkg/db`), without MCP.
 
 **What it shows:**
 
-- Creating a database and collections
-- Defining schemas
-- Inserting documents
-- Creating indexes
-- Querying with filters
-- Saving/loading from disk
+- Opening an engine on a data directory with `db.Open`
+- Creating databases and collections, with and without a schema
+- Inserting documents with generated and caller-chosen IDs
+- Schema validation errors (`db.ErrSchemaValidation`)
+- Creating an index and querying with filters (results sorted by `_id`)
+- Updating and deleting documents
+- Closing the engine, reopening the same directory, and finding the data
+  still there (durability)
 
 **Run it:**
 
 ```bash
-cd examples/basic
-go run main.go
+go run ./examples/basic             # uses a fresh temporary directory, removed on exit
+go run ./examples/basic -dir DIR    # uses (and keeps) DIR
 ```
 
-This is useful if you want to embed CachyDB in your own Go application.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-dir` | temporary directory | Data directory to use; it is kept after the run |
 
-### 2. mcp-client/ - MCP Client Example
+`DIR` must not be in use by a running `cachydb` server (the data directory
+is locked by one process at a time).
 
-Demonstrates connecting to CachyDB as an MCP client.
+## 2. mcp-client/ - MCP Client Example
+
+Connects to the `cachydb` binary over the stdio MCP transport, using the
+official Go SDK client.
 
 **What it shows:**
 
-- Connecting to the MCP server
-- Listing available tools
-- Creating collections via MCP
-- Inserting documents via MCP
-- Creating indexes via MCP
-- Querying documents via MCP
+- Starting the server as a subprocess and connecting as an MCP client
+- Listing the available tools
+- Database management (`create_database`, `use_database`, `current_database`, ...)
+- Creating a collection with a schema
+- Inserting, finding (with `query.filters`), updating, and deleting documents
+- Creating an index
 
 **Run it:**
 
 ```bash
-# First, build CachyDB in the parent directory
-cd ..
-go build -o cachydb
-
-# Then run the MCP client example
-cd examples/mcp-client
-go run main.go
+go build -o cachydb                        # build the server first (repository root)
+go run ./examples/mcp-client               # fresh temporary data directory
+go run ./examples/mcp-client -root DIR     # uses (and keeps) DIR
+go run ./examples/mcp-client -bin PATH     # use a cachydb binary elsewhere
 ```
 
-This demonstrates how to integrate CachyDB with MCP clients (AI assistants, etc.).
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-bin` | `./cachydb`, else `../../cachydb` | Path to the `cachydb` binary |
+| `-root` | temporary directory | Server data directory, passed to the server as `-R`; kept after the run |
+
+The example always passes a data directory to the server, so it never
+touches the default `~/.cachydb` (which a running server may have locked).
 
 ## Which Example Should I Use?
 
-- **Use `basic/`** if you want to use CachyDB as a library in your Go application
-- **Use `mcp-client/`** if you want to understand how CachyDB works with MCP clients
+- **Use `basic/`** to embed CachyDB in your own Go application
+- **Use `mcp-client/`** to see how MCP clients (AI assistants, tools) talk to CachyDB
 - **Use the MCP Inspector** (see [TESTING.md](../TESTING.md)) for interactive testing with a web UI
 
 ## Requirements
 
-Both examples require:
-
-- Go 1.25 or later
-- The CachyDB dependencies (automatically installed via `go run`)
-
-The MCP client example also requires:
-
-- The `cachydb` binary to be built in the parent directory
+- Go 1.25 or later (dependencies are fetched by `go run`)
+- Linux or macOS
+- For `mcp-client/`: a built `cachydb` binary

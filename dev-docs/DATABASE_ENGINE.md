@@ -1,10 +1,106 @@
-# Database Engine Reference
+# Database Engine Reference (`pkg/db`)
 
-The database engine lives in `pkg/db/` and is usable as a standalone Go library.
+`pkg/db` is a self-contained, embeddable storage engine: `db.Open` returns
+an `*Engine` that owns durability. The MCP server and the CLI only call its
+methods. This doc covers the public API and the data and query semantics.
+Storage internals (formats, WAL, flush, recovery, compaction) are in
+[STORAGE.md](STORAGE.md); the overview is in [PROJECT.md](PROJECT.md).
 
-## Core Types
+## Opening and closing
 
-### Document
+```go
+e, err := db.Open(ctx, db.Options{Dir: "/path/to/data"})
+if err != nil { ... }              // ErrDataDirInUse, ErrIncompatibleDataDir, ...
+defer e.Close(ctx)                 // final flush, releases the data-dir lock
+```
+
+`Open` takes the exclusive data-directory lock (`<Dir>/cachydb.lock`), checks
+the on-disk format, runs recovery, and starts the background flusher,
+compactor, and WAL retention. `Close` waits for in-flight calls, flushes
+everything, writes index snapshots, closes the WAL, and releases the lock.
+It is idempotent. Calls after `Close` return `ErrClosed`.
+
+### Options (`pkg/db/options.go`)
+
+Zero-valued fields take the defaults. For `WALRetentionAge`,
+`WALRetentionSize`, and `CacheSize` a **negative** value means "disabled".
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `Dir` | required | Data directory |
+| `Logger` | `slog.Default()` (stderr) | All engine logging; `pkg/db` never writes to stdout |
+| `WALSegmentSize` | 64 MiB | WAL segment rotation size |
+| `WALRetentionAge` | 24h | Keep processed WAL segments this long; negative = no age limit |
+| `WALRetentionSize` | 1 GiB | Keep at most this much WAL; negative = no size limit |
+| `DataSegmentSize` | 64 MiB | Data segment roll-over size; also the compaction output cap |
+| `FlushInterval` | 1s | Flush and compaction tick |
+| `MemtableSize` | 16 MiB | Per-collection memtable size that triggers an early flush |
+| `CacheSize` | 64 MiB | LRU document cache; negative = cache disabled |
+| `CompactionRatio` | 0.5 | Dead/total bytes of sealed segments that triggers compaction; must be in (0,1] |
+
+The defaults were kept after the benchmarks in `pkg/db/bench_test.go`; the
+reasoning is in the comment above the constants in `options.go`.
+
+## API
+
+### Engine (`engine.go`)
+
+| Method | Notes |
+|--------|-------|
+| `Open(ctx, Options) (*Engine, error)` | See above |
+| `Close(ctx) error` | Idempotent; if `ctx` ends, remaining flushes are skipped (data stays in the WAL) |
+| `CreateDatabase(ctx, name) (*Database, error)` | Returns the existing database without writing a WAL record if it exists |
+| `Database(name) (*Database, error)` | `ErrNotFound` if missing |
+| `ListDatabases() []string` | Sorted; nil when empty |
+| `DropDatabase(ctx, name) error` | Waits for in-flight writes in the database |
+| `MigrateDatabase(ctx, name, target) error` | See [Migrations](#migrations) |
+| `MigrateAll(ctx, target) error` | |
+
+### Database (`database.go`)
+
+| Method | Notes |
+|--------|-------|
+| `Name() string`, `SchemaVersion() int` | |
+| `CreateCollection(ctx, name, *Schema) error` | `nil` schema = schemaless; `ErrExists`, `ErrSchemaValidation` (invalid schema) |
+| `Collection(name) (*Collection, error)` | `ErrNotFound` if missing |
+| `ListCollections() []string` | Sorted; nil when empty |
+| `DropCollection(ctx, name) error` | Not exposed as an MCP tool |
+
+### Collection (`document.go`, `collection.go`)
+
+| Method | Notes |
+|--------|-------|
+| `Insert(ctx, *Document) (string, error)` | Empty `doc.ID` gets a UUID; `ErrExists`; `ErrSchemaValidation` (schema, or `"_id"` key in `Data`) |
+| `Get(ctx, id) (*Document, error)` | Deep copy; `ErrNotFound` |
+| `Find(ctx, *Query) ([]*Document, error)` | See [Queries](#queries) |
+| `Update(ctx, id, set map[string]any) (*Document, error)` | Merges top-level fields; returns the new version; `ErrNotFound`; `"_id"` in `set` → `ErrSchemaValidation` |
+| `Delete(ctx, id) error` | `ErrNotFound` |
+| `CreateIndex(ctx, name, field) error` | Builds from existing documents; blocks writes to the whole database while it runs; `ErrExists` |
+| `DropIndex(ctx, name) error` | Not exposed as an MCP tool |
+| `Count() int` | O(1) |
+| `Name() string` | |
+
+Every acknowledged write is fsynced to the WAL before the call returns.
+Returned documents are deep copies: mutating them never changes stored data.
+
+### Sentinel errors (`errors.go`)
+
+Errors are wrapped with context; test them with `errors.Is`.
+
+| Error | When |
+|-------|------|
+| `ErrNotFound` | Database, collection, document, or index missing (also after a drop) |
+| `ErrExists` | Collection, document id, or index name already exists |
+| `ErrInvalidName` | Name fails `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` (`names.go`, `ValidateName`) |
+| `ErrSchemaValidation` | Invalid schema, document violates the schema, or a reserved `_id` misuse |
+| `ErrClosed` | Engine closed |
+| `ErrDataDirInUse` | Another process (or engine) holds `cachydb.lock` |
+| `ErrIncompatibleDataDir` | Old-format or newer-format data directory |
+| `ErrWALCorrupt` | WAL damaged before its tail, or WAL files missing |
+| `ErrWALFailed` | A WAL fsync failed; writes fail until restart, reads continue |
+| `ErrSchemaTooNew` | A database's schema version is newer than `CurrentSchemaVersion` |
+
+## Documents (`types.go`)
 
 ```go
 type Document struct {
@@ -13,314 +109,111 @@ type Document struct {
 }
 ```
 
-Documents are the fundamental unit of storage. Each has a unique `_id` (auto-generated UUID if not provided) and a flexible `Data` map holding arbitrary JSON-compatible values.
+- `MarshalJSON`/`UnmarshalJSON` use a flat object: `_id` next to the data
+  fields. A string `_id` becomes `ID`.
+- Documents are stored as JSON. Each write round-trips the document through
+  JSON, so **integers come back as `float64`**, Go slices as `[]any`, and
+  structs as `map[string]any`, in the library as well as over MCP.
+- `_id` is never a data field: `Insert` rejects `"_id"` in `Data` (set
+  `Document.ID`), and `Update` cannot change it. Ids are strings up to
+  65535 bytes.
+- `Clone()` is a deep copy.
 
-**Custom JSON marshaling**: Documents serialize as a flat JSON object with `_id` at the top level alongside data fields (not nested under a `data` key).
-
-### Collection
-
-```go
-type Collection struct {
-    Name      string
-    Schema    *Schema              // Optional schema for validation
-    Documents map[string]*Document // ID → Document (in-memory)
-    Indexes   map[string]*Index    // Index name → Index
-}
-```
-
-### Database
+## Schemas (`schema.go`, `types.go`)
 
 ```go
-type Database struct {
-    Name          string
-    SchemaVersion int                    // For migration system
-    Collections   map[string]*Collection
-}
+type Schema struct { Fields map[string]Field `json:"fields"` }
+type Field  struct { Type FieldType `json:"type"`; Required bool `json:"required"` }
 ```
 
-### DatabaseManager
+| `FieldType` | Accepted values (after the JSON round-trip) |
+|-------------|---------------------------------------------|
+| `string` | string |
+| `number` | any number |
+| `boolean` | bool |
+| `object` | JSON object |
+| `array` | JSON array |
+| `date` | string (no format check) |
+
+- A schema needs at least one field; field names cannot be empty or `_id`;
+  types must be one of the above.
+- Validation runs on every insert and on the merged result of every update.
+  A required field must be present; a present field must have the declared
+  type. Fields not in the schema are allowed.
+- Schemas are fixed at collection creation. There is no API to change them.
+
+## Queries
 
 ```go
-type DatabaseManager struct {
-    Databases map[string]*Database
-}
+type QueryFilter struct { Field, Operator string; Value any }
+type Query struct { Filters []QueryFilter; Limit, Skip int }
 ```
 
-Top-level container managing all databases. Thread-safe for concurrent access.
+Semantics (`compare.go`, `document.go`):
 
----
+- All filters must match (AND). `Field` is a **top-level** field name or
+  `_id`; there is no dot-notation for nested fields.
+- Operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`. Unknown operators
+  match nothing.
+- Comparison is type-aware: every numeric kind (and `json.Number`) compares
+  as `float64`; strings compare lexically with strings; bools and `null`
+  support equality only; objects and arrays support equality (deep, with
+  numbers normalized). Values of different types never order:
+  `gt/gte/lt/lte` and `eq` are false, `ne` is true.
+- **A document missing the filtered field matches no operator, including
+  `ne`.** This differs from MongoDB's `$ne` and is intentional.
+- `in` takes an array; it matches when the field equals any element.
+- Results are sorted by `_id` ascending. `Skip` matches are skipped, then
+  at most `Limit` are returned (0 or negative = no limit). Paging is
+  deterministic.
+- Candidates: the smallest id set among `eq` filters on `_id` or on an
+  indexed field with an indexable value. Without one, every live document
+  is scanned (read from the memtable, cache, or disk). The scan stops once
+  `Skip+Limit` matches are found.
 
-## Query Engine (`query.go`)
+## Indexes (`index.go`)
 
-### Collection Operations
+- Multi-value hash indexes: canonical key → set of document ids. Duplicate
+  values are fully supported; deleting one document removes only its id.
+- Keys are type-tagged: `n:<float>` (numbers, `-0` folded into `0`),
+  `s:<string>`, `b:t`/`b:f`, `z:` (null). So the number `1` and the string
+  `"1"` are different keys.
+- Objects, arrays, and NaN are not indexed. A document whose field is
+  missing or holds one has no entry, and `eq` filters on such values scan.
+- Only `eq` uses an index. The `_id` lookup uses the keydir (no separate
+  `_id` index exists).
+- Indexes are kept in memory, persisted as snapshots, and rebuilt when a
+  snapshot is missing or invalid (see [STORAGE.md](STORAGE.md)).
 
-| Method | Description |
-|--------|-------------|
-| `Insert(doc *Document) error` | Insert document (validates schema, updates indexes) |
-| `FindByID(id string) (*Document, error)` | Find single document by ID |
-| `Find(query *Query) ([]*Document, error)` | Find documents matching filters |
-| `Update(id string, updates map[string]any) error` | Update document fields by ID |
-| `Delete(id string) error` | Delete document by ID |
-| `Count() int` | Return document count |
+## Migrations
 
-### Database Operations
-
-| Method | Description |
-|--------|-------------|
-| `CreateDatabase(name string) *Database` | Create new database |
-| `GetDatabase(name string) *Database` | Get database by name |
-| `DeleteDatabase(name string) error` | Delete database |
-| `ListDatabases() []string` | List all database names |
-| `CreateCollection(name string, schema *Schema) error` | Create collection |
-| `DropCollection(name string) error` | Drop collection |
-| `GetCollection(name string) (*Collection, error)` | Get collection by name |
-| `ListCollections() []string` | List collection names |
-
-### Query Filters
-
-```go
-type QueryFilter struct {
-    Field    string // Field path (supports dot notation)
-    Operator string // "eq", "ne", "gt", "lt", "gte", "lte", "in"
-    Value    any    // Comparison value
-}
-
-type Query struct {
-    Filters []QueryFilter
-    Limit   int  // 0 = no limit
-    Skip    int  // Number of results to skip
-}
-```
-
-**Index acceleration**: Only `eq` operator on the first filter can leverage an index. If an index exists for the filter's field, it performs an O(1) hash lookup instead of a full collection scan.
-
----
-
-## Schema Validation (`schema.go`)
-
-### Field Types
-
-| Type | Go types accepted |
-|------|-------------------|
-| `string` | `string` |
-| `number` | `float64`, `int`, `int64`, `float32` |
-| `boolean` | `bool` |
-| `object` | `map[string]any` |
-| `array` | `[]any` |
-| `date` | `string` (ISO format expected) |
-
-### Schema Definition
-
-```go
-type Schema struct {
-    Fields map[string]Field `json:"fields"`
-}
-
-type Field struct {
-    Type     FieldType `json:"type"`     // Required: field type
-    Required bool      `json:"required"` // If true, field must exist in document
-}
-```
-
-### Validation Rules
-
-- If a field is marked `Required` and missing from the document, insertion/update fails.
-- If a field is present, its value must match the declared type.
-- The field name `_id` is reserved and cannot be used in schemas.
-- A schema must have at least one field.
-- Validation runs on both `Insert` and `Update` operations.
-
----
-
-## Indexing (`index.go`)
-
-### Hash-Based Index
-
-```go
-type Index struct {
-    Name      string            // Index name
-    FieldName string            // Field this index covers
-    Data      map[string]string // field_value → document_id (1:1 mapping)
-}
-```
-
-**Important**: Current implementation maps each unique field value to exactly one document ID. This means indexes work best for unique or near-unique fields. If multiple documents share the same field value, only the last-indexed one is accessible via the index.
-
-### Index API
-
-```go
-// Create an index on a collection field
-func (c *Collection) CreateIndex(indexName, fieldName string) error
-
-// Drop an index
-func (c *Collection) DropIndex(indexName string) error
-
-// Look up a document ID by field value
-func (idx *Index) Find(value any) (string, bool)
-
-// Persist index to disk
-func (idx *Index) SaveToDisk(dataDir, dbName, collName string) error
-
-// Load index from disk
-func LoadIndexFromDisk(dataDir, dbName, collName, indexName string) (*Index, error)
-func LoadAllIndexes(dataDir, dbName, collName string) (map[string]*Index, error)
-```
-
-### Index Persistence
-
-Indexes are saved as JSON files at: `<rootDir>/<dbName>/<collName>/indexes/<indexName>.json`
-
-### Index Maintenance
-
-- On `Insert`: Index is updated with the new document's field value.
-- On `Update`: Old value is removed from index, new value is added.
-- On `Delete`: Document's value is removed from index.
-
----
-
-## Storage System
-
-### Binary Storage Format (`binary_storage.go`)
-
-The default storage format uses a custom binary layout:
-
-```
-┌─────────────── collection.data ──────────────────┐
-│ Header (8 bytes)                                  │
-│   Magic: 0x43414348 ("CACH") - 4 bytes           │
-│   Version: uint16 - 2 bytes                      │
-│   Flags: uint16 - 2 bytes (bit 0 = compressed)   │
-├───────────────────────────────────────────────────┤
-│ Document Entry 1                                  │
-│   Entry Header (20 bytes):                        │
-│     Offset: int64 (8 bytes)                       │
-│     Size: uint32 (original size, 4 bytes)         │
-│     CompressedSize: uint32 (4 bytes)              │
-│     Checksum: uint32 (CRC32, 4 bytes)             │
-│   Data: gzip-compressed JSON (variable)           │
-├───────────────────────────────────────────────────┤
-│ Document Entry 2 ...                              │
-└───────────────────────────────────────────────────┘
-
-┌─────────────── collection.idx ───────────────────┐
-│ Binary offset index                               │
-│   Maps document IDs → file offsets                │
-│   Enables O(1) random-access reads                │
-└───────────────────────────────────────────────────┘
-```
-
-**Constants**:
-- `CollectionMagic = 0x43414348`
-- `BinaryFormatVersion = 1`
-- `HeaderSize = 8` bytes
-- `DocEntryHeaderSize = 20` bytes
-
-### Storage Manager (`storage.go`)
-
-Orchestrates all persistence with background sync:
-
-```go
-const StorageSyncInterval = 5 * time.Second
-```
-
-**Lifecycle**:
-1. `NewStorageManager(rootDir)` — initializes WAL, creates directories
-2. `LoadAllDatabases()` — reads persisted data + replays WAL
-3. `StartBackgroundSync(dbManager)` — starts 5s periodic syncer
-4. On each sync cycle: saves dirty collections → creates checkpoint
-5. `Stop()` — final sync + cleanup
-
-**Dirty tracking**: When a collection is modified, `MarkDirty(db, collection)` records it. The background syncer picks up all dirty entries each cycle.
-
-### Write-Ahead Log (`wal.go`)
-
-Provides crash-recovery durability:
-
-| Constant | Value |
-|----------|-------|
-| `WALMaxSize` | 64 MB |
-| `WALRetentionCount` | 2 (files kept) |
-| `WALBatchSize` | 100 entries |
-| `WALFlushInterval` | 100ms |
-
-**WAL Entry Format** (on disk):
-```
-[length: 4 bytes][checksum: 4 bytes][JSON-encoded WALEntry]
-```
-
-**Operations logged**:
-- `insert` — document insertion
-- `update` — document update
-- `delete` — document deletion
-- `create_database` — database creation
-- `delete_database` — database deletion
-- `create_collection` — collection creation
-- `delete_collection` — collection deletion
-- `create_index` — index creation
-
-**Key APIs**:
-```go
-func NewWALManager(rootDir string) (*WALManager, error)
-func (wm *WALManager) AppendEntry(entry *WALEntry) error      // Batched (async)
-func (wm *WALManager) AppendEntrySync(entry *WALEntry) error  // Immediate flush + fsync
-func (wm *WALManager) Replay(dm *DatabaseManager, storage *StorageManager) error
-func (wm *WALManager) Checkpoint(offset uint64) error
-```
-
-**Recovery**: `Replay()` reads all WAL entries after the last checkpoint offset and re-applies them to the in-memory state.
-
-**File rotation**: When a WAL file exceeds 64MB, a new file is created. Old files beyond `WALRetentionCount` are deleted.
-
-### Compression (`compression.go`)
-
-```go
-func Compress(data []byte) ([]byte, error)   // gzip compression
-func Decompress(data []byte) ([]byte, error) // gzip decompression
-```
-
-Used by binary storage to compress document data before writing to disk.
-
----
-
-## Migration System (`migration.go`)
+Defined in `migration.go`.
 
 ```go
 const CurrentSchemaVersion = 1
+
+type MigrationFunc func(ctx context.Context, e *Engine, dbName string) error
+
+func RegisterMigration(fromVersion int, fn MigrationFunc)
+func ListMigrations() []int
+func (e *Engine) MigrateDatabase(ctx context.Context, dbName string, targetVersion int) error
+func (e *Engine) MigrateAll(ctx context.Context, targetVersion int) error
 ```
 
-### Registration
+- New databases start at `CurrentSchemaVersion`. No migrations are
+  registered in this build.
+- A migration upgrades `fromVersion` → `fromVersion+1`. It runs on the
+  opened engine (after recovery) and must use normal engine operations,
+  which are WAL-logged. Steps run one version at a time; after each, the
+  new version is persisted to `db.meta`. A crash between a step and its
+  version bump reruns the step, so migrations should be idempotent.
+- Downgrades are rejected. Migrations are serialized per engine.
+- `Open` fails with `ErrSchemaTooNew` for a database newer than
+  `CurrentSchemaVersion` and logs a warning for an older one.
+- CLI: `cachydb utils migrate` (see [CLI.md](CLI.md)).
 
-```go
-type MigrationFunc func(db *Database) error
+## Example
 
-func RegisterMigration(fromVersion int, migrationFunc MigrationFunc)
-```
-
-Migrations are registered globally, keyed by `fromVersion`. Each function upgrades a database from `fromVersion` to `fromVersion + 1`.
-
-### Execution
-
-```go
-func NewMigrationManager(storage *StorageManager) *MigrationManager
-func (mm *MigrationManager) MigrateDatabase(dbName string, targetVersion int) error
-func (mm *MigrationManager) MigrateAllDatabases(targetVersion int) error
-```
-
-Migrations are applied iteratively: if a database is at version 0 and target is 3, it applies migration 0→1, then 1→2, then 2→3.
-
----
-
-## On-Disk Layout
-
-```
-~/.cachydb/                          # Root directory (configurable)
-├── wal-<timestamp>.log              # Write-ahead log files
-├── wal.checkpoint                   # Last checkpoint offset
-├── <database_name>/
-│   ├── metadata.json                # Database metadata (schema version)
-│   └── <collection_name>/
-│       ├── collection.data          # Binary document storage
-│       ├── collection.idx           # Binary offset index
-│       └── indexes/
-│           └── <index_name>.json    # Persisted index data
-```
+See [`examples/basic/main.go`](../examples/basic/main.go) for a complete,
+runnable program (open, schema, insert, index, find, update, delete, close,
+reopen).
