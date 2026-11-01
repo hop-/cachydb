@@ -19,7 +19,10 @@ import (
 //
 // One background goroutine checks every collection each FlushInterval. A
 // collection is compacted when its sealed segments hold at least 2
-// segments and deadBytes/totalBytes >= CompactionRatio. The input run is a
+// segments and deadBytes/totalBytes >= CompactionRatio, or, failing that,
+// when a run of at least smallRunMin adjacent sealed segments are each
+// smaller than DataSegmentSize/4 (small segments are merged even when
+// fully live; plan 002 C3). The input run is a
 // contiguous run of sealed segments, never the active segment nor the
 // segment holding the newest checkpoint marker (markers are not copied, so
 // that one must survive). The output is one new segment, id nextSeg (max
@@ -49,6 +52,10 @@ import (
 // compactBatchBytes is roughly how many document bytes compaction buffers
 // before appending them to the output segment.
 const compactBatchBytes = 1 << 20
+
+// smallRunMin is the shortest run of small sealed segments that is merged
+// even without dead bytes.
+const smallRunMin = 4
 
 // compactPlan describes one compaction of a collection.
 type compactPlan struct {
@@ -152,6 +159,9 @@ func (c *Collection) planCompaction() (compactPlan, bool, error) {
 	segs := slices.Sorted(maps.Keys(c.segBytes))
 	skip := map[uint32]bool{c.activeSeg: true, c.markerSeg: true}
 	run := pickCompactionRun(segs, skip, c.segBytes, c.deadBytes, e.opts.CompactionRatio, e.opts.DataSegmentSize)
+	if run == nil {
+		run = pickSmallRun(segs, skip, c.segBytes, c.deadBytes, e.opts.DataSegmentSize)
+	}
 	c.mu.RUnlock()
 	if run == nil {
 		return compactPlan{}, false, nil
@@ -206,6 +216,32 @@ func pickCompactionRun(segs []uint32, skip map[uint32]bool, total, dead map[uint
 		}
 	}
 	return slices.Clone(best)
+}
+
+// pickSmallRun returns the oldest run of at least smallRunMin adjacent
+// candidate segments (segs ascending; skip splits runs, as in
+// pickCompactionRun) that are each smaller than segSize/4, extended while
+// the merged live bytes fit in segSize; nil if there is none.
+func pickSmallRun(segs []uint32, skip map[uint32]bool, total, dead map[uint32]int64, segSize int64) []uint32 {
+	small := func(s uint32) bool { return !skip[s] && total[s] < segSize/4 }
+	live := func(s uint32) int64 { return max(total[s]-dead[s], 0) }
+	for i := 0; i < len(segs); i++ {
+		if !small(segs[i]) {
+			continue
+		}
+		var cumLive int64
+		j := i
+		for ; j < len(segs) && small(segs[j]); j++ {
+			if j > i && cumLive+live(segs[j]) > segSize {
+				break
+			}
+			cumLive += live(segs[j])
+		}
+		if j-i >= smallRunMin {
+			return slices.Clone(segs[i:j])
+		}
+	}
+	return nil
 }
 
 // coversOlderVersions reports whether tombstones may be dropped when
