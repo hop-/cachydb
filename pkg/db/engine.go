@@ -49,6 +49,14 @@ type Engine struct {
 	lwMu         sync.Mutex
 	metaInflight []uint64
 
+	// metacpMu guards metacp, the metadata checkpoint last persisted in
+	// cachydb.metacp (metacp.go); it serializes the file's rewrites.
+	metacpMu sync.Mutex
+	metacp   uint64
+	// metacpLoaded reports that metacp was read from a valid file at Open
+	// (replayStart uses it only then).
+	metacpLoaded bool
+
 	// recov counts what recovery did at Open.
 	recov recoveryStats
 
@@ -163,6 +171,9 @@ func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 		e.closeCollectionFiles()
 		return nil, fmt.Errorf("opening %s: %w", root, err)
 	}
+	// Replay applied every metadata record it found: persist that, so the
+	// next Open starts after them.
+	e.writeMetaCheckpoint()
 	e.bgCtx, e.bgCancel = context.WithCancel(context.Background())
 	e.startFlusher()
 	e.startCompactor()
@@ -296,6 +307,7 @@ func (e *Engine) close(ctx context.Context) error {
 				errs = append(errs, err)
 			}
 		}
+		e.writeMetaCheckpoint()
 	}
 
 	e.mu.RLock()

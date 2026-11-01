@@ -156,10 +156,11 @@ func (e *Engine) appendMetaWAL(ctx context.Context, r wal.Record) (off uint64, d
 
 	release := func() {
 		e.lwMu.Lock()
-		defer e.lwMu.Unlock()
 		if i, ok := slices.BinarySearch(e.metaInflight, lb); ok {
 			e.metaInflight = slices.Delete(e.metaInflight, i, i+1)
 		}
+		e.lwMu.Unlock()
+		e.writeMetaCheckpoint()
 	}
 	off, err = e.appendWAL(ctx, r)
 	if err != nil {

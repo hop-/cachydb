@@ -75,6 +75,13 @@ func (e *Engine) recover(ctx context.Context) error {
 			ErrWALCorrupt, maxSeen, next)
 	}
 
+	switch cp, ok, err := readMetaCheckpoint(e.root, e.wal.NextOffset()); {
+	case err != nil:
+		e.logger.Warn("cachydb: ignoring the metadata checkpoint; replay starts at the meta files' offsets", "err", err)
+	case ok:
+		e.metacp, e.metacpLoaded = cp, true
+	}
+
 	from, err := e.replay(ctx)
 	if err != nil {
 		return err
@@ -472,15 +479,31 @@ func removeIDs(ix *index, ids map[string]struct{}) {
 	}
 }
 
-// replayStart returns the first WAL offset replay must read (§7.2 step 6):
-// one past the minimum over every metadata file's wal_offset and every
-// collection's replay floor. A metadata operation whose meta write did not
+// replayStart returns the first WAL offset replay must read (§7.2 step 6).
+// With a usable metadata checkpoint N (cachydb.metacp, see metacp.go) it
+// is the minimum of N+1 and every collection's replay floor + 1: every
+// metadata record at or below N is reflected in the meta files. Without
+// one it is one past the minimum over every metadata file's wal_offset and
+// every collection's replay floor. A metadata operation whose meta write did not
 // happen has an offset above the wal_offset of the file it would have
 // changed (its database, or the collection), so it is covered; with no
 // database at all, a create_db may be missing, so replay reads the whole
 // log. ReadFrom starts at the oldest kept record if the offset is below
 // it: records retention deleted were processed.
 func (e *Engine) replayStart() uint64 {
+	e.metacpMu.Lock()
+	metacp, haveMetacp := e.metacp, e.metacpLoaded
+	e.metacpMu.Unlock()
+	if haveMetacp {
+		from := metacp + 1
+		for _, d := range e.databases {
+			for _, c := range d.collections {
+				from = min(from, c.replayFloor()+1)
+			}
+		}
+		return from
+	}
+
 	if len(e.databases) == 0 {
 		return 1
 	}
