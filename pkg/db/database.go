@@ -76,10 +76,14 @@ func (d *Database) loadCollection(name string) (*Collection, error) {
 		return nil, fmt.Errorf("%s: name %q does not match directory %q", filepath.Join(dir, collMetaFile), m.Name, name)
 	}
 	c := newCollection(d, name, m.Schema, m.WALOffset)
-	// Indexes start empty: documents are loaded (and indexes rebuilt) by
-	// the recovery step of the engine.
 	for _, def := range m.Indexes {
 		c.indexes[def.Name] = newIndex(def.Name, def.Field)
+	}
+	if err := c.load(); err != nil {
+		if cerr := c.closeFiles(); cerr != nil {
+			d.e.logger.Warn("cachydb: closing segments after failed load", "dir", dir, "err", cerr)
+		}
+		return nil, err
 	}
 	return c, nil
 }
@@ -114,7 +118,7 @@ func (d *Database) CreateCollection(ctx context.Context, name string, s *Schema)
 	if err != nil {
 		return fmt.Errorf("creating collection %q: encoding payload: %w", name, err)
 	}
-	off, err := e.appendWAL(ctx, wal.Record{Op: wal.OpCreateColl, DB: d.name, Coll: name, Payload: payload})
+	off, done, err := e.appendMetaWAL(ctx, wal.Record{Op: wal.OpCreateColl, DB: d.name, Coll: name, Payload: payload})
 	if err != nil {
 		return fmt.Errorf("creating collection %q: %w", name, err)
 	}
@@ -128,6 +132,7 @@ func (d *Database) CreateCollection(ctx context.Context, name string, s *Schema)
 	if err := writeCollMeta(dir, collMeta{Name: name, Schema: s, WALOffset: off}); err != nil {
 		return fmt.Errorf("creating collection %q: %w", name, err)
 	}
+	done()
 
 	d.collections[name] = newCollection(d, name, s, off)
 	return nil
@@ -187,7 +192,11 @@ func (d *Database) DropCollection(ctx context.Context, name string) error {
 		return fmt.Errorf("dropping collection %q in database %q: %w", name, d.name, ErrNotFound)
 	}
 
-	off, err := e.appendWAL(ctx, wal.Record{Op: wal.OpDropColl, DB: d.name, Coll: name})
+	// Wait for a running flush and keep the flusher away from the
+	// directory while it is renamed (lock order: Database.mu → flushMu).
+	c.flushMu.Lock()
+	defer c.flushMu.Unlock()
+	off, done, err := e.appendMetaWAL(ctx, wal.Record{Op: wal.OpDropColl, DB: d.name, Coll: name})
 	if err != nil {
 		return fmt.Errorf("dropping collection %q: %w", name, err)
 	}
@@ -198,6 +207,7 @@ func (d *Database) DropCollection(ctx context.Context, name string) error {
 	if err != nil {
 		return fmt.Errorf("dropping collection %q: %w", name, err)
 	}
+	done()
 
 	c.markDropped()
 	delete(d.collections, name)

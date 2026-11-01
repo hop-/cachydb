@@ -39,6 +39,10 @@ const maxReadRetries = 8
 // checks.
 const findCtxCheckEvery = 256
 
+// memEntryOverhead approximates the fixed memory cost of a memtable entry
+// beyond its id and encoded document, for the MemtableSize trigger.
+const memEntryOverhead = 64
+
 // errSegmentRetired reports that a data segment was retired between the
 // keydir lookup and the read; the caller looks the document up again.
 var errSegmentRetired = errors.New("data segment retired")
@@ -220,6 +224,7 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 		return nil, err
 	}
 
+	size := int64(len(id)+len(rec.Payload)) + memEntryOverhead
 	lb := c.registerInflight()
 	off, err := e.appendWAL(context.WithoutCancel(ctx), rec) // commit point
 	if err != nil {
@@ -229,7 +234,7 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 	if err := e.hook(hookAfterWALSync); err != nil {
 		return nil, err // simulated crash: no cleanup
 	}
-	c.apply(id, cur, next, off, lb)
+	c.apply(id, cur, next, off, lb, size)
 	return next, nil
 }
 
@@ -262,15 +267,30 @@ func (c *Collection) removeInflightLocked(lb uint64) {
 
 // apply makes a durable write visible (§5.2 step 5). prev is the version
 // the write replaced (nil if none); next is the after-image (nil for a
-// delete). Memory only.
-func (c *Collection) apply(id string, prev, next *Document, off, lb uint64) {
+// delete); size is the entry's approximate size for the MemtableSize
+// flush trigger. Memory only.
+func (c *Collection) apply(id string, prev, next *Document, off, lb uint64, size int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.removeInflightLocked(lb)
-	if me, ok := c.memtable[id]; ok && me.walOffset >= off {
+	me, ok := c.memtable[id]
+	if ok && me.walOffset >= off {
 		return // never happens under the doc lock; replay relies on the same rule
 	}
-	c.memtable[id] = memEntry{doc: next, walOffset: off}
+	if ok {
+		c.memBytes -= me.size
+	}
+	// memMin stays a lower bound of the memtable's offsets: an overwritten
+	// entry may leave it lower than the true minimum, which only makes the
+	// low-water mark more conservative.
+	if len(c.memtable) == 0 || off < c.memMin {
+		c.memMin = off
+	}
+	c.memtable[id] = memEntry{doc: next, walOffset: off, size: size}
+	c.memBytes += size
+	if c.memBytes > c.db.e.opts.MemtableSize {
+		c.db.e.kickFlush()
+	}
 	for _, ix := range c.indexes {
 		if prev != nil {
 			ix.remove(id, prev)

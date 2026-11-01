@@ -42,14 +42,23 @@ type Engine struct {
 	mu        sync.RWMutex
 	databases map[string]*Database
 
+	// lwMu guards metaInflight: in ascending order, a lower bound of the
+	// WAL offset of every metadata operation between its WAL append and
+	// its durable meta-file change (§7.1). See appendMetaWAL.
+	lwMu         sync.Mutex
+	metaInflight []uint64
+
+	// flushKick wakes the flusher when a memtable exceeds MemtableSize.
+	flushKick chan struct{}
+
 	// Close gate: public operations enter() before touching state and
 	// exit() when done; Close sets closed and waits for them.
 	gateMu sync.Mutex
 	closed bool
 	ops    sync.WaitGroup
 
-	// Background goroutines (drop removal; flusher, compaction in later
-	// tasks) run under bgCtx and are joined by Close. bgCtx is the
+	// Background goroutines (drop removal, flusher; compaction in a later
+	// task) run under bgCtx and are joined by Close. bgCtx is the
 	// engine's lifetime context, not a request context: it is cancelled
 	// only by Close.
 	bgCtx    context.Context
@@ -64,9 +73,10 @@ type Engine struct {
 // the exclusive directory lock (ErrDataDirInUse if another process — or
 // another Engine in this process — holds it), checks the on-disk format
 // (ErrIncompatibleDataDir), removes leftovers of interrupted drops, opens
-// the WAL, and loads database and collection metadata. A database whose
-// schema version is newer than CurrentSchemaVersion fails with
-// ErrSchemaTooNew; an older one is logged.
+// the WAL, loads database and collection metadata and the collections'
+// data segments, and starts the background flusher and WAL retention. A
+// database whose schema version is newer than CurrentSchemaVersion fails
+// with ErrSchemaTooNew; an older one is logged.
 func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 	opts, err = opts.withDefaults()
 	if err != nil {
@@ -131,12 +141,30 @@ func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 		wal:       wlog,
 		cache:     cache.New(opts.CacheSize),
 		databases: make(map[string]*Database),
+		flushKick: make(chan struct{}, 1),
 	}
 	if err := e.loadMetadata(ctx); err != nil {
+		e.closeCollectionFiles()
 		return nil, fmt.Errorf("opening %s: %w", root, err)
 	}
 	e.bgCtx, e.bgCancel = context.WithCancel(context.Background())
+	e.startFlusher()
+	// Retention gets the low-water mark before anything can run a
+	// retention pass: without it nothing counts as processed.
+	e.wal.StartRetention(e.lowWater)
 	return e, nil
+}
+
+// closeCollectionFiles closes the segment files of every loaded collection
+// without flushing (cleanup after a failed Open).
+func (e *Engine) closeCollectionFiles() {
+	for _, d := range e.databases {
+		for _, c := range d.collections {
+			if err := c.closeFiles(); err != nil {
+				e.logger.Warn("cachydb: closing segments after failed open", "database", d.name, "collection", c.name, "err", err)
+			}
+		}
+	}
 }
 
 // loadMetadata reads every <db>/db.meta and <db>/<coll>/coll.meta. The meta
@@ -156,7 +184,7 @@ func (e *Engine) loadMetadata(ctx context.Context) error {
 		}
 		d, err := e.loadDatabase(ent.Name())
 		if err != nil {
-			return err
+			return err // Open closes the collections loaded so far
 		}
 		if d != nil {
 			e.databases[d.name] = d
@@ -202,6 +230,11 @@ func (e *Engine) loadDatabase(name string) (*Database, error) {
 		}
 		c, err := d.loadCollection(ent.Name())
 		if err != nil {
+			for _, loaded := range d.collections {
+				if cerr := loaded.closeFiles(); cerr != nil {
+					e.logger.Warn("cachydb: closing segments after failed open", "database", name, "collection", loaded.name, "err", cerr)
+				}
+			}
 			return nil, err
 		}
 		if c != nil {
@@ -211,11 +244,14 @@ func (e *Engine) loadDatabase(name string) (*Database, error) {
 	return d, nil
 }
 
-// Close flushes nothing yet (flushing arrives with the flusher), waits for
-// in-flight operations and background goroutines, closes the open data
-// segments and the WAL, and releases the data-directory lock. It is idempotent: later calls return
-// the first call's result. If ctx ends while waiting, Close still closes
-// the WAL and releases the lock and returns an error including ctx.Err().
+// Close waits for in-flight operations, stops the background goroutines,
+// flushes every collection's memtable (final flush) and writes the index
+// snapshots, closes the data segments and the WAL, and releases the
+// data-directory lock. It is idempotent: later calls return the first
+// call's result. A failed final flush is reported; its changes remain in
+// the WAL. If ctx ends while waiting, Close skips the remaining flushes,
+// still closes the WAL and releases the lock, and returns an error
+// including ctx.Err().
 func (e *Engine) Close(ctx context.Context) error {
 	e.closeOnce.Do(func() { e.closeErr = e.close(ctx) })
 	return e.closeErr
@@ -233,7 +269,17 @@ func (e *Engine) close(ctx context.Context) error {
 
 	e.bgCancel()
 	if err := waitCtx(ctx, &e.bg); err != nil {
+		// The flusher may still be running: leave the segments to it.
 		errs = append(errs, fmt.Errorf("waiting for background work: %w", err))
+	} else {
+		if err := e.flushAll(ctx, false); err != nil {
+			errs = append(errs, fmt.Errorf("final flush: %w", err))
+		}
+		for _, c := range e.allCollections() {
+			if err := c.shutdown(); err != nil {
+				errs = append(errs, err)
+			}
+		}
 	}
 
 	e.mu.RLock()
@@ -360,7 +406,7 @@ func (e *Engine) CreateDatabase(ctx context.Context, name string) (*Database, er
 		return d, nil
 	}
 
-	off, err := e.appendWAL(ctx, wal.Record{Op: wal.OpCreateDB, DB: name})
+	off, done, err := e.appendMetaWAL(ctx, wal.Record{Op: wal.OpCreateDB, DB: name})
 	if err != nil {
 		return nil, fmt.Errorf("creating database %q: %w", name, err)
 	}
@@ -374,6 +420,7 @@ func (e *Engine) CreateDatabase(ctx context.Context, name string) (*Database, er
 	if err := writeDBMeta(dir, dbMeta{Name: name, SchemaVersion: CurrentSchemaVersion, WALOffset: off}); err != nil {
 		return nil, fmt.Errorf("creating database %q: %w", name, err)
 	}
+	done()
 
 	d := newDatabase(e, name, CurrentSchemaVersion, off)
 	e.mu.Lock()
@@ -431,7 +478,17 @@ func (e *Engine) DropDatabase(ctx context.Context, name string) error {
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	off, err := e.appendWAL(ctx, wal.Record{Op: wal.OpDropDB, DB: name})
+	// Wait for running flushes and keep the flusher away from the
+	// directory while it is renamed (lock order: Database.mu → flushMu).
+	for _, c := range d.collections {
+		c.flushMu.Lock()
+	}
+	defer func() {
+		for _, c := range d.collections {
+			c.flushMu.Unlock()
+		}
+	}()
+	off, done, err := e.appendMetaWAL(ctx, wal.Record{Op: wal.OpDropDB, DB: name})
 	if err != nil {
 		return fmt.Errorf("dropping database %q: %w", name, err)
 	}
@@ -442,6 +499,7 @@ func (e *Engine) DropDatabase(ctx context.Context, name string) error {
 	if err != nil {
 		return fmt.Errorf("dropping database %q: %w", name, err)
 	}
+	done()
 
 	d.dropped = true
 	for _, c := range d.collections {

@@ -418,7 +418,7 @@ func TestHookAfterWALSync(t *testing.T) {
 				)
 				e, c = newTestColl(t, func(o *Options) {
 					o.testHook = func(p hookPoint) error {
-						if !armed || p != hookAfterWALSync {
+						if p != hookAfterWALSync || !armed { // p first: the flusher calls the hook from another goroutine
 							return nil
 						}
 						called++

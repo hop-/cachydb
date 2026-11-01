@@ -27,6 +27,7 @@ type keyEntry struct {
 type memEntry struct {
 	doc       *Document
 	walOffset uint64
+	size      int64 // approximate encoded size, for the MemtableSize flush trigger
 }
 
 // Collection is a set of documents with an optional schema and secondary
@@ -58,6 +59,26 @@ type Collection struct {
 	metaOffset    uint64                     // coll.meta wal_offset
 	dropped       bool
 
+	// Flush bookkeeping (§5.4, §7.1), guarded by mu.
+	memBytes    int64  // sum of memtable entry sizes
+	memMin      uint64 // <= smallest walOffset in memtable (meaningful when non-empty)
+	flushingMin uint64 // <= smallest walOffset in flushing (meaningful when non-nil)
+	checkpoint  uint64 // value of the last checkpoint marker durable in the data segments
+	// deadBytes counts, per data segment, the bytes of records the keydir
+	// no longer references: superseded and deleted versions, tombstones,
+	// and checkpoint markers. Compaction (§9) uses it.
+	deadBytes map[uint32]int64
+
+	// flushMu serializes flushes of this collection and guards the active
+	// segment fields below. Drops hold it while renaming the collection
+	// directory, so the flusher never touches a dropped collection's files
+	// by path. Lock order: Database.mu → flushMu → mu.
+	flushMu      sync.Mutex
+	active       segmentWriter       // open active data segment; nil when not open
+	activeSeg    uint32              // id of the active segment; 0 = no segment yet
+	activeSealed bool                // activeSeg is sealed; the next flush creates activeSeg+1
+	activeHint   []segment.HintEntry // records of the active segment, for its hint file
+
 	// docLocks serializes read-modify-write of one document; stripe chosen
 	// by FNV-1a of the id (see docLock).
 	docLocks [numDocLocks]sync.Mutex
@@ -75,6 +96,7 @@ func newCollection(d *Database, name string, s *Schema, metaOffset uint64) *Coll
 		memtable:   make(map[string]memEntry),
 		indexes:    make(map[string]*index),
 		readers:    make(map[uint32]*segment.Reader),
+		deadBytes:  make(map[uint32]int64),
 		metaOffset: metaOffset,
 	}
 }
@@ -83,20 +105,45 @@ func newCollection(d *Database, name string, s *Schema, metaOffset uint64) *Coll
 func (c *Collection) Name() string { return c.name }
 
 // markDropped flags the collection as dropped so background work and
-// late callers stop using it, closes its segment readers, and evicts its
-// documents from the cache. Callers hold Database.mu exclusively.
+// late callers stop using it, closes its active segment and segment
+// readers, and evicts its documents from the cache. Callers hold
+// Database.mu exclusively and the collection's flushMu.
 func (c *Collection) markDropped() {
 	c.mu.Lock()
 	c.dropped = true
 	readers := c.readers
 	c.readers = make(map[uint32]*segment.Reader)
 	c.mu.Unlock()
+	if c.active != nil {
+		// Best effort: the directory is about to be removed, so nothing
+		// written to it matters any more.
+		_ = c.active.Close()
+		c.active = nil
+	}
 	for _, r := range readers {
 		// Best effort: the files are read-only and the directory is about
 		// to be removed; a reader still in use closes on its last Release.
 		_ = r.Close()
 	}
 	c.db.e.cache.InvalidateCollection(c.db.name, c.name)
+}
+
+// closeFiles closes the active segment writer and every segment reader
+// without flushing (cleanup after a failed Open).
+func (c *Collection) closeFiles() error {
+	c.flushMu.Lock()
+	var errs []error
+	if c.active != nil {
+		if err := c.active.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		c.active = nil
+	}
+	c.flushMu.Unlock()
+	if err := c.closeReaders(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // closeReaders closes every open segment reader (engine shutdown).
@@ -169,7 +216,7 @@ func (c *Collection) CreateIndex(ctx context.Context, name, field string) error 
 	if err != nil {
 		return fmt.Errorf("creating index %q: encoding payload: %w", name, err)
 	}
-	off, err := e.appendWAL(ctx, wal.Record{Op: wal.OpCreateIndex, DB: d.name, Coll: c.name, Payload: payload})
+	off, done, err := e.appendMetaWAL(ctx, wal.Record{Op: wal.OpCreateIndex, DB: d.name, Coll: c.name, Payload: payload})
 	if err != nil {
 		return fmt.Errorf("creating index %q: %w", name, err)
 	}
@@ -181,6 +228,7 @@ func (c *Collection) CreateIndex(ctx context.Context, name, field string) error 
 	if err := c.writeMeta(defs, off); err != nil {
 		return fmt.Errorf("creating index %q: %w", name, err)
 	}
+	done()
 
 	c.mu.Lock()
 	c.indexes[name] = ix
@@ -213,7 +261,7 @@ func (c *Collection) DropIndex(ctx context.Context, name string) error {
 	if err != nil {
 		return fmt.Errorf("dropping index %q: encoding payload: %w", name, err)
 	}
-	off, err := e.appendWAL(ctx, wal.Record{Op: wal.OpDropIndex, DB: d.name, Coll: c.name, Payload: payload})
+	off, done, err := e.appendMetaWAL(ctx, wal.Record{Op: wal.OpDropIndex, DB: d.name, Coll: c.name, Payload: payload})
 	if err != nil {
 		return fmt.Errorf("dropping index %q: %w", name, err)
 	}
@@ -225,6 +273,7 @@ func (c *Collection) DropIndex(ctx context.Context, name string) error {
 	if err := c.writeMeta(defs, off); err != nil {
 		return fmt.Errorf("dropping index %q: %w", name, err)
 	}
+	done()
 
 	c.mu.Lock()
 	delete(c.indexes, name)

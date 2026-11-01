@@ -36,6 +36,9 @@ type Options struct {
 	CompactionRatio  float64       // 0.5; must be in (0,1]
 
 	testHook func(hookPoint) error // unexported; set only from export_test.go (see #crash-hooks)
+	// testSegWriter, when set (tests only), wraps every active data
+	// segment writer the flusher opens, to inject slow or failing I/O.
+	testSegWriter func(segmentWriter) segmentWriter
 }
 
 // withDefaults fills zero fields with defaults and validates the result.

@@ -716,7 +716,7 @@ func TestHookMetaWrite(t *testing.T) {
 					return state{next: e.wal.NextOffset(), files: map[string]bool{p: err == nil}}
 				}
 				opts.testHook = func(p hookPoint) error {
-					if !armed || p != hookMetaWrite {
+					if p != hookMetaWrite || !armed { // p first: the flusher calls the hook from another goroutine
 						return nil
 					}
 					called++
