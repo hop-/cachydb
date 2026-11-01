@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hop-/cachydb/pkg/db"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -32,7 +33,8 @@ type Server struct {
 	defaultDBName string
 	transport     string
 	httpAddr      string
-	stderr        io.Writer // startup/shutdown messages; never stdout
+	stderr        io.Writer     // startup/shutdown messages; never stdout
+	stdio         mcp.Transport // the stdio transport; tests replace it
 
 	// sessions maps *mcp.ServerSession to *sessionState: the database the
 	// session selected with use_database.
@@ -63,8 +65,9 @@ func (st *sessionState) set(name string) {
 
 // NewServer creates an MCP server on the opened engine. It creates the
 // default database if it does not exist. transport is "http" or anything
-// else for stdio; httpAddr is the listen address for HTTP.
-func NewServer(ctx context.Context, engine *db.Engine, defaultDBName, transport, httpAddr string) (*Server, error) {
+// else for stdio; httpAddr is the listen address for HTTP; version is the
+// build version reported in the server's implementation info.
+func NewServer(ctx context.Context, engine *db.Engine, defaultDBName, transport, httpAddr, version string) (*Server, error) {
 	if engine == nil {
 		return nil, errors.New("creating MCP server: engine is nil")
 	}
@@ -78,18 +81,39 @@ func NewServer(ctx context.Context, engine *db.Engine, defaultDBName, transport,
 		transport:     transport,
 		httpAddr:      httpAddr,
 		stderr:        os.Stderr,
+		stdio:         &mcp.StdioTransport{},
 	}
 
 	s.server = mcp.NewServer(&mcp.Implementation{
 		Name:    "cachydb",
-		Version: "1.0.0",
+		Title:   "CachyDB document database",
+		Version: version,
 	}, &mcp.ServerOptions{
+		Instructions: Instructions(),
 		InitializedHandler: func(_ context.Context, req *mcp.InitializedRequest) {
 			s.trackSession(req.Session)
 		},
 	})
+	// Clients on protocol 2026-07-28 and later skip the initialize
+	// handshake (server/discover), so InitializedHandler never runs for
+	// them: also track the session on every request it sends.
+	s.server.AddReceivingMiddleware(s.trackSessionMiddleware)
 	s.registerTools(s.server)
+	if err := registerDocsResources(s.server); err != nil {
+		return nil, fmt.Errorf("creating MCP server: %w", err)
+	}
 	return s, nil
+}
+
+// trackSessionMiddleware registers the session of every incoming request
+// (see trackSession) before handling it.
+func (s *Server) trackSessionMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		if ss, ok := req.GetSession().(*mcp.ServerSession); ok && ss != nil {
+			s.trackSession(ss)
+		}
+		return next(ctx, method, req)
+	}
 }
 
 // Start runs the configured transport until ctx is cancelled or, for
@@ -185,13 +209,38 @@ func (s *Server) sessionDatabase(ss *mcp.ServerSession) string {
 	return ""
 }
 
-// startStdio serves one session over stdin/stdout.
+// errServerClosing matches the SDK's internal "server is closing" JSON-RPC
+// error (code -32004); the SDK's WireError.Is compares codes.
+var errServerClosing = &jsonrpc.Error{Code: -32004}
+
+// isEndOfInput reports whether err only says that the client closed its
+// end of the stdio connection, which is a normal way for a session to end.
+func isEndOfInput(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, mcp.ErrConnectionClosed) ||
+		errors.Is(err, errServerClosing)
+}
+
+// startStdio serves one session over stdin/stdout. The session ends when
+// ctx is cancelled or the client closes stdin; both are a clean shutdown
+// and return nil, so the engine is closed and the process exits 0.
+//
+// When stdin closes while requests are still in flight, the SDK (v1.8.0)
+// cancels them and their responses are not written: a client must keep
+// stdin open until it has read the responses it needs.
 func (s *Server) startStdio(ctx context.Context) error {
-	err := s.server.Run(ctx, &mcp.StdioTransport{})
-	if err != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+	err := s.server.Run(ctx, s.stdio)
+	switch {
+	case err == nil:
 		return nil
+	case ctx.Err() != nil && errors.Is(err, ctx.Err()):
+		return nil
+	case isEndOfInput(err):
+		return nil
+	default:
+		return fmt.Errorf("stdio transport: %w", err)
 	}
-	return err
 }
 
 // httpHandler returns the Streamable HTTP handler serving s.server.
@@ -258,146 +307,19 @@ func (s *Server) startHTTP(ctx context.Context) error {
 	return nil
 }
 
-// registerTools registers all MCP tools
-func (s *Server) registerTools(server *mcp.Server) {
-	// Database management tools
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "create_database",
-		Description: "Create a new database",
-	}, s.createDatabaseTool)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "list_databases",
-		Description: "List all databases",
-	}, s.listDatabasesTool)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "delete_database",
-		Description: "Delete a database",
-	}, s.deleteDatabaseTool)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "use_database",
-		Description: "Switch default database for subsequent operations in this session",
-	}, s.useDatabaseTool)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "current_database",
-		Description: "Get the current default database name for this session",
-	}, s.currentDatabaseTool)
-
-	// Collection management tools
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "create_collection",
-		Description: "Create a new collection with optional schema",
-	}, s.createCollectionTool)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "list_collections",
-		Description: "List all collections in a database",
-	}, s.listCollectionsTool)
-
-	// Document management tools
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "insert_document",
-		Description: "Insert a document into a collection",
-	}, s.insertDocumentTool)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "find_documents",
-		Description: "Find documents in a collection",
-	}, s.findDocumentsTool)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "update_document",
-		Description: "Update a document by ID",
-	}, s.updateDocumentTool)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "delete_document",
-		Description: "Delete a document by ID",
-	}, s.deleteDocumentTool)
-
-	// Index management tools
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "create_index",
-		Description: "Create an index on a collection field",
-	}, s.createIndexTool)
-}
-
-// Tool input/output types
-
-// Database management inputs
-type CreateDatabaseInput struct {
-	Name string `json:"name" jsonschema:"Name of the database"`
-}
-
-type ListDatabasesInput struct{}
-
-type DeleteDatabaseInput struct {
-	Name string `json:"name" jsonschema:"Name of the database to delete"`
-}
-
-type UseDatabaseInput struct {
-	Name string `json:"name" jsonschema:"Name of the database to use as default"`
-}
-
-type CurrentDatabaseInput struct{}
-
-// Collection management inputs
-type CreateCollectionInput struct {
-	Database string                 `json:"database,omitempty" jsonschema:"Database name (optional, defaults to configured database)"`
-	Name     string                 `json:"name" jsonschema:"Name of the collection"`
-	Schema   map[string]interface{} `json:"schema,omitempty" jsonschema:"Optional schema definition with fields"`
-}
-
-type InsertDocumentInput struct {
-	Database   string                 `json:"database,omitempty" jsonschema:"Database name (optional, defaults to configured database)"`
-	Collection string                 `json:"collection" jsonschema:"Name of the collection"`
-	Document   map[string]interface{} `json:"document" jsonschema:"Document data to insert"`
-}
-
-type FindDocumentsInput struct {
-	Database   string                 `json:"database,omitempty" jsonschema:"Database name (optional, defaults to configured database)"`
-	Collection string                 `json:"collection" jsonschema:"Name of the collection"`
-	Query      map[string]interface{} `json:"query,omitempty" jsonschema:"Query filters, limit, and skip"`
-}
-
-type UpdateDocumentInput struct {
-	Database   string                 `json:"database,omitempty" jsonschema:"Database name (optional, defaults to configured database)"`
-	Collection string                 `json:"collection" jsonschema:"Name of the collection"`
-	ID         string                 `json:"id" jsonschema:"Document ID"`
-	Updates    map[string]interface{} `json:"updates" jsonschema:"Fields to update"`
-}
-
-type DeleteDocumentInput struct {
-	Database   string `json:"database,omitempty" jsonschema:"Database name (optional, defaults to configured database)"`
-	Collection string `json:"collection" jsonschema:"Name of the collection"`
-	ID         string `json:"id" jsonschema:"Document ID"`
-}
-
-type CreateIndexInput struct {
-	Database   string `json:"database,omitempty" jsonschema:"Database name (optional, defaults to configured database)"`
-	Collection string `json:"collection" jsonschema:"Name of the collection"`
-	IndexName  string `json:"index_name" jsonschema:"Name for the index"`
-	FieldName  string `json:"field_name" jsonschema:"Field to index"`
-}
-
-type ListCollectionsInput struct {
-	Database string `json:"database,omitempty" jsonschema:"Database name (optional, defaults to configured database)"`
-}
-
 // Helper methods
 
 // toolError turns an engine error into the error a tool returns; the SDK
 // reports it to the client as a tool error (IsError) carrying the message.
+// Client errors end with a short hint on what to do next.
 func toolError(action string, err error) error {
 	switch {
-	case errors.Is(err, db.ErrNotFound),
-		errors.Is(err, db.ErrExists),
-		errors.Is(err, db.ErrInvalidName),
-		errors.Is(err, db.ErrSchemaValidation):
-		// Client errors: the engine message names the object and reason.
+	case errors.Is(err, db.ErrNotFound):
+		return fmt.Errorf("%s: %w (hint: list_databases and list_collections show what exists; current_database shows the database used when none is given)", action, err)
+	case errors.Is(err, db.ErrSchemaValidation):
+		return fmt.Errorf("%s: %w (hint: see resource cachydb://docs/schema)", action, err)
+	case errors.Is(err, db.ErrExists), errors.Is(err, db.ErrInvalidName):
+		// The engine message names the object and the rule.
 		return fmt.Errorf("%s: %w", action, err)
 	case errors.Is(err, db.ErrClosed):
 		return fmt.Errorf("%s: the database engine is shut down: %w", action, err)
@@ -446,158 +368,92 @@ func nonNil(names []string) []string {
 
 // Tool handlers
 
-// Database management handlers
-func (s *Server) createDatabaseTool(
-	ctx context.Context,
-	req *mcp.CallToolRequest,
-	input CreateDatabaseInput,
-) (*mcp.CallToolResult, map[string]interface{}, error) {
-	if _, err := s.engine.CreateDatabase(ctx, input.Name); err != nil {
-		return nil, nil, toolError("create database", err)
+func (s *Server) createDatabaseTool(ctx context.Context, _ *mcp.CallToolRequest, in CreateDatabaseInput) (*mcp.CallToolResult, MessageOutput, error) {
+	if _, err := s.engine.CreateDatabase(ctx, in.Name); err != nil {
+		return nil, MessageOutput{}, toolError("create database", err)
 	}
-
-	return nil, map[string]interface{}{
-		"success": true,
-		"message": fmt.Sprintf("Database '%s' created successfully", input.Name),
-	}, nil
+	return nil, MessageOutput{Success: true, Message: fmt.Sprintf("Database '%s' created successfully", in.Name)}, nil
 }
 
-func (s *Server) listDatabasesTool(
-	ctx context.Context,
-	req *mcp.CallToolRequest,
-	input ListDatabasesInput,
-) (*mcp.CallToolResult, map[string]interface{}, error) {
-	return nil, map[string]interface{}{
-		"success":   true,
-		"databases": nonNil(s.engine.ListDatabases()),
-	}, nil
+func (s *Server) listDatabasesTool(context.Context, *mcp.CallToolRequest, ListDatabasesInput) (*mcp.CallToolResult, ListDatabasesOutput, error) {
+	return nil, ListDatabasesOutput{Success: true, Databases: nonNil(s.engine.ListDatabases())}, nil
 }
 
-func (s *Server) deleteDatabaseTool(
-	ctx context.Context,
-	req *mcp.CallToolRequest,
-	input DeleteDatabaseInput,
-) (*mcp.CallToolResult, map[string]interface{}, error) {
-	if err := s.engine.DropDatabase(ctx, input.Name); err != nil {
-		return nil, nil, toolError("delete database", err)
+func (s *Server) deleteDatabaseTool(ctx context.Context, _ *mcp.CallToolRequest, in DeleteDatabaseInput) (*mcp.CallToolResult, MessageOutput, error) {
+	if err := s.engine.DropDatabase(ctx, in.Name); err != nil {
+		return nil, MessageOutput{}, toolError("delete database", err)
 	}
-
-	return nil, map[string]interface{}{
-		"success": true,
-		"message": fmt.Sprintf("Database '%s' deleted successfully", input.Name),
-	}, nil
+	return nil, MessageOutput{Success: true, Message: fmt.Sprintf("Database '%s' deleted successfully", in.Name)}, nil
 }
 
-func (s *Server) useDatabaseTool(
-	ctx context.Context,
-	req *mcp.CallToolRequest,
-	input UseDatabaseInput,
-) (*mcp.CallToolResult, map[string]interface{}, error) {
-	if _, err := s.engine.Database(input.Name); err != nil {
-		return nil, nil, toolError("use database", err)
+func (s *Server) useDatabaseTool(_ context.Context, req *mcp.CallToolRequest, in UseDatabaseInput) (*mcp.CallToolResult, UseDatabaseOutput, error) {
+	if _, err := s.engine.Database(in.Name); err != nil {
+		return nil, UseDatabaseOutput{}, toolError("use database", err)
 	}
 	if req.Session == nil {
-		return nil, nil, errors.New("use database: no MCP session")
+		return nil, UseDatabaseOutput{}, errors.New("use database: no MCP session")
 	}
-	s.trackSession(req.Session).set(input.Name)
-
-	return nil, map[string]interface{}{
-		"success":          true,
-		"message":          fmt.Sprintf("Now using database '%s' as default", input.Name),
-		"current_database": input.Name,
+	s.trackSession(req.Session).set(in.Name)
+	return nil, UseDatabaseOutput{
+		Success:         true,
+		Message:         fmt.Sprintf("Now using database '%s' as default", in.Name),
+		CurrentDatabase: in.Name,
 	}, nil
 }
 
-func (s *Server) currentDatabaseTool(
-	ctx context.Context,
-	req *mcp.CallToolRequest,
-	input CurrentDatabaseInput,
-) (*mcp.CallToolResult, map[string]interface{}, error) {
-	return nil, map[string]interface{}{
-		"success":          true,
-		"current_database": s.databaseName(req.Session, ""),
-	}, nil
+func (s *Server) currentDatabaseTool(_ context.Context, req *mcp.CallToolRequest, _ CurrentDatabaseInput) (*mcp.CallToolResult, CurrentDatabaseOutput, error) {
+	return nil, CurrentDatabaseOutput{Success: true, CurrentDatabase: s.databaseName(req.Session, "")}, nil
 }
 
-// parseSchema converts the create_collection schema argument
-// ({"fields": {name: {"type": ..., "required": ...}}}) to a *db.Schema.
-func parseSchema(raw map[string]interface{}) *db.Schema {
-	if raw == nil {
+// toDBSchema converts the create_collection schema argument to a
+// *db.Schema (nil for a schemaless collection).
+func toDBSchema(in *SchemaDef) *db.Schema {
+	if in == nil {
 		return nil
 	}
-	schema := &db.Schema{
-		Fields: make(map[string]db.Field),
-	}
-	if fields, ok := raw["fields"].(map[string]interface{}); ok {
-		for fieldName, fieldData := range fields {
-			if fieldMap, ok := fieldData.(map[string]interface{}); ok {
-				field := db.Field{}
-				if t, ok := fieldMap["type"].(string); ok {
-					field.Type = db.FieldType(t)
-				}
-				if r, ok := fieldMap["required"].(bool); ok {
-					field.Required = r
-				}
-				schema.Fields[fieldName] = field
-			}
-		}
+	schema := &db.Schema{Fields: make(map[string]db.Field, len(in.Fields))}
+	for name, f := range in.Fields {
+		schema.Fields[name] = db.Field{Type: db.FieldType(f.Type), Required: f.Required}
 	}
 	return schema
 }
 
-// Collection management handlers
-func (s *Server) createCollectionTool(
-	ctx context.Context,
-	req *mcp.CallToolRequest,
-	input CreateCollectionInput,
-) (*mcp.CallToolResult, map[string]interface{}, error) {
-	database, err := s.engine.Database(s.databaseName(req.Session, input.Database))
+func (s *Server) createCollectionTool(ctx context.Context, req *mcp.CallToolRequest, in CreateCollectionInput) (*mcp.CallToolResult, MessageOutput, error) {
+	database, err := s.engine.Database(s.databaseName(req.Session, in.Database))
 	if err != nil {
-		return nil, nil, toolError("create collection", err)
+		return nil, MessageOutput{}, toolError("create collection", err)
 	}
-
-	if err := database.CreateCollection(ctx, input.Name, parseSchema(input.Schema)); err != nil {
-		return nil, nil, toolError("create collection", err)
+	if err := database.CreateCollection(ctx, in.Name, toDBSchema(in.Schema)); err != nil {
+		return nil, MessageOutput{}, toolError("create collection", err)
 	}
-
-	return nil, map[string]interface{}{
-		"success": true,
-		"message": fmt.Sprintf("Collection '%s' created in database '%s'", input.Name, database.Name()),
+	return nil, MessageOutput{
+		Success: true,
+		Message: fmt.Sprintf("Collection '%s' created in database '%s'", in.Name, database.Name()),
 	}, nil
 }
 
-func (s *Server) listCollectionsTool(
-	ctx context.Context,
-	req *mcp.CallToolRequest,
-	input ListCollectionsInput,
-) (*mcp.CallToolResult, map[string]interface{}, error) {
-	database, err := s.engine.Database(s.databaseName(req.Session, input.Database))
+func (s *Server) listCollectionsTool(_ context.Context, req *mcp.CallToolRequest, in ListCollectionsInput) (*mcp.CallToolResult, ListCollectionsOutput, error) {
+	database, err := s.engine.Database(s.databaseName(req.Session, in.Database))
 	if err != nil {
-		return nil, nil, toolError("list collections", err)
+		return nil, ListCollectionsOutput{}, toolError("list collections", err)
 	}
-
-	return nil, map[string]interface{}{
-		"success":     true,
-		"collections": nonNil(database.ListCollections()),
-		"database":    database.Name(),
+	return nil, ListCollectionsOutput{
+		Success:     true,
+		Collections: nonNil(database.ListCollections()),
+		Database:    database.Name(),
 	}, nil
 }
 
-// Document management handlers
-func (s *Server) insertDocumentTool(
-	ctx context.Context,
-	req *mcp.CallToolRequest,
-	input InsertDocumentInput,
-) (*mcp.CallToolResult, map[string]interface{}, error) {
-	coll, err := s.getCollection(req.Session, input.Database, input.Collection, "insert document")
+func (s *Server) insertDocumentTool(ctx context.Context, req *mcp.CallToolRequest, in InsertDocumentInput) (*mcp.CallToolResult, InsertDocumentOutput, error) {
+	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "insert document")
 	if err != nil {
-		return nil, nil, err
+		return nil, InsertDocumentOutput{}, err
 	}
 
 	// A string "_id" in the document is the client-chosen document ID; the
 	// engine takes it as Document.ID, not as a data field.
-	doc := &db.Document{Data: make(map[string]any, len(input.Document))}
-	for k, v := range input.Document {
+	doc := &db.Document{Data: make(map[string]any, len(in.Document))}
+	for k, v := range in.Document {
 		if k == "_id" {
 			if id, ok := v.(string); ok {
 				doc.ID = id
@@ -609,138 +465,78 @@ func (s *Server) insertDocumentTool(
 
 	id, err := coll.Insert(ctx, doc)
 	if err != nil {
-		return nil, nil, toolError("insert document", err)
+		return nil, InsertDocumentOutput{}, toolError("insert document", err)
 	}
-
-	return nil, map[string]interface{}{
-		"success": true,
-		"id":      id,
-		"message": fmt.Sprintf("Document inserted with ID: %s", id),
-	}, nil
+	return nil, InsertDocumentOutput{Success: true, ID: id, Message: fmt.Sprintf("Document inserted with ID: %s", id)}, nil
 }
 
-// parseQuery converts the find_documents query argument
-// ({"filters": [{field, operator, value}], "limit": n, "skip": n}).
-func parseQuery(raw map[string]interface{}) *db.Query {
-	query := &db.Query{}
-	if raw == nil {
-		return query
+// toDBQuery converts the find_documents query argument to a *db.Query.
+func toDBQuery(in *Query) *db.Query {
+	q := &db.Query{}
+	if in == nil {
+		return q
 	}
-	if filters, ok := raw["filters"].([]interface{}); ok {
-		for _, f := range filters {
-			if filterMap, ok := f.(map[string]interface{}); ok {
-				filter := db.QueryFilter{}
-				if field, ok := filterMap["field"].(string); ok {
-					filter.Field = field
-				}
-				if op, ok := filterMap["operator"].(string); ok {
-					filter.Operator = op
-				}
-				if val, ok := filterMap["value"]; ok {
-					filter.Value = val
-				}
-				query.Filters = append(query.Filters, filter)
-			}
-		}
+	for _, f := range in.Filters {
+		q.Filters = append(q.Filters, db.QueryFilter{Field: f.Field, Operator: string(f.Operator), Value: f.Value})
 	}
-	if limit, ok := raw["limit"].(float64); ok {
-		query.Limit = int(limit)
-	}
-	if skip, ok := raw["skip"].(float64); ok {
-		query.Skip = int(skip)
-	}
-	return query
+	q.Limit, q.Skip = in.Limit, in.Skip
+	return q
 }
 
-func (s *Server) findDocumentsTool(
-	ctx context.Context,
-	req *mcp.CallToolRequest,
-	input FindDocumentsInput,
-) (*mcp.CallToolResult, map[string]interface{}, error) {
-	coll, err := s.getCollection(req.Session, input.Database, input.Collection, "find documents")
+func (s *Server) findDocumentsTool(ctx context.Context, req *mcp.CallToolRequest, in FindDocumentsInput) (*mcp.CallToolResult, FindDocumentsOutput, error) {
+	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "find documents")
 	if err != nil {
-		return nil, nil, err
+		return nil, FindDocumentsOutput{}, err
+	}
+	docs, err := coll.Find(ctx, toDBQuery(in.Query))
+	if err != nil {
+		return nil, FindDocumentsOutput{}, toolError("find documents", err)
 	}
 
-	docs, err := coll.Find(ctx, parseQuery(input.Query))
-	if err != nil {
-		return nil, nil, toolError("find documents", err)
-	}
-
-	// Convert documents to JSON for output
-	docsJSON := make([]interface{}, len(docs))
+	out := make([]map[string]any, len(docs))
 	for i, doc := range docs {
-		docMap := make(map[string]interface{}, len(doc.Data)+1)
+		m := make(map[string]any, len(doc.Data)+1)
 		for k, v := range doc.Data {
-			docMap[k] = v
+			m[k] = v
 		}
-		docMap["_id"] = doc.ID
-		docsJSON[i] = docMap
+		m["_id"] = doc.ID
+		out[i] = m
 	}
-
-	return nil, map[string]interface{}{
-		"success":   true,
-		"count":     len(docs),
-		"documents": docsJSON,
-	}, nil
+	return nil, FindDocumentsOutput{Success: true, Count: len(docs), Documents: out}, nil
 }
 
-func (s *Server) updateDocumentTool(
-	ctx context.Context,
-	req *mcp.CallToolRequest,
-	input UpdateDocumentInput,
-) (*mcp.CallToolResult, map[string]interface{}, error) {
-	coll, err := s.getCollection(req.Session, input.Database, input.Collection, "update document")
+func (s *Server) updateDocumentTool(ctx context.Context, req *mcp.CallToolRequest, in UpdateDocumentInput) (*mcp.CallToolResult, MessageOutput, error) {
+	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "update document")
 	if err != nil {
-		return nil, nil, err
+		return nil, MessageOutput{}, err
 	}
-
-	if _, err := coll.Update(ctx, input.ID, input.Updates); err != nil {
-		return nil, nil, toolError("update document", err)
+	if _, err := coll.Update(ctx, in.ID, in.Updates); err != nil {
+		return nil, MessageOutput{}, toolError("update document", err)
 	}
-
-	return nil, map[string]interface{}{
-		"success": true,
-		"message": fmt.Sprintf("Document %s updated", input.ID),
-	}, nil
+	return nil, MessageOutput{Success: true, Message: fmt.Sprintf("Document %s updated", in.ID)}, nil
 }
 
-func (s *Server) deleteDocumentTool(
-	ctx context.Context,
-	req *mcp.CallToolRequest,
-	input DeleteDocumentInput,
-) (*mcp.CallToolResult, map[string]interface{}, error) {
-	coll, err := s.getCollection(req.Session, input.Database, input.Collection, "delete document")
+func (s *Server) deleteDocumentTool(ctx context.Context, req *mcp.CallToolRequest, in DeleteDocumentInput) (*mcp.CallToolResult, MessageOutput, error) {
+	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "delete document")
 	if err != nil {
-		return nil, nil, err
+		return nil, MessageOutput{}, err
 	}
-
-	if err := coll.Delete(ctx, input.ID); err != nil {
-		return nil, nil, toolError("delete document", err)
+	if err := coll.Delete(ctx, in.ID); err != nil {
+		return nil, MessageOutput{}, toolError("delete document", err)
 	}
-
-	return nil, map[string]interface{}{
-		"success": true,
-		"message": fmt.Sprintf("Document %s deleted", input.ID),
-	}, nil
+	return nil, MessageOutput{Success: true, Message: fmt.Sprintf("Document %s deleted", in.ID)}, nil
 }
 
-func (s *Server) createIndexTool(
-	ctx context.Context,
-	req *mcp.CallToolRequest,
-	input CreateIndexInput,
-) (*mcp.CallToolResult, map[string]interface{}, error) {
-	coll, err := s.getCollection(req.Session, input.Database, input.Collection, "create index")
+func (s *Server) createIndexTool(ctx context.Context, req *mcp.CallToolRequest, in CreateIndexInput) (*mcp.CallToolResult, MessageOutput, error) {
+	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "create index")
 	if err != nil {
-		return nil, nil, err
+		return nil, MessageOutput{}, err
 	}
-
-	if err := coll.CreateIndex(ctx, input.IndexName, input.FieldName); err != nil {
-		return nil, nil, toolError("create index", err)
+	if err := coll.CreateIndex(ctx, in.IndexName, in.FieldName); err != nil {
+		return nil, MessageOutput{}, toolError("create index", err)
 	}
-
-	return nil, map[string]interface{}{
-		"success": true,
-		"message": fmt.Sprintf("Index '%s' created on field '%s'", input.IndexName, input.FieldName),
+	return nil, MessageOutput{
+		Success: true,
+		Message: fmt.Sprintf("Index '%s' created on field '%s'", in.IndexName, in.FieldName),
 	}, nil
 }

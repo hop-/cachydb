@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
 
@@ -31,7 +32,7 @@ type Engine struct {
 	logger *slog.Logger
 	lock   *fsutil.Lock
 	wal    *wal.Log
-	cache  *cache.LRU // encoded documents read from data segments
+	cache  *cache.LRU[cachedDoc] // decoded documents read from data segments
 
 	// metaMu serializes database-level metadata operations (create/drop
 	// database) including their I/O.
@@ -48,11 +49,24 @@ type Engine struct {
 	lwMu         sync.Mutex
 	metaInflight []uint64
 
+	// metacpMu guards metacp, the metadata checkpoint last persisted in
+	// cachydb.metacp (metacp.go); it serializes the file's rewrites.
+	metacpMu sync.Mutex
+	metacp   uint64
+	// metacpLoaded reports that metacp was read from a valid file at Open
+	// (replayStart uses it only then).
+	metacpLoaded bool
+
 	// recov counts what recovery did at Open.
 	recov recoveryStats
 
-	// flushKick wakes the flusher when a memtable exceeds MemtableSize.
+	// flushKick wakes the flusher when a memtable exceeds MemtableSize or
+	// writers wait on MaxPendingBytes.
 	flushKick chan struct{}
+
+	// pending counts the unflushed bytes of all collections for write
+	// backpressure (backpressure.go).
+	pending *pendingBytes
 
 	// Close gate: public operations enter() before touching state and
 	// exit() when done; Close sets closed and waits for them.
@@ -102,6 +116,10 @@ func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 		}
 		return nil, fmt.Errorf("opening %s: %w", root, err)
 	}
+	if !lock.Supported() {
+		opts.Logger.Warn("cachydb: data-dir locking unsupported on "+runtime.GOOS+
+			"; do not open this directory from two processes at once", "dir", root)
+	}
 	defer func() {
 		if err != nil {
 			if rerr := lock.Release(); rerr != nil {
@@ -144,14 +162,18 @@ func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 		logger:    opts.Logger,
 		lock:      lock,
 		wal:       wlog,
-		cache:     cache.New(opts.CacheSize),
+		cache:     newDocCache(opts.CacheSize),
 		databases: make(map[string]*Database),
 		flushKick: make(chan struct{}, 1),
+		pending:   newPendingBytes(),
 	}
 	if err := e.recover(ctx); err != nil {
 		e.closeCollectionFiles()
 		return nil, fmt.Errorf("opening %s: %w", root, err)
 	}
+	// Replay applied every metadata record it found: persist that, so the
+	// next Open starts after them.
+	e.writeMetaCheckpoint()
 	e.bgCtx, e.bgCancel = context.WithCancel(context.Background())
 	e.startFlusher()
 	e.startCompactor()
@@ -267,6 +289,7 @@ func (e *Engine) close(ctx context.Context) error {
 	e.gateMu.Lock()
 	e.closed = true
 	e.gateMu.Unlock()
+	e.pending.broadcast() // writers waiting on MaxPendingBytes return ErrClosed
 	if err := waitCtx(ctx, &e.ops); err != nil {
 		errs = append(errs, fmt.Errorf("waiting for in-flight operations: %w", err))
 	}
@@ -284,6 +307,7 @@ func (e *Engine) close(ctx context.Context) error {
 				errs = append(errs, err)
 			}
 		}
+		e.writeMetaCheckpoint()
 	}
 
 	e.mu.RLock()

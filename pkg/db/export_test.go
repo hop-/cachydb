@@ -1,7 +1,12 @@
 package db
 
 import (
+	"fmt"
+	"strings"
+	"sync"
 	"sync/atomic"
+	"testing"
+	"time"
 )
 
 // Crash-test helpers (interfaces.md #crash-hooks).
@@ -12,17 +17,39 @@ import (
 // dead process does nothing more. The operation (or flush) that hit the
 // hook returns at once without cleanup. Tests then call abandon and
 // reopen the directory with opts.testHook cleared.
-func crashAt(opts *Options, p hookPoint) {
-	var dead atomic.Bool
+//
+// If t fails, the hook calls the engine made (point, time since arming, and
+// whether the call crashed) are logged, so an intermittent failure shows
+// where the simulated crash really happened.
+func crashAt(t *testing.T, opts *Options, p hookPoint) {
+	t.Helper()
+	var (
+		dead  atomic.Bool
+		mu    sync.Mutex
+		calls []string
+	)
+	start := time.Now()
 	opts.testHook = func(at hookPoint) error {
 		if at == p {
 			dead.Store(true)
 		}
-		if dead.Load() {
+		crashed := dead.Load()
+		mu.Lock()
+		calls = append(calls, fmt.Sprintf("%s +%v crashed=%v", at, time.Since(start).Round(time.Microsecond), crashed))
+		mu.Unlock()
+		if crashed {
 			return errSimulatedCrash
 		}
 		return nil
 	}
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		t.Logf("crash hook armed at %s; %d hook calls:\n  %s", p, len(calls), strings.Join(calls, "\n  "))
+	})
 }
 
 // abandon stops e the way a dead process would leave it: no final flush
@@ -35,6 +62,7 @@ func (e *Engine) abandon() {
 		e.gateMu.Lock()
 		e.closed = true
 		e.gateMu.Unlock()
+		e.pending.broadcast()
 		e.ops.Wait()
 		e.bgCancel()
 		e.bg.Wait()

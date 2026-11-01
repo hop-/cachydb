@@ -9,11 +9,16 @@ import (
 	"strings"
 
 	"github.com/hop-/cachydb/pkg/db/internal/fsutil"
+	"github.com/hop-/cachydb/pkg/db/internal/wal"
 )
 
 // FormatVersion is the on-disk data-directory format this build reads and
 // writes. Version 1 is the legacy layout (no cachydb.format file).
 const FormatVersion = 2
+
+// WALFormatVersion is the write-ahead log segment format this build reads
+// and writes.
+const WALFormatVersion = wal.FormatVersion
 
 const (
 	formatFileName = "cachydb.format"

@@ -8,15 +8,21 @@ databases, supports optional schema validation and multi-value secondary
 indexes, and exposes everything as MCP tools for AI assistants. It ships as
 one Go binary; `pkg/db` is also usable as an embedded Go library.
 
-Supported platforms: **Linux and macOS**. Windows compiles but is not
-supported (no data-directory lock, no directory fsync).
+Supported platforms: **Linux and macOS** (the BSDs also get the
+data-directory lock). Windows, Solaris, illumos, and AIX compile; there the
+lock is a no-op with a logged warning, and Windows is not supported at
+runtime (no directory fsync either).
+
+For AI agents using cachydb (not developing it), the binary documents
+itself: `cachydb --help`, `cachydb docs`, and over MCP typed tool schemas,
+server instructions, and `cachydb://docs/<topic>` resources.
 
 ## Related docs
 
 - [DATABASE_ENGINE.md](DATABASE_ENGINE.md) — `pkg/db` public API, documents, schemas, query and index semantics, migrations
 - [STORAGE.md](STORAGE.md) — on-disk layout and formats, WAL, data segments, flush, recovery, compaction, lock order
 - [MCP_SERVER.md](MCP_SERVER.md) — the 12 MCP tools, transports, sessions, errors
-- [CLI.md](CLI.md) — commands, flags, environment variables, known issues
+- [CLI.md](CLI.md) — commands (incl. `docs`, `version --json`), flags, environment variables, known issues
 - [DEVELOPMENT.md](DEVELOPMENT.md) — coding patterns, testing, benchmarks, known limitations
 
 ## High-Level Architecture
@@ -42,7 +48,7 @@ supported (no data-directory lock, no directory fsync).
 │  validate → docLock → WAL append+fsync (commit) → memtable   │
 │  ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌────────────────┐  │
 │  │ query /  │ │ schema    │ │ indexes  │ │ LRU cache      │  │
-│  │ compare  │ │ validation│ │ (multi)  │ │ (encoded docs) │  │
+│  │ compare  │ │ validation│ │ (multi)  │ │ (decoded docs) │  │
 │  └──────────┘ └───────────┘ └──────────┘ └────────────────┘  │
 │  background: flusher · compactor · WAL retention             │
 │  internal/wal       group-commit log, retention              │
@@ -61,15 +67,19 @@ cachydb/
 ├── go.mod                   # github.com/hop-/cachydb, Go 1.25.5
 ├── internal/
 │   ├── app/                 # Builder (options → Engine + MCP server), App Start/Stop
-│   ├── cmd/                 # cobra commands: root/app, version, utils list/migrate, flags
+│   ├── cmd/                 # cobra commands: root/app, docs, version, utils list/migrate, flags
 │   ├── config/              # envconfig settings, ByteSize parser, Windows root dir name
-│   └── mcp/server.go        # MCP server, tool handlers, sessions, transports
+│   ├── docs/                # embedded agent docs topics (cachydb docs, MCP resources)
+│   └── mcp/                 # server.go: handlers, sessions, transports;
+│                            # tools.go: tool definitions; docs.go: instructions, resources
 ├── pkg/db/
 │   ├── engine.go            # Engine, Open/Close, database create/drop
 │   ├── database.go          # Database, collection create/drop
 │   ├── collection.go        # Collection state, CreateIndex/DropIndex
 │   ├── document.go          # write path, read path, Find
-│   ├── flush.go             # flusher, checkpoint markers, low-water mark
+│   ├── flush.go             # parallel flusher, checkpoint markers, low-water mark
+│   ├── backpressure.go      # MaxPendingBytes write backpressure
+│   ├── metacp.go            # cachydb.metacp metadata checkpoint
 │   ├── recovery.go          # load at Open, idempotent WAL replay
 │   ├── compact.go           # background compaction
 │   ├── compare.go index.go  # query comparison, multi-value index
@@ -98,7 +108,8 @@ cachydb/
 5. **Last writer wins by WAL offset**: every record carries its WAL offset,
    so loading and replay are order-independent and idempotent.
 6. **Bounded RAM**: only keys, indexes, memtables, and the LRU cache live in
-   memory; documents are read from disk.
+   memory; documents are read from disk. Unflushed memtable bytes are
+   bounded by `MaxPendingBytes` (writers wait while over it).
 7. **Clean lifecycle**: exclusive data-directory lock, graceful shutdown
    with a final flush, only MCP traffic on stdout (logs go to stderr via
    `slog`).
@@ -109,12 +120,14 @@ cachydb/
 
 ```
 MCP handler → Collection.Insert(ctx, doc)
+  0. wait while unflushed bytes >= MaxPendingBytes (ctx-aware, no lock held)
   1. Database.mu (shared) → docLock(id) → read current version
   2. build after-image, JSON round-trip, schema validation
   3. WAL append; group commit fsync                 ← commit point
   4. apply under Collection.mu: memtable, indexes, cache invalidation, count
   5. return id
-background flusher (every 1s or memtable > 16 MiB):
+background flusher (every 1s, memtable > 16 MiB, or writers waiting;
+up to FlushWorkers collections in parallel):
   memtable → active data segment + checkpoint marker, one fsync → keydir
 ```
 
@@ -123,7 +136,7 @@ background flusher (every 1s or memtable > 16 MiB):
 ```
 Collection.Find(ctx, query)
   candidates: smallest indexed-eq id set, else all live ids; sorted by _id
-  per id: memtable → flushing → LRU cache → keydir → ReadAt + zstd + JSON
+  per id: memtable → flushing → LRU cache (decoded) → keydir → ReadAt + zstd + JSON
   filter, skip, stop at skip+limit; return deep copies
 ```
 
@@ -133,9 +146,11 @@ Collection.Find(ctx, query)
 cmd.Execute → config.Init → cobra → runApp
   app.Builder.Build → db.Open
      lock cachydb.lock → check cachydb.format → open WAL (torn-tail fix)
-     → load meta, keydirs, indexes → replay WAL → start flusher,
-       compactor, retention
-  → mcp.NewServer (creates the default database "main" if missing)
+     → load meta, keydirs, indexes → replay WAL from
+       min(cachydb.metacp + 1, collection floors) → write cachydb.metacp
+       → start flusher, compactor, retention
+  → mcp.NewServer (creates the default database, -d/--db or DB_NAME,
+     default "main"; registers tools, docs resources, instructions)
   → App.Start: run stdio or HTTP transport
 ```
 

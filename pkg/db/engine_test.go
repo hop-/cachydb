@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -26,6 +27,7 @@ func testOptions(dir string) Options {
 // openEngine opens dir and closes the engine at test cleanup.
 func openEngine(t *testing.T, opts Options) *Engine {
 	t.Helper()
+	logDirOnFailure(t, opts.Dir)
 	e, err := Open(context.Background(), opts)
 	if err != nil {
 		t.Fatalf("Open(%s): %v", opts.Dir, err)
@@ -36,6 +38,47 @@ func openEngine(t *testing.T, opts Options) *Engine {
 		}
 	})
 	return e
+}
+
+// dirLogged dedups logDirOnFailure registrations per (test, directory).
+var dirLogged sync.Map
+
+// logDirOnFailure lists every file under dir (path and size) at the end of
+// a failed test, once per test and directory, so an intermittent failure
+// leaves the on-disk state that led to it in the log.
+func logDirOnFailure(t *testing.T, dir string) {
+	t.Helper()
+	type key struct {
+		t   *testing.T
+		dir string
+	}
+	k := key{t, dir}
+	if _, loaded := dirLogged.LoadOrStore(k, true); loaded {
+		return
+	}
+	t.Cleanup(func() {
+		defer dirLogged.Delete(k)
+		if !t.Failed() {
+			return
+		}
+		var b strings.Builder
+		err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			rel, _ := filepath.Rel(dir, path) // path is under dir
+			fmt.Fprintf(&b, "\n  %s %d", rel, info.Size())
+			return nil
+		})
+		t.Logf("data directory %s at the end of the failed test (walk error: %v):%s", dir, err, b.String())
+	})
 }
 
 // reopen closes e and opens its directory again.

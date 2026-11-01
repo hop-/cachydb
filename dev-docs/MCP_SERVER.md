@@ -2,7 +2,7 @@
 
 The MCP (Model Context Protocol) server lives in `internal/mcp/server.go`
 and exposes CachyDB as tools for AI assistants. It uses the official Go SDK
-(`github.com/modelcontextprotocol/go-sdk` v1.2.0). Handlers only call
+(`github.com/modelcontextprotocol/go-sdk` v1.8.0). Handlers only call
 methods of the `*db.Engine` they are given; durability is entirely the
 engine's job (see [STORAGE.md](STORAGE.md)). Overview:
 [PROJECT.md](PROJECT.md).
@@ -11,13 +11,12 @@ engine's job (see [STORAGE.md](STORAGE.md)). Overview:
 
 | Setting | How to set it | Default |
 |---------|---------------|---------|
-| Transport | `-t` / `--transport` flag (`stdio` or `http`) | `stdio` |
+| Transport | `-t` / `--transport` flag, or `TRANSPORT` env var (`stdio` or `http`) | `stdio` |
 | HTTP port | `-p` / `--port` flag, or `PORT` env var | `7601` |
-| Data directory | `-R` / `--root` flag | `~/.cachydb` |
-| Default database | none that works (see [CLI.md](CLI.md#known-issues)) | `main` |
+| Data directory | `-R` / `--root` flag, or `ROOT_DIR` env var | `~/.cachydb` |
+| Default database | `-d` / `--db` flag, or `DB_NAME` env var | `main` |
 
-The `TRANSPORT`, `ROOT_DIR`, and `DB_NAME` environment variables currently
-have no effect; see [CLI.md — Known issues](CLI.md#known-issues).
+Precedence: flag > environment variable > default.
 
 ## Transports
 
@@ -30,10 +29,12 @@ messages go to stderr. The server stops when stdin closes.
 { "mcpServers": { "cachydb": { "command": "/path/to/cachydb", "args": ["-R", "/path/to/data"] } } }
 ```
 
-Clients must keep stdin open until they have read their responses: if
-stdin hits EOF while requests are in flight, the SDK drops those responses
-and the process exits with status 1 (`server is closing: EOF`). The engine
-is still closed cleanly.
+Closing stdin is a clean shutdown: `startStdio` treats end of input (EOF,
+closed pipe, connection closed, "server is closing") as success, the
+engine is closed, and the process exits 0. Clients must still keep stdin
+open until they have read their responses: SDK v1.8.0 cancels requests that
+are in flight at EOF and does not write their responses (observed with
+initialize + tools/call piped and stdin closed at once: no output, exit 0).
 
 ### Streamable HTTP
 
@@ -49,8 +50,10 @@ Multiple concurrent sessions are supported. Idle sessions are closed after
 ## Lifecycle
 
 1. `app.Builder.Build` opens the engine (`db.Open`: lock, recovery).
-2. `NewServer(ctx, engine, defaultDBName, transport, httpAddr)` creates the
-   default database if missing and registers the 12 tools.
+2. `NewServer(ctx, engine, defaultDBName, transport, httpAddr, version)`
+   creates the default database if missing, registers the 12 tools and the
+   8 docs resources, and sets the server instructions and the
+   implementation version (the build version, from `cmd.getVersion`).
 3. `Server.Start(ctx)` runs the transport until `ctx` is cancelled
    (SIGINT/SIGTERM), stdin closes (stdio), or the transport fails.
 4. `App.Stop` (10s timeout) calls `Server.Close` (ends every session) and
@@ -60,7 +63,9 @@ Multiple concurrent sessions are supported. Idle sessions are closed after
 ## Sessions and `use_database`
 
 The selected database is **per MCP session**. `ServerOptions.InitializedHandler`
-registers each session in `Server.sessions`; a goroutine waits on
+and a receiving middleware (`trackSessionMiddleware`, needed because
+clients on protocol 2026-07-28 use `server/discover` instead of the
+initialize handshake) register each session in `Server.sessions`; a goroutine waits on
 `ServerSession.Wait()` and forgets the session when it ends. Each handler
 resolves its database in this order:
 
@@ -70,11 +75,25 @@ resolves its database in this order:
 
 ## Tools (12)
 
-All handlers are typed: `mcp.AddTool(server, &mcp.Tool{...}, handler)` with
-an input struct whose JSON schema the SDK generates from the struct tags,
-and a `map[string]interface{}` output. The SDK returns the output as
-structured content and as JSON text content. Every successful result has
-`"success": true`.
+Tools are defined once in `internal/mcp/tools.go` (`toolSpecs`): name,
+description, annotations, typed input and output structs, and an example
+call. `registerTools` registers exactly these, and `ToolDefinitions()`
+returns them without an engine for the generated docs. The input and
+output schemas are generated with `jsonschema.For` from the structs' `json`
+and `jsonschema` tags; `Operator` and `FieldType` map to string enums
+(`Operators`, `FieldTypes`). The SDK validates arguments against the input
+schema, returns the typed output as structured content and as JSON text
+content, and validates it against the output schema. Every successful
+result has `"success": true`.
+
+Annotations (all tools also set `openWorldHint: false` and a title):
+
+| Tool(s) | readOnly | destructive | idempotent |
+|---------|----------|-------------|------------|
+| `list_databases`, `list_collections`, `find_documents`, `current_database` | true | — | true |
+| `create_database`, `use_database` | false | false | true |
+| `create_collection`, `insert_document`, `create_index`, `update_document` | false | false | false |
+| `delete_document`, `delete_database` | false | true | true |
 
 | Tool | Arguments | Result fields |
 |------|-----------|---------------|
@@ -161,14 +180,36 @@ the merged result.
 Builds a multi-value index from the existing documents. Writes to the whole
 database wait while it builds. Only `eq` filters use indexes.
 
+## Self-description
+
+- **Instructions**: `ServerOptions.Instructions` is `Instructions()` in
+  `internal/mcp/docs.go`, a condensed guide (under 2,000 characters; a test
+  checks it) with the typical workflow and the `cachydb://docs/<topic>`
+  URIs of every topic in `docs.Names`.
+- **Resources**: one `text/markdown` resource per docs topic at
+  `cachydb://docs/<topic>` (name and title = the topic title, description
+  = its summary). Reads return the same content as `cachydb docs <topic>`;
+  the `tools` topic is rendered from the tool definitions
+  (`DocsTopics`/`ToolDocs`).
+- **Implementation info**: name `cachydb`, the real build version.
+
 ## Errors
+
+Invalid arguments are rejected by the SDK before the handler runs, as a
+tool error starting `validating "arguments":` that names the property and,
+for enums, lists the valid values (for example `enum: like does not equal
+any of: [eq ne gt gte lt lte in]`). Unknown properties are rejected too
+(`additionalProperties: false`), which catches `filter` instead of
+`query.filters`.
 
 Handler errors are returned to the client as tool errors (`isError: true`)
 whose text names the action and the cause (`toolError` in `server.go`):
 
 | Engine error | Message shape |
 |--------------|---------------|
-| `ErrNotFound`, `ErrExists`, `ErrInvalidName`, `ErrSchemaValidation` | `<action>: <engine message>` |
+| `ErrNotFound` | `<action>: <engine message> (hint: list_databases and list_collections show what exists; …)` |
+| `ErrSchemaValidation` | `<action>: <engine message> (hint: see resource cachydb://docs/schema)` |
+| `ErrExists`, `ErrInvalidName` | `<action>: <engine message>` |
 | `ErrClosed` | `<action>: the database engine is shut down: …` |
 | `ErrWALFailed`, `ErrWALCorrupt` | `<action>: write-ahead log failure, restart the server: …` |
 | context cancelled / deadline | `<action>: request cancelled: …` |

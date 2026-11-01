@@ -2,7 +2,9 @@ package db
 
 import (
 	"log/slog"
+	"math"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +31,8 @@ func TestOptionsWithDefaults(t *testing.T) {
 				MemtableSize:     16 << 20,
 				CacheSize:        64 << 20,
 				CompactionRatio:  0.5,
+				MaxPendingBytes:  defaultMaxPendingBytes(16 << 20),
+				FlushWorkers:     defaultFlushWorkers(),
 			},
 		},
 		{
@@ -44,6 +48,8 @@ func TestOptionsWithDefaults(t *testing.T) {
 				MemtableSize:     4,
 				CacheSize:        5,
 				CompactionRatio:  1,
+				MaxPendingBytes:  6,
+				FlushWorkers:     7,
 			},
 			want: Options{
 				Dir:              "/data",
@@ -55,6 +61,8 @@ func TestOptionsWithDefaults(t *testing.T) {
 				MemtableSize:     4,
 				CacheSize:        5,
 				CompactionRatio:  1,
+				MaxPendingBytes:  6,
+				FlushWorkers:     7,
 			},
 		},
 		{
@@ -64,6 +72,7 @@ func TestOptionsWithDefaults(t *testing.T) {
 				WALRetentionAge:  -1,
 				WALRetentionSize: -1,
 				CacheSize:        -1,
+				MaxPendingBytes:  -1,
 			},
 			want: Options{
 				Dir:              "/data",
@@ -75,6 +84,8 @@ func TestOptionsWithDefaults(t *testing.T) {
 				MemtableSize:     16 << 20,
 				CacheSize:        0,
 				CompactionRatio:  0.5,
+				MaxPendingBytes:  0,
+				FlushWorkers:     defaultFlushWorkers(),
 			},
 		},
 	}
@@ -101,6 +112,25 @@ func TestOptionsWithDefaults(t *testing.T) {
 	}
 }
 
+func TestDefaultMaxPendingBytes(t *testing.T) {
+	procs := int64(max(1, runtime.GOMAXPROCS(0)/2))
+	tests := []struct {
+		memtable, want int64
+	}{
+		{memtable: 1 << 20, want: min(4*(1<<20)*procs, 1<<30)},
+		{memtable: 1 << 40, want: 1 << 30},           // capped
+		{memtable: math.MaxInt64 / 2, want: 1 << 30}, // overflow
+	}
+	for _, tt := range tests {
+		if got := defaultMaxPendingBytes(tt.memtable); got != tt.want {
+			t.Errorf("defaultMaxPendingBytes(%d) = %d, want %d", tt.memtable, got, tt.want)
+		}
+	}
+	if w := defaultFlushWorkers(); w < 1 || w > 4 {
+		t.Errorf("defaultFlushWorkers() = %d, want 1..4", w)
+	}
+}
+
 func TestOptionsWithDefaultsErrors(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -114,6 +144,7 @@ func TestOptionsWithDefaultsErrors(t *testing.T) {
 		{"negative flush interval", Options{Dir: "d", FlushInterval: -time.Second}, "FlushInterval"},
 		{"negative compaction ratio", Options{Dir: "d", CompactionRatio: -0.1}, "CompactionRatio"},
 		{"compaction ratio above 1", Options{Dir: "d", CompactionRatio: 1.5}, "CompactionRatio"},
+		{"negative flush workers", Options{Dir: "d", FlushWorkers: -1}, "FlushWorkers"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

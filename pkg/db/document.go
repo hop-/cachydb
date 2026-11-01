@@ -24,8 +24,8 @@ import (
 // the memtable, indexes, cache, and count under Collection.mu.
 //
 // Read: memtable → flushing → cache → keydir + data segment. Documents
-// stored in the memtable are immutable; callers of the read path get deep
-// clones (or freshly decoded copies) and never share memory with them.
+// stored in the memtable and the cache are immutable; callers of the read
+// path get deep clones and never share memory with them.
 
 // maxIDLen is the longest document id the WAL and segment formats can
 // store (u16 length prefix).
@@ -180,6 +180,10 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// Backpressure: wait, holding no lock, while too much is unflushed.
+	if err := e.waitPending(ctx); err != nil {
+		return nil, err
+	}
 
 	// Lock order (§11): Database.mu (R) → docLock → Collection.mu. The
 	// shared database lock blocks drops and index changes until the write
@@ -286,9 +290,12 @@ func (c *Collection) applyLocked(id string, existed bool, prev, next *Document, 
 	if ok && me.walOffset >= off {
 		return // never happens under the doc lock; replay relies on the same rule
 	}
+	delta := size
 	if ok {
 		c.memBytes -= me.size
+		delta -= me.size
 	}
+	c.db.e.pending.add(delta)
 	// memMin stays a lower bound of the memtable's offsets: an overwritten
 	// entry may leave it lower than the true minimum, which only makes the
 	// low-water mark more conservative.
@@ -320,8 +327,9 @@ func (c *Collection) applyLocked(id string, existed bool, prev, next *Document, 
 // current returns the live version of id through the read path (§5.3):
 // memtable → flushing → cache → keydir + data segment. doc is nil when the
 // document does not exist. When owned is false, doc is shared with the
-// memtable and must be neither modified nor handed out; otherwise it is a
-// private copy.
+// memtable or the cache and must be neither modified nor handed out
+// without a Clone; otherwise it is a private copy. (Every path currently
+// returns shared documents, so callers clone only what they hand out.)
 func (c *Collection) current(id string) (doc *Document, owned bool, err error) {
 	for attempt := 0; ; attempt++ {
 		c.mu.RLock()
@@ -350,16 +358,34 @@ func (c *Collection) current(id string) (doc *Document, owned bool, err error) {
 		if err != nil {
 			return nil, false, err
 		}
-		return doc, true, nil
+		return doc, false, nil
 	}
 }
 
+// cachedDoc is a document cache value: an immutable decoded document and
+// the number of bytes it is charged.
+type cachedDoc struct {
+	doc  *Document
+	size int64
+}
+
+// cachedDocSize charges a decoded document twice its encoded length: the
+// decoded maps and values take roughly that much more memory than the
+// JSON they came from.
+func cachedDocSize(encodedLen int) int64 { return 2 * int64(encodedLen) }
+
+func newDocCache(maxBytes int64) *cache.LRU[cachedDoc] {
+	return cache.New(maxBytes, func(v cachedDoc) int64 { return v.size })
+}
+
 // readStored reads the version of id described by the keydir entry ke,
-// from the cache or else from its data segment (and caches it).
+// from the cache or else from its data segment (and caches it). The
+// returned document is shared with the cache: it must be neither modified
+// nor handed out without a Clone.
 func (c *Collection) readStored(id string, ke keyEntry) (*Document, error) {
 	lru, key := c.db.e.cache, c.cacheKey(id)
-	if data, ok := lru.Get(key, ke.walOffset); ok {
-		return decodeDocument(id, data)
+	if v, ok := lru.Get(key, ke.walOffset); ok {
+		return v.doc, nil
 	}
 
 	r, err := c.acquireReader(ke.loc.Seg)
@@ -379,7 +405,7 @@ func (c *Collection) readStored(id string, ke keyEntry) (*Document, error) {
 	if err != nil {
 		return nil, err
 	}
-	lru.Put(key, ke.walOffset, rec.Doc) // rec.Doc is a fresh buffer, never modified
+	lru.Put(key, ke.walOffset, cachedDoc{doc: doc, size: cachedDocSize(len(rec.Doc))})
 	return doc, nil
 }
 

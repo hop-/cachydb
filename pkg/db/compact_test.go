@@ -591,7 +591,7 @@ func TestCrashCompactBeforeSwap(t *testing.T) {
 				tt.mod(&opts)
 			}
 			armed := opts
-			crashAt(&armed, hookCompactBeforeSwap)
+			crashAt(t, &armed, hookCompactBeforeSwap)
 			e := openEngine(t, armed)
 			d := mustCreateDB(t, e, "app")
 			if err := d.CreateCollection(ctx, "c", nil); err != nil {
@@ -915,4 +915,164 @@ func TestDropWaitsForCompaction(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPickSmallRun(t *testing.T) {
+	const seg = 400 // small means < 100
+	tests := []struct {
+		name  string
+		segs  []uint32
+		skip  []uint32
+		total map[uint32]int64
+		dead  map[uint32]int64
+		want  []uint32
+	}{
+		{
+			name:  "four small segments merge",
+			segs:  []uint32{1, 2, 3, 4, 5},
+			skip:  []uint32{5},
+			total: map[uint32]int64{1: 50, 2: 60, 3: 70, 4: 80},
+			want:  []uint32{1, 2, 3, 4},
+		},
+		{
+			name:  "three are not enough",
+			segs:  []uint32{1, 2, 3, 4},
+			skip:  []uint32{4},
+			total: map[uint32]int64{1: 50, 2: 60, 3: 70},
+		},
+		{
+			name:  "a large segment splits the run",
+			segs:  []uint32{1, 2, 3, 4, 5, 6, 7, 8},
+			skip:  []uint32{8},
+			total: map[uint32]int64{1: 10, 2: 10, 3: 300, 4: 10, 5: 10, 6: 10, 7: 10},
+			want:  []uint32{4, 5, 6, 7},
+		},
+		{
+			name:  "skipped segments split the run",
+			segs:  []uint32{1, 2, 3, 4, 5, 6},
+			skip:  []uint32{3, 6},
+			total: map[uint32]int64{1: 10, 2: 10, 4: 10, 5: 10},
+		},
+		{
+			name:  "exactly a quarter is not small",
+			segs:  []uint32{1, 2, 3, 4, 5},
+			skip:  []uint32{5},
+			total: map[uint32]int64{1: 100, 2: 10, 3: 10, 4: 10},
+		},
+		{
+			name:  "merged live bytes capped at the segment size",
+			segs:  []uint32{1, 2, 3, 4, 5, 6, 7},
+			skip:  []uint32{7},
+			total: map[uint32]int64{1: 99, 2: 99, 3: 99, 4: 99, 5: 99, 6: 99},
+			want:  []uint32{1, 2, 3, 4}, // 396 live; a fifth would exceed 400
+		},
+		{
+			name:  "dead bytes do not count toward the cap",
+			segs:  []uint32{1, 2, 3, 4, 5, 6, 7},
+			skip:  []uint32{7},
+			total: map[uint32]int64{1: 99, 2: 99, 3: 99, 4: 99, 5: 99, 6: 99},
+			dead:  map[uint32]int64{1: 90, 2: 90, 3: 90, 4: 90, 5: 90, 6: 90},
+			want:  []uint32{1, 2, 3, 4, 5, 6},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			skip := map[uint32]bool{}
+			for _, s := range tt.skip {
+				skip[s] = true
+			}
+			dead := tt.dead
+			if dead == nil {
+				dead = map[uint32]int64{}
+			}
+			if got := pickSmallRun(tt.segs, skip, tt.total, dead, seg); !slices.Equal(got, tt.want) {
+				t.Fatalf("pickSmallRun = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// buildSmallSegments writes n fully live sealed segments (one flush and
+// seal each) plus one unflushed document, and returns the expected
+// documents.
+func buildSmallSegments(t *testing.T, c *Collection, n int) map[string]map[string]any {
+	t.Helper()
+	want := map[string]map[string]any{}
+	for i := range n {
+		for j := range 3 {
+			id := fmt.Sprintf("s%d-%d", i, j)
+			data := map[string]any{"g": float64(j % 2), "i": float64(i)}
+			mustInsert(t, c, id, data)
+			want[id] = data
+		}
+		mustFlushSeal(t, c)
+	}
+	mustInsert(t, c, "unflushed", map[string]any{"g": float64(1)})
+	want["unflushed"] = map[string]any{"g": float64(1)}
+	return want
+}
+
+func TestCompactionMergesSmallSegments(t *testing.T) {
+	ctx := context.Background()
+	opts := crashOpts(t.TempDir())
+	e := openEngine(t, opts)
+	d := mustCreateDB(t, e, "app")
+	if err := d.CreateCollection(ctx, "c", nil); err != nil {
+		t.Fatal(err)
+	}
+	c := mustColl(t, d, "c")
+	if err := c.CreateIndex(ctx, "by_g", "g"); err != nil {
+		t.Fatal(err)
+	}
+	want := buildSmallSegments(t, c, 6)
+	idx := map[string]string{"by_g": "g"}
+
+	before := listSegs(t, c.dir)
+	if !mustCompact(t, c) {
+		t.Fatalf("no compaction of small fully live segments %v", before)
+	}
+	after := listSegs(t, c.dir)
+	// Segments 1-5 merge into one output; 6 holds the newest checkpoint
+	// marker; the empty active segment 7 is removed when it is sealed.
+	if len(after) != 2 || after[0] != 6 || after[1] <= 7 {
+		t.Fatalf("segments %v -> %v, want [6 <output>]", before, after)
+	}
+	checkModel(t, e, docsModel(idx, want))
+	checkKeydirLive(t, c)
+	if mustCompact(t, c) {
+		t.Fatalf("a second compaction ran on %v", listSegs(t, c.dir))
+	}
+	e = reopen(t, e)
+	checkModel(t, e, docsModel(idx, want))
+}
+
+func TestCrashMergeSmallSegmentsBeforeSwap(t *testing.T) {
+	ctx := context.Background()
+	opts := crashOpts(t.TempDir())
+	armed := opts
+	crashAt(t, &armed, hookCompactBeforeSwap)
+	e := openEngine(t, armed)
+	d := mustCreateDB(t, e, "app")
+	if err := d.CreateCollection(ctx, "c", nil); err != nil {
+		t.Fatal(err)
+	}
+	c := mustColl(t, d, "c")
+	want := buildSmallSegments(t, c, 5)
+	if _, err := c.compact(ctx); !errors.Is(err, errSimulatedCrash) {
+		t.Fatalf("compact = %v, want simulated crash", err)
+	}
+	e.abandon()
+
+	e = openEngine(t, opts)
+	checkModel(t, e, docsModel(nil, want))
+	c = mustColl(t, mustDB(t, e, "app"), "c")
+	for i := 0; mustCompact(t, c); i++ {
+		if i > 20 {
+			t.Fatal("compaction does not converge")
+		}
+	}
+	checkModel(t, e, docsModel(nil, want))
+	checkKeydirLive(t, c)
+	e = reopen(t, e)
+	checkModel(t, e, docsModel(nil, want))
 }

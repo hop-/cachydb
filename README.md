@@ -27,9 +27,11 @@ Names of databases, collections, and indexes must match `^[A-Za-z0-9][A-Za-z0-9_
 
 ## Platform Support
 
-CachyDB supports **Linux and macOS**. It compiles on Windows, but Windows is
-not supported: there is no data-directory lock and no directory fsync there,
-so durability and the single-process guarantee do not hold.
+CachyDB supports **Linux and macOS**; the BSDs also get the data-directory
+lock. It compiles on Windows, Solaris, illumos, and AIX, but there the
+data-directory lock is a no-op (cachydb logs a warning), and Windows is
+not supported: there is no directory fsync either, so durability and the
+single-process guarantee do not hold.
 
 ## Installation
 
@@ -75,12 +77,13 @@ Change the port with `--port`:
 
 ### Configuration
 
-CLI flags (override environment variables):
+CLI flags (override environment variables, which override the defaults):
 
 ```none
-  -t, --transport            Transport type: stdio (default) or http
+  -t, --transport            MCP transport: stdio (default) or http
   -p, --port                 Port for HTTP transport (default 7601)
   -R, --root                 Data directory (default ~/.cachydb)
+  -d, --db                   Default database, created at startup (default main)
       --wal-retention-age    Keep processed WAL for this long, e.g. 24h (0 = no age limit)
       --wal-retention-size   Keep at most this much processed WAL, e.g. 1GiB (0 = no size limit)
       --cache-size           Document cache size, e.g. 64MiB (0 = cache disabled)
@@ -88,18 +91,38 @@ CLI flags (override environment variables):
 
 Environment variables:
 
+- `TRANSPORT`: `stdio` or `http` (default: `stdio`)
 - `PORT`: Port for the HTTP transport (default: `7601`)
+- `ROOT_DIR`: Data directory (default: `~/.cachydb`)
+- `DB_NAME`: Default database (default: `main`)
 - `WAL_RETENTION_AGE`: How long processed WAL segments are kept, as a Go duration (default: `24h`, `0` = no age limit)
 - `WAL_RETENTION_SIZE`: Maximum size of processed WAL kept (default: `1GiB`, `0` = no size limit)
 - `CACHE_SIZE`: Document cache size (default: `64MiB`, `0` = disabled)
 
 Sizes accept `B`, `KiB`, `MiB`, `GiB`, `TiB` (powers of 1024) and `KB`, `MB`, `GB`, `TB` (powers of 1000). Retention never deletes WAL that has not yet been written to the data segments.
 
-> **Known issue:** the `ROOT_DIR`, `DB_NAME`, and `TRANSPORT` environment variables currently have no effect. Use the `-R` and `-t` flags; the default database is `main`. See [`dev-docs/CLI.md`](dev-docs/CLI.md#known-issues).
+Run `cachydb docs config` for every setting, or `cachydb --help`.
 
 Only one process can use a data directory at a time: the server holds an exclusive lock on `<data dir>/cachydb.lock`, and a second server or a `cachydb utils` command on the same directory fails with "data directory is in use by another cachydb process".
 
-Logs go to stderr; in stdio mode stdout carries only MCP messages. SIGINT/SIGTERM shut the server down gracefully (final flush). Errors exit with status 1.
+Logs go to stderr; in stdio mode stdout carries only MCP messages. SIGINT/SIGTERM, or the client closing stdin, shut the server down gracefully (final flush, exit status 0). Errors exit with status 1.
+
+### Built-in documentation for AI agents
+
+The binary documents itself, so an agent does not need this repository:
+
+```bash
+cachydb docs                         # topics: overview, quickstart, mcp, tools, query, schema, config, errors
+cachydb docs quickstart              # one topic (markdown)
+cachydb docs tools --format json     # every MCP tool with its input/output JSON Schema and an example
+cachydb version --json               # version, Go, storage/WAL format, MCP protocol
+```
+
+Over MCP, the server publishes typed tool schemas (with enums for query
+operators and field types), read-only/destructive/idempotent annotations,
+short usage instructions in the `initialize` result, and every docs topic
+as a `cachydb://docs/<topic>` resource. The `mcp` topic has config
+examples for Claude Code, Claude Desktop, Cursor, and VS Code.
 
 ### MCP Configuration
 
@@ -343,15 +366,20 @@ cachydb/
 ├── main.go                 # Entry point
 ├── internal/
 │   ├── app/               # Application setup (opens the engine, starts the MCP server)
-│   ├── cmd/               # CLI commands (server, version, utils list/migrate)
+│   ├── cmd/               # CLI commands (server, docs, version, utils list/migrate)
 │   ├── config/            # Configuration (env vars, size parsing)
+│   ├── docs/              # Built-in agent docs topics (cachydb docs, MCP resources)
 │   └── mcp/
-│       └── server.go      # MCP tool handlers, sessions, transports
+│       ├── server.go      # MCP tool handlers, sessions, transports
+│       ├── tools.go       # Tool definitions: typed schemas, annotations, examples
+│       └── docs.go        # Server instructions, docs resources, generated tools topic
 ├── pkg/
 │   └── db/                # Public database engine (db.Open → *Engine)
 │       ├── engine.go      # Open/Close, databases
 │       ├── document.go    # Write/read paths, Find
-│       ├── flush.go       # Background flush and checkpoints
+│       ├── flush.go       # Background (parallel) flush and checkpoints
+│       ├── backpressure.go # Write backpressure (MaxPendingBytes)
+│       ├── metacp.go      # Metadata checkpoint (cachydb.metacp)
 │       ├── recovery.go    # Crash recovery and WAL replay
 │       ├── compact.go     # Background compaction
 │       ├── migration.go   # Schema-version migrations
@@ -375,15 +403,16 @@ Developer documentation is in [`AGENTS.md`](AGENTS.md) and [`dev-docs/`](dev-doc
 
 ### Data Segments
 
-- **Append-only**: a background flusher (every second, or when 16 MiB of changes accumulate) appends only the changed documents and deletion tombstones to the collection's active segment, followed by a checkpoint marker, with one fsync. A one-document change never rewrites a collection.
+- **Append-only**: a background flusher (every second, or when 16 MiB of changes accumulate) appends only the changed documents and deletion tombstones to the collection's active segment, followed by a checkpoint marker, with one fsync. A one-document change never rewrites a collection. Up to four collections are flushed in parallel.
+- **Backpressure**: when the disk is slower than the writers, writes wait while the unflushed changes of all collections exceed `MaxPendingBytes` (by default 4 × the 16 MiB memtable size × half the CPUs, at most 1 GiB), so memory stays bounded
 - **Compression**: documents are compressed with zstd
-- **Keys in RAM**: an in-memory key directory maps each document id to its location on disk; documents are read on demand through an LRU cache (`CACHE_SIZE`, default 64 MiB)
-- **Compaction**: a background task rewrites sealed segments with many dead records (superseded or deleted versions) to reclaim space
+- **Keys in RAM**: an in-memory key directory maps each document id to its location on disk; documents are read on demand through an LRU cache of decoded documents (`CACHE_SIZE`, default 64 MiB), so a cached read skips the disk and the JSON decoding
+- **Compaction**: a background task rewrites sealed segments with many dead records (superseded or deleted versions) to reclaim space, and merges runs of small segments
 - **Hint files and index snapshots**: speed up startup; both are rebuilt automatically if missing or damaged
 
 ### Recovery
 
-On startup CachyDB loads the key directories and indexes, then replays the WAL from each collection's last checkpoint. Replay is idempotent, so a crash at any point — including during a flush or compaction — loses no acknowledged write. A clean shutdown flushes everything, so the next start has nothing to re-apply.
+On startup CachyDB loads the key directories and indexes, then replays the WAL from each collection's last checkpoint (and, for metadata, from the `cachydb.metacp` checkpoint). Replay is idempotent, so a crash at any point — including during a flush or compaction — loses no acknowledged write. A clean shutdown flushes everything, so the next start has nothing to re-apply.
 
 ### Storage Format
 
@@ -393,6 +422,7 @@ Data is stored in `~/.cachydb/` (or the directory given with `-R`):
 .cachydb/
 ├── cachydb.lock                    # Exclusive lock held by the running process
 ├── cachydb.format                  # On-disk format version
+├── cachydb.metacp                  # Metadata checkpoint (where WAL replay may start)
 ├── wal-00000000000000000001.log    # WAL segments, named by first offset
 ├── wal-00000000000004213377.log
 └── main/                           # Database

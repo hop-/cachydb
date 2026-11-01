@@ -46,6 +46,10 @@ official Go SDK client.
 - Inserting, finding (with `query.filters`), updating, and deleting documents
 - Creating an index
 
+The tool schemas the client receives are typed (enums for `operator` and
+field `type`); `cachydb docs tools --format json` prints them without a
+client.
+
 **Run it:**
 
 ```bash

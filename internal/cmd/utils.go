@@ -15,11 +15,13 @@ import (
 var utilsCmd = &cobra.Command{
 	Use:   "utils",
 	Short: "Utility commands for database maintenance and management",
-	Long: `Utility commands for database maintenance and management.
-This includes migration, backup, repair, and other administrative tasks.
+	Long: `Utility commands for database maintenance: listing databases and
+running schema migrations.
 
 Utility commands open the database engine and take the data-directory
 lock, so they fail while a cachydb server is running on the same directory.`,
+	Example: `  cachydb utils list -c -R /path/to/data
+  cachydb utils migrate --list`,
 }
 
 func init() {
@@ -28,7 +30,7 @@ func init() {
 		&generalRootDir,
 		"root", "R",
 		config.GetConfig().RootDir,
-		"root directory for application data and configurations",
+		"data directory (env ROOT_DIR)",
 	)
 	setEngineFlags(utilsCmd.PersistentFlags())
 
@@ -47,17 +49,17 @@ func setEngineFlags(fs *pflag.FlagSet) {
 		&generalWALRetentionAge,
 		"wal-retention-age",
 		c.WALRetentionAge,
-		"keep processed WAL segments for this long, e.g. 24h (0 = no age limit)",
+		"keep processed WAL segments this long, e.g. 24h; 0 = no age limit (env WAL_RETENTION_AGE)",
 	)
 	fs.Var(
 		&generalWALRetentionSize,
 		"wal-retention-size",
-		"keep at most this much processed WAL, e.g. 1GiB (0 = no size limit)",
+		"keep at most this much processed WAL, e.g. 1GiB; 0 = no size limit (env WAL_RETENTION_SIZE)",
 	)
 	fs.Var(
 		&generalCacheSize,
 		"cache-size",
-		"document cache size, e.g. 64MiB (0 = cache disabled)",
+		"document cache size, e.g. 64MiB; 0 = cache disabled (env CACHE_SIZE)",
 	)
 }
 
@@ -68,6 +70,15 @@ func rootDir() string {
 		return generalRootDir
 	}
 	return config.GetConfig().RootDir
+}
+
+// dbName returns the default database from the flags, falling back to
+// the configured default at runtime.
+func dbName() string {
+	if generalDBName != "" {
+		return generalDBName
+	}
+	return config.GetConfig().DBName
 }
 
 // newBuilder returns an app builder with the data directory and engine

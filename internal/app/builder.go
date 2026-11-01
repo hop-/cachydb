@@ -17,6 +17,7 @@ type Builder struct {
 	rootDir   string
 	transport string
 	port      int
+	version   string
 	logger    *slog.Logger
 
 	walRetentionSet  bool
@@ -47,6 +48,12 @@ func (b *Builder) WithTransport(transport string) *Builder {
 
 func (b *Builder) WithPort(port int) *Builder {
 	b.port = port
+	return b
+}
+
+// WithVersion sets the build version the MCP server reports.
+func (b *Builder) WithVersion(v string) *Builder {
+	b.version = v
 	return b
 }
 
@@ -123,7 +130,7 @@ func (b *Builder) Build(ctx context.Context) (_ *App, err error) {
 	}()
 
 	httpAddr := fmt.Sprintf(":%d", b.port)
-	mcpServer, err := mcpserver.NewServer(ctx, engine, b.dbName, b.transport, httpAddr)
+	mcpServer, err := mcpserver.NewServer(ctx, engine, b.dbName, b.transport, httpAddr, b.version)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create MCP server: %w", err)
 	}
