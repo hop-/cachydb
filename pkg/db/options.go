@@ -8,6 +8,19 @@ import (
 )
 
 // Default option values applied by Options.withDefaults to zero fields.
+//
+// These are the initial defaults of the design (plan 001, approach §3–9),
+// kept unchanged after the P8 benchmarks in bench_test.go (btrfs on LUKS
+// on an NVMe SSD, i7-1165G7) gave no reason to tune them:
+//   - BenchmarkFlushOneChange: a one-change flush costs ~6 ms at both 1k
+//     and 100k documents (fsync-bound), so flushing every FlushInterval=1s
+//     under a trickle of writes costs about 1% of wall time; MemtableSize
+//     only bounds RAM between flushes.
+//   - BenchmarkInsertParallel: 16 writers reach ~7× the single-writer
+//     throughput, so group commit batches without a tuned delay.
+//   - BenchmarkGet: cached and uncached Gets differ by ~15% because JSON
+//     decoding dominates either way; CacheSize mostly saves disk reads
+//     once data outgrows the OS page cache, so 64 MiB stays.
 const (
 	defaultWALSegmentSize   int64         = 64 << 20 // 64 MiB
 	defaultWALRetentionAge  time.Duration = 24 * time.Hour
