@@ -27,6 +27,30 @@ environment variable, which wins over the default.**
 
 `cachydb utils` takes `-R/--root` and the engine tuning flags too.
 
+## Health check (`cachydb healthcheck`)
+
+| Flag | Env var | Default | Meaning |
+| --- | --- | --- | --- |
+| `--url` | | `http://127.0.0.1:<port>/healthz` | Endpoint to probe; always probed when given |
+| `-p, --port` | `PORT` | `7601` | Port for the default URL |
+| `-t, --transport` | `TRANSPORT` | `stdio` | Without `--url`, `stdio` means nothing to probe (exit 0) |
+
+Exit 0 on HTTP 200; exit 1 otherwise (3-second timeout). See
+`cachydb docs mcp`.
+
+## Docker image
+
+The image `hovhannespalyan/cachydb` sets `TRANSPORT=http`, `PORT=7601`,
+`ROOT_DIR=/data` and `DB_NAME=main`, and passes no flags, so every
+variable above works with `-e`. Keep `ROOT_DIR=/data` (the volume).
+Arguments after the image name are passed to cachydb; flags still win
+over variables, but the image's healthcheck reads only the variables.
+
+```bash
+docker run -d -p 8080:8080 -v cachydb-data:/data -e PORT=8080 -e DB_NAME=app hovhannespalyan/cachydb
+docker run -i --rm -v cachydb-data:/data -e TRANSPORT=stdio hovhannespalyan/cachydb
+```
+
 ## Formats
 
 - **Sizes**: a number with an optional unit, case-insensitive. Binary
@@ -54,3 +78,5 @@ cachydb -t http -p 8080 --cache-size 256MiB    # HTTP on port 8080 with a bigger
 - Errors are printed to stderr as `Error: <message>`; the exit status is 1.
 - In stdio mode, stdout carries only MCP messages.
 - `cachydb docs`, `cachydb version`, and `--help` print to stdout and exit 0.
+- `cachydb healthcheck` prints nothing on success (exit 0); on failure it
+  prints `Error: healthcheck: ...` to stderr and exits 1.

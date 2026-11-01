@@ -309,10 +309,16 @@ func TestCloseIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := mustColl(t, d, "users")
+	if e.Closed() {
+		t.Fatal("Closed() = true before Close")
+	}
 	for i := range 3 {
 		if err := e.Close(ctx); err != nil {
 			t.Fatalf("Close #%d: %v", i+1, err)
 		}
+	}
+	if !e.Closed() {
+		t.Fatal("Closed() = false after Close")
 	}
 
 	checks := []struct {

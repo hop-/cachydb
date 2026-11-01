@@ -3,8 +3,11 @@ package mcpserver
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
+	"maps"
+	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
@@ -471,4 +474,70 @@ func TestNewServerCreatesDefaultDatabase(t *testing.T) {
 	if _, err := NewServer(context.Background(), nil, testDefaultDB, "stdio", "", testVersion); err == nil {
 		t.Fatal("NewServer(nil engine) = nil error, want error")
 	}
+}
+
+func TestHealthz(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s.httpHandler())
+	t.Cleanup(ts.Close)
+
+	do := func(t *testing.T, method string) (int, http.Header, string) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(context.Background(), method, ts.URL+"/healthz", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatalf("%s /healthz: %v", method, err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("reading body: %v", err)
+		}
+		return resp.StatusCode, resp.Header, string(body)
+	}
+
+	t.Run("open engine", func(t *testing.T) {
+		code, h, body := do(t, http.MethodGet)
+		if code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body %q)", code, body)
+		}
+		if ct := h.Get("Content-Type"); ct != "application/json" {
+			t.Errorf("Content-Type = %q", ct)
+		}
+		var got map[string]string
+		if err := json.Unmarshal([]byte(body), &got); err != nil {
+			t.Fatalf("body %q: %v", body, err)
+		}
+		if want := map[string]string{"status": "ok", "version": testVersion}; !maps.Equal(got, want) {
+			t.Fatalf("body = %v, want %v", got, want)
+		}
+	})
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodHead} {
+		t.Run("method "+method, func(t *testing.T) {
+			code, h, _ := do(t, method)
+			if code != http.StatusMethodNotAllowed {
+				t.Fatalf("status = %d, want 405", code)
+			}
+			if allow := h.Get("Allow"); allow != http.MethodGet {
+				t.Errorf("Allow = %q, want GET", allow)
+			}
+		})
+	}
+
+	t.Run("closed engine", func(t *testing.T) {
+		if err := s.engine.Close(context.Background()); err != nil {
+			t.Fatalf("Engine.Close: %v", err)
+		}
+		code, _, body := do(t, http.MethodGet)
+		if code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503 (body %q)", code, body)
+		}
+		if strings.TrimSpace(body) != `{"status":"unavailable"}` {
+			t.Fatalf("body = %q", body)
+		}
+	})
 }

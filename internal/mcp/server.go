@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -33,6 +34,7 @@ type Server struct {
 	defaultDBName string
 	transport     string
 	httpAddr      string
+	version       string        // build version, reported by /healthz
 	stderr        io.Writer     // startup/shutdown messages; never stdout
 	stdio         mcp.Transport // the stdio transport; tests replace it
 
@@ -80,6 +82,7 @@ func NewServer(ctx context.Context, engine *db.Engine, defaultDBName, transport,
 		defaultDBName: defaultDBName,
 		transport:     transport,
 		httpAddr:      httpAddr,
+		version:       version,
 		stderr:        os.Stderr,
 		stdio:         &mcp.StdioTransport{},
 	}
@@ -243,17 +246,52 @@ func (s *Server) startStdio(ctx context.Context) error {
 	}
 }
 
-// httpHandler returns the Streamable HTTP handler serving s.server.
+// httpHandler returns the HTTP handler: the Streamable HTTP transport
+// serving s.server at /mcp, and the health endpoint at /healthz.
 func (s *Server) httpHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return s.server
 	}, &mcp.StreamableHTTPOptions{SessionTimeout: httpSessionTimeout}))
+	mux.HandleFunc("/healthz", s.healthz)
 	return mux
 }
 
+// healthResponse is the body of GET /healthz.
+type healthResponse struct {
+	Status  string `json:"status"`
+	Version string `json:"version,omitempty"`
+}
+
+// healthz answers GET /healthz: 200 {"status":"ok","version":...} while
+// the engine is open, 503 {"status":"unavailable"} once it is closing or
+// closed, and 405 for other methods. It is outside MCP session handling
+// and is what "cachydb healthcheck" (the image HEALTHCHECK) probes.
+func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	code, body := http.StatusOK, healthResponse{Status: "ok", Version: s.version}
+	if s.engine.Closed() {
+		code, body = http.StatusServiceUnavailable, healthResponse{Status: "unavailable"}
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		// Two plain strings; this cannot happen.
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(code)
+	// A write error means the client went away; nothing to report.
+	_, _ = w.Write(append(data, '\n'))
+}
+
 // startHTTP serves the Streamable HTTP transport (MCP spec 2025-03-26+) at
-// /mcp until ctx is cancelled.
+// /mcp, and /healthz, until ctx is cancelled.
 func (s *Server) startHTTP(ctx context.Context) error {
 	ln, err := net.Listen("tcp", s.httpAddr)
 	if err != nil {

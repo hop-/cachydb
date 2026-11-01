@@ -47,6 +47,27 @@ Multiple concurrent sessions are supported. Idle sessions are closed after
 { "mcpServers": { "cachydb": { "url": "http://localhost:7601/mcp" } } }
 ```
 
+The SDK's DNS-rebinding (localhost) protection stays on for `/mcp`. It
+rejects only requests that arrive via 127.0.0.1/[::1] with a non-localhost
+`Host` header, so Docker port mapping and container-to-container access
+are not affected.
+
+### `GET /healthz`
+
+`httpHandler()` also serves `/healthz` next to `/mcp`, outside MCP session
+handling (`Server.healthz`):
+
+| Request | Status | Body |
+|---------|--------|------|
+| `GET`, engine open | `200` | `{"status":"ok","version":"<build version>"}` |
+| `GET`, engine closing or closed (`Engine.Closed()`) | `503` | `{"status":"unavailable"}` |
+| any other method | `405` | `Allow: GET` |
+
+Responses are `application/json` with `Cache-Control: no-store`.
+`cachydb healthcheck` probes it (see [CLI.md](CLI.md#cachydb-healthcheck)),
+and the Docker image's `HEALTHCHECK` runs that command. The stdio
+transport has no health endpoint.
+
 ## Lifecycle
 
 1. `app.Builder.Build` opens the engine (`db.Open`: lock, recovery).

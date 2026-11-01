@@ -80,6 +80,34 @@ MCP SDK supports (`mcp.SupportedProtocolVersions()[0]`).
 
 Every command's `--help` has an `Examples` section.
 
+### `cachydb healthcheck`
+
+Probes the `/healthz` endpoint of a running HTTP server
+(`internal/cmd/healthcheck.go`), like `pg_isready`. The official Docker
+image uses it as its `HEALTHCHECK` (distroless has no shell or curl). It
+never opens the engine or takes the data-directory lock.
+
+```bash
+TRANSPORT=http cachydb healthcheck                    # GET http://127.0.0.1:$PORT/healthz
+cachydb healthcheck --url http://db.internal:7601/healthz
+cachydb healthcheck                                   # TRANSPORT unset (stdio): exits 0, nothing to probe
+```
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--url` | | `http://127.0.0.1:<port>/healthz` | Endpoint to probe; an explicit URL is always probed |
+| `--port` | `-p` | `7601` (or `PORT`) | Port for the default URL |
+| `--transport` | `-t` | `stdio` (or `TRANSPORT`) | Without `--url`, `stdio` means nothing to probe |
+
+- **Exit 0**: the endpoint answered `200`. Nothing is written.
+- **Exit 1**: connection error, another status (`503` while the server
+  shuts down), or no answer within 3 seconds (`healthcheckTimeout`); the
+  reason goes to stderr as `Error: healthcheck: ...`. An invalid transport
+  also exits 1.
+- **stdio**: without `--url`, if the transport is `stdio` there is no HTTP
+  server, so it prints `healthcheck: transport is stdio; nothing to probe`
+  to stderr and exits 0 (a stdio container is not marked unhealthy).
+
 ### `cachydb utils`
 
 Parent of the maintenance commands. Its persistent flags are inherited by
@@ -190,6 +218,7 @@ main.go → cmd.Execute()
       App.Stop(WithoutCancel(ctx))      # 10s: sessions, Engine.Close
     runList / runMigrate                # utils: withEngine(Open … Close)
     runDocs / version                   # print to stdout; never open the engine
+    runHealthcheck                      # GET /healthz (3s); never opens the engine
   cobra.CheckErr(err)                   # print + exit 1
 ```
 
@@ -199,4 +228,5 @@ main.go → cmd.Execute()
 go build -o cachydb
 go install github.com/hop-/cachydb@latest
 go build -ldflags "-X github.com/hop-/cachydb/internal/cmd.Version=$(git describe --tags --always)" -o cachydb
+docker build --build-arg VERSION=$(git describe --tags --always) -t cachydb .   # the official image, see DEVELOPMENT.md "Releasing"
 ```

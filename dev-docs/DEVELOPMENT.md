@@ -42,6 +42,9 @@ go test -race ./...                       # all tests
 | `pkg/db/internal/wal/` | WAL format, group commit, retention | WAL changes |
 | `pkg/db/internal/segment/` | Data segments, hints, index snapshots | Data format changes |
 | `pkg/db/internal/fsutil/`, `cache/` | Atomic writes, dir fsync, flock; LRU | Rarely |
+| `Dockerfile`, `.dockerignore` | Official image (multi-stage, distroless, non-root, `/data`) | Base-image bumps, build changes; keep the `go:embed` sources in the context |
+| `.github/workflows/docker.yml` | Image lint, smoke test, multi-arch publish, Docker Hub overview sync | Release process changes |
+| `DOCKERHUB.md`, `docker-compose.yml` | Docker Hub overview (< 25,000 bytes), Compose example | Docker usage changes |
 
 ## Rules
 
@@ -172,7 +175,13 @@ What exists:
 - `internal/app`, `internal/cmd`, `internal/config`: builder options, lock
   behavior, utils output, flags, env-var precedence (flag > env >
   default), `docs` output (index, topics, `--all`, JSON, unknown topic),
-  `version --json`, help examples, `ByteSize` parsing.
+  `version --json`, help examples, `ByteSize` parsing, `healthcheck`
+  (healthy, 503, refused, timeout, stdio, `healthcheck_test.go`).
+- `/healthz` (200, 405, 503 after `Engine.Close`): `TestHealthz` in
+  `internal/mcp/server_test.go`.
+- The Docker image is tested only in CI: the `docker` workflow's
+  pull-request run builds it and runs the smoke test (see
+  [Releasing](#releasing)).
 
 ### Benchmarks
 
@@ -203,6 +212,51 @@ smoke tests, crash recovery).
   the MCP Inspector or `examples/mcp-client` at it. Plain `curl` needs the
   Streamable HTTP handshake (initialize, then the `Mcp-Session-Id` header).
 
+## Releasing
+
+Releases are git tags `vX.Y.Z`. Pushing one runs
+`.github/workflows/docker.yml`, which publishes the official image
+`hovhannespalyan/cachydb` to Docker Hub:
+
+```bash
+git tag v0.0.4 && git push origin v0.0.4
+```
+
+The workflow, in order:
+
+1. Validates the tag (`vX.Y.Z`, optional `-prerelease`) and lints the
+   `Dockerfile` with hadolint.
+2. Builds `linux/amd64` with `VERSION=<tag>` (stamped into
+   `cmd.Version`) and smoke-tests it without secrets: user 65532, healthy
+   within 30s, `GET /healthz`, MCP `initialize` over HTTP,
+   `version --json` reports the tag, `docker stop` exits 0 within 15s, and
+   an `initialize` over stdio.
+3. Logs in to Docker Hub and pushes `linux/amd64` + `linux/arm64` as
+   `X.Y.Z`, `X.Y` and `latest` (pre-releases get only `X.Y.Z-pre`), with
+   provenance (`mode=max`) and SBOM attestations.
+4. Syncs `DOCKERHUB.md` to the Docker Hub overview (short description
+   "Lightweight document database with a built-in MCP server").
+
+Pull requests that touch the Dockerfile, the workflow, Go code or the
+embedded topics run steps 1–2 only; nothing is pushed and no secrets are
+used, so fork PRs run them too.
+
+**Required repository secrets** (Settings > Secrets and variables >
+Actions): `DOCKERHUB_USERNAME` (`hovhannespalyan`) and `DOCKERHUB_TOKEN`, a
+Docker Hub personal access token with **Read, Write, Delete** scope (the
+overview sync needs Delete). A missing secret fails the run before any
+push, with the secret's name in the error.
+
+**Re-publishing**: Actions > docker > Run workflow, with input `tag` (for
+example `v0.0.4`), rebuilds and pushes an existing tag. The tag must
+already contain the `Dockerfile` (v0.0.4 and later).
+
+**Maintenance**: the base images in the `Dockerfile` are pinned by digest
+(the comments name the tags). Bump the digests, and the Go builder version
+with `go.mod`, when updating them; the action versions in the workflow are
+pinned to major tags (hadolint-action to a full version, it has no major
+tag). Keep `DOCKERHUB.md` under 25,000 bytes (Docker Hub's limit).
+
 ## Dependencies
 
 | Package | Version | Purpose |
@@ -225,7 +279,7 @@ smoke tests, crash recovery).
    indexes; no dot-notation in queries.
 5. Schemas cannot be changed after collection creation.
 6. No MCP tools for dropping collections or indexes (engine supports both).
-7. No authentication or TLS on the HTTP transport.
+7. No authentication or TLS on the HTTP transport (`/mcp` and `/healthz`).
 8. Single node only. The data-directory lock needs `flock` (Linux, macOS,
    the BSDs); elsewhere (Windows, Solaris, illumos, AIX) it is a no-op with
    a logged warning, and Windows is unsupported at runtime.

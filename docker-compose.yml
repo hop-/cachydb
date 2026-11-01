@@ -1,0 +1,26 @@
+# Example: run cachydb as a long-running MCP server over HTTP.
+#
+#   docker compose up -d
+#
+# The MCP endpoint is http://localhost:7601/mcp (from other services in
+# this project: http://cachydb:7601/mcp). Data is kept in the named volume
+# cachydb-data. The healthcheck comes from the image (cachydb healthcheck).
+# Settings are environment variables; see DOCKERHUB.md or
+# "docker run --rm hovhannespalyan/cachydb docs config".
+services:
+  cachydb:
+    image: hovhannespalyan/cachydb:latest
+    ports:
+      # No authentication or TLS: publish on localhost only, or keep the
+      # service on a trusted network.
+      - "127.0.0.1:7601:7601"
+    volumes:
+      - cachydb-data:/data
+    environment:
+      DB_NAME: main
+      # CACHE_SIZE: 256MiB
+      # WAL_RETENTION_AGE: 24h
+    restart: unless-stopped
+
+volumes:
+  cachydb-data:
