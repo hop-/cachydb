@@ -32,7 +32,7 @@ type Engine struct {
 	logger *slog.Logger
 	lock   *fsutil.Lock
 	wal    *wal.Log
-	cache  *cache.LRU // encoded documents read from data segments
+	cache  *cache.LRU[cachedDoc] // decoded documents read from data segments
 
 	// metaMu serializes database-level metadata operations (create/drop
 	// database) including their I/O.
@@ -149,7 +149,7 @@ func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 		logger:    opts.Logger,
 		lock:      lock,
 		wal:       wlog,
-		cache:     cache.New(opts.CacheSize),
+		cache:     newDocCache(opts.CacheSize),
 		databases: make(map[string]*Database),
 		flushKick: make(chan struct{}, 1),
 	}

@@ -18,9 +18,10 @@ import (
 //     only bounds RAM between flushes.
 //   - BenchmarkInsertParallel: 16 writers reach ~7× the single-writer
 //     throughput, so group commit batches without a tuned delay.
-//   - BenchmarkGet: cached and uncached Gets differ by ~15% because JSON
-//     decoding dominates either way; CacheSize mostly saves disk reads
-//     once data outgrows the OS page cache, so 64 MiB stays.
+//   - BenchmarkGet: the cache holds decoded documents (plan 002), so a
+//     cached Get (~0.73 µs, a deep clone) is ~8.5× faster than an uncached
+//     one (~6.2 µs: segment read plus JSON decode). Entries are charged
+//     twice their encoded size; 64 MiB stays the default.
 const (
 	defaultWALSegmentSize   int64         = 64 << 20 // 64 MiB
 	defaultWALRetentionAge  time.Duration = 24 * time.Hour

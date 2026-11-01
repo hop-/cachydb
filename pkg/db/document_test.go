@@ -955,3 +955,50 @@ func TestDocumentOpsAfterDropAndClose(t *testing.T) {
 		})
 	}
 }
+
+// TestCachedDocumentIsNeverShared: the cache holds one decoded document;
+// every Get and Find returns a deep clone, so mutating a result (also its
+// nested values) never changes what later reads see.
+func TestCachedDocumentIsNeverShared(t *testing.T) {
+	ctx := context.Background()
+	e, c, _ := newFlushColl(t, nil)
+	mustInsert(t, c, "a", map[string]any{"n": 1, "tags": []any{"x"}, "obj": map[string]any{"k": "v"}})
+	mustFlush(t, c) // now read from the data segment, through the cache
+
+	first := mustGet(t, c, "a")
+	ke := func() keyEntry {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		return c.keydir["a"]
+	}()
+	cached, ok := e.cache.Get(c.cacheKey("a"), ke.walOffset)
+	if !ok {
+		t.Fatal("document not cached after a Get")
+	}
+	if cached.doc == first {
+		t.Fatal("Get returned the cached document itself")
+	}
+
+	mutate := func(d *Document) {
+		d.Data["n"] = 99
+		d.Data["tags"].([]any)[0] = "changed"
+		d.Data["obj"].(map[string]any)["k"] = "changed"
+		d.Data["extra"] = true
+	}
+	mutate(first)
+	found, err := c.Find(ctx, &Query{Filters: []QueryFilter{{Field: "n", Operator: "eq", Value: 1}}})
+	if err != nil || len(found) != 1 {
+		t.Fatalf("Find = %v, %v; want the unchanged document", found, err)
+	}
+	mutate(found[0])
+
+	want := map[string]any{"n": float64(1), "tags": []any{"x"}, "obj": map[string]any{"k": "v"}}
+	for i := range 2 {
+		if got := mustGet(t, c, "a"); !reflect.DeepEqual(got.Data, want) {
+			t.Fatalf("Get %d after mutating earlier results = %v, want %v", i, got.Data, want)
+		}
+	}
+	if !reflect.DeepEqual(cached.doc.Data, want) {
+		t.Fatalf("cached document changed: %v", cached.doc.Data)
+	}
+}

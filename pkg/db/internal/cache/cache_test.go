@@ -9,7 +9,7 @@ import (
 
 // checkInvariants verifies internal bookkeeping: map and list agree, the
 // accounted size equals the sum of entry sizes, and the budget holds.
-func checkInvariants(t *testing.T, c *LRU) {
+func checkInvariants(t *testing.T, c *LRU[[]byte]) {
 	t.Helper()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -18,11 +18,11 @@ func checkInvariants(t *testing.T, c *LRU) {
 	}
 	var sum, valueBytes int64
 	for el := c.ll.Front(); el != nil; el = el.Next() {
-		e := el.Value.(*entry)
+		e := el.Value.(*entry[[]byte])
 		if c.items[e.key] != el {
 			t.Fatalf("map entry for %v does not point at its list element", e.key)
 		}
-		if want := entrySize(e.key, e.val); e.size != want {
+		if want := entrySize(e.key, int64(len(e.val))); e.size != want {
 			t.Fatalf("entry %v size %d, want %d", e.key, e.size, want)
 		}
 		sum += e.size
@@ -43,7 +43,7 @@ func key(id string) Key { return Key{DB: "d", Coll: "c", ID: id} }
 
 func TestEntrySize(t *testing.T) {
 	k := Key{DB: "db", Coll: "coll", ID: "id1"}
-	got := entrySize(k, make([]byte, 10))
+	got := entrySize(k, int64(len(make([]byte, 10))))
 	if want := int64(10 + 2 + 4 + 3 + 64); got != want {
 		t.Fatalf("entrySize = %d, want %d", got, want)
 	}
@@ -66,11 +66,11 @@ func TestGetPut(t *testing.T) {
 		{name: "disabled negative", maxBytes: -5, putOffset: 1, getOffset: 1, val: []byte("x")},
 		{name: "value larger than maxBytes not cached", maxBytes: 100, putOffset: 1, getOffset: 1, val: make([]byte, 101)},
 		{name: "value plus overhead larger than maxBytes not cached", maxBytes: 100, putOffset: 1, getOffset: 1, val: make([]byte, 50)},
-		{name: "value exactly filling budget cached", maxBytes: entrySize(key("k"), make([]byte, 30)), putOffset: 1, getOffset: 1, val: make([]byte, 30), wantHit: true},
+		{name: "value exactly filling budget cached", maxBytes: entrySize(key("k"), int64(len(make([]byte, 30)))), putOffset: 1, getOffset: 1, val: make([]byte, 30), wantHit: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := New(tt.maxBytes)
+			c := newBytes(tt.maxBytes)
 			c.Put(key("k"), tt.putOffset, tt.val)
 			got, ok := c.Get(key("k"), tt.getOffset)
 			if ok != tt.wantHit {
@@ -88,7 +88,7 @@ func TestGetPut(t *testing.T) {
 }
 
 func TestPutReplaces(t *testing.T) {
-	c := New(1 << 20)
+	c := newBytes(1 << 20)
 	c.Put(key("k"), 1, []byte("old value"))
 	c.Put(key("k"), 2, []byte("new"))
 	if _, ok := c.Get(key("k"), 1); ok {
@@ -104,7 +104,7 @@ func TestPutReplaces(t *testing.T) {
 	}
 
 	// Replacing with an oversized value drops the existing entry.
-	small := New(entrySize(key("k"), make([]byte, 10)))
+	small := newBytes(entrySize(key("k"), int64(len(make([]byte, 10)))))
 	small.Put(key("k"), 1, make([]byte, 10))
 	small.Put(key("k"), 2, make([]byte, 11))
 	if _, ok := small.Get(key("k"), 1); ok {
@@ -118,16 +118,16 @@ func TestPutReplaces(t *testing.T) {
 
 func TestEvictionLRUOrder(t *testing.T) {
 	val := make([]byte, 36) // entry size = 36 + 1 + 1 + 2 + 64 = 104 for ids "kN"
-	per := entrySize(key("k0"), val)
+	per := entrySize(key("k0"), int64(len(val)))
 	tests := []struct {
 		name     string
-		ops      func(c *LRU)
+		ops      func(c *LRU[[]byte])
 		wantKeep []string
 		wantGone []string
 	}{
 		{
 			name: "oldest evicted first",
-			ops: func(c *LRU) {
+			ops: func(c *LRU[[]byte]) {
 				for i := range 4 {
 					c.Put(key(fmt.Sprintf("k%d", i)), 1, val)
 				}
@@ -137,7 +137,7 @@ func TestEvictionLRUOrder(t *testing.T) {
 		},
 		{
 			name: "get refreshes recency",
-			ops: func(c *LRU) {
+			ops: func(c *LRU[[]byte]) {
 				c.Put(key("k0"), 1, val)
 				c.Put(key("k1"), 1, val)
 				c.Put(key("k2"), 1, val)
@@ -149,7 +149,7 @@ func TestEvictionLRUOrder(t *testing.T) {
 		},
 		{
 			name: "miss on wrong offset does not refresh recency",
-			ops: func(c *LRU) {
+			ops: func(c *LRU[[]byte]) {
 				c.Put(key("k0"), 1, val)
 				c.Put(key("k1"), 1, val)
 				c.Put(key("k2"), 1, val)
@@ -161,7 +161,7 @@ func TestEvictionLRUOrder(t *testing.T) {
 		},
 		{
 			name: "put refreshes recency",
-			ops: func(c *LRU) {
+			ops: func(c *LRU[[]byte]) {
 				c.Put(key("k0"), 1, val)
 				c.Put(key("k1"), 1, val)
 				c.Put(key("k2"), 1, val)
@@ -173,7 +173,7 @@ func TestEvictionLRUOrder(t *testing.T) {
 		},
 		{
 			name: "large insert evicts several",
-			ops: func(c *LRU) {
+			ops: func(c *LRU[[]byte]) {
 				c.Put(key("k0"), 1, val)
 				c.Put(key("k1"), 1, val)
 				c.Put(key("k2"), 1, val)
@@ -186,7 +186,7 @@ func TestEvictionLRUOrder(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := New(3 * per) // room for exactly three regular entries
+			c := newBytes(3 * per) // room for exactly three regular entries
 			tt.ops(c)
 			checkInvariants(t, c)
 			for _, id := range tt.wantKeep {
@@ -205,7 +205,7 @@ func TestEvictionLRUOrder(t *testing.T) {
 
 func TestBudgetNeverExceeded(t *testing.T) {
 	const maxBytes = 4096
-	c := New(maxBytes)
+	c := newBytes(maxBytes)
 	for i := range 2000 {
 		size := (i * 37) % 700
 		c.Put(Key{DB: "d", Coll: fmt.Sprintf("c%d", i%3), ID: fmt.Sprintf("id%d", i%250)}, uint64(i), make([]byte, size))
@@ -226,21 +226,21 @@ func TestInvalidate(t *testing.T) {
 	}
 	tests := []struct {
 		name     string
-		op       func(c *LRU)
+		op       func(c *LRU[[]byte])
 		wantGone []int // indexes into keys
 	}{
-		{name: "single key", op: func(c *LRU) { c.Invalidate(keys[1]) }, wantGone: []int{1}},
-		{name: "missing key is no-op", op: func(c *LRU) { c.Invalidate(Key{DB: "z", Coll: "z", ID: "z"}) }},
-		{name: "collection", op: func(c *LRU) { c.InvalidateCollection("a", "x") }, wantGone: []int{0, 1}},
-		{name: "collection same name other db untouched", op: func(c *LRU) { c.InvalidateCollection("b", "x") }, wantGone: []int{3}},
-		{name: "missing collection is no-op", op: func(c *LRU) { c.InvalidateCollection("a", "zz") }},
-		{name: "database", op: func(c *LRU) { c.InvalidateDatabase("a") }, wantGone: []int{0, 1, 2}},
-		{name: "database prefix not matched", op: func(c *LRU) { c.InvalidateDatabase("ab") }, wantGone: []int{4}},
-		{name: "missing database is no-op", op: func(c *LRU) { c.InvalidateDatabase("nope") }},
+		{name: "single key", op: func(c *LRU[[]byte]) { c.Invalidate(keys[1]) }, wantGone: []int{1}},
+		{name: "missing key is no-op", op: func(c *LRU[[]byte]) { c.Invalidate(Key{DB: "z", Coll: "z", ID: "z"}) }},
+		{name: "collection", op: func(c *LRU[[]byte]) { c.InvalidateCollection("a", "x") }, wantGone: []int{0, 1}},
+		{name: "collection same name other db untouched", op: func(c *LRU[[]byte]) { c.InvalidateCollection("b", "x") }, wantGone: []int{3}},
+		{name: "missing collection is no-op", op: func(c *LRU[[]byte]) { c.InvalidateCollection("a", "zz") }},
+		{name: "database", op: func(c *LRU[[]byte]) { c.InvalidateDatabase("a") }, wantGone: []int{0, 1, 2}},
+		{name: "database prefix not matched", op: func(c *LRU[[]byte]) { c.InvalidateDatabase("ab") }, wantGone: []int{4}},
+		{name: "missing database is no-op", op: func(c *LRU[[]byte]) { c.InvalidateDatabase("nope") }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := New(1 << 20)
+			c := newBytes(1 << 20)
 			for i, k := range keys {
 				c.Put(k, uint64(i), []byte(fmt.Sprintf("v%d", i)))
 			}
@@ -264,7 +264,7 @@ func TestInvalidate(t *testing.T) {
 }
 
 func TestDisabledInvalidateIsSafe(t *testing.T) {
-	c := New(0)
+	c := newBytes(0)
 	c.Invalidate(key("k"))
 	c.InvalidateCollection("d", "c")
 	c.InvalidateDatabase("d")
@@ -272,7 +272,7 @@ func TestDisabledInvalidateIsSafe(t *testing.T) {
 }
 
 func TestConcurrentAccess(t *testing.T) {
-	c := New(16 * 1024)
+	c := newBytes(16 * 1024)
 	const (
 		workers = 16
 		iters   = 2000
@@ -308,4 +308,9 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 	wg.Wait()
 	checkInvariants(t, c)
+}
+
+// newBytes returns an LRU of byte slices charged by their length.
+func newBytes(maxBytes int64) *LRU[[]byte] {
+	return New(maxBytes, func(b []byte) int64 { return int64(len(b)) })
 }
