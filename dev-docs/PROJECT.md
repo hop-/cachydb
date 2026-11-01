@@ -67,7 +67,7 @@ cachydb/
 ├── go.mod                   # github.com/hop-/cachydb, Go 1.25.5
 ├── internal/
 │   ├── app/                 # Builder (options → Engine + MCP server), App Start/Stop
-│   ├── cmd/                 # cobra commands: root/app, docs, version, utils list/migrate, flags
+│   ├── cmd/                 # cobra commands: root/app, docs, version, healthcheck, utils list/migrate, flags
 │   ├── config/              # envconfig settings, ByteSize parser, Windows root dir name
 │   ├── docs/                # embedded agent docs topics (cachydb docs, MCP resources)
 │   └── mcp/                 # server.go: handlers, sessions, transports;
@@ -89,9 +89,13 @@ cachydb/
 │   ├── options.go errors.go names.go hooks.go
 │   ├── bench_test.go        # performance benchmarks
 │   └── internal/{wal,segment,fsutil,cache}/
-└── examples/
-    ├── basic/main.go        # embed pkg/db as a library
-    └── mcp-client/main.go   # drive the binary over stdio MCP
+├── examples/
+│   ├── basic/main.go        # embed pkg/db as a library
+│   └── mcp-client/main.go   # drive the binary over stdio MCP
+├── Dockerfile .dockerignore # official image (distroless, non-root, /data volume)
+├── docker-compose.yml       # example: HTTP server with a named volume
+├── DOCKERHUB.md             # Docker Hub overview, synced on release
+└── .github/workflows/docker.yml  # PR smoke test; v* tags publish hovhannespalyan/cachydb
 ```
 
 ## Design Principles

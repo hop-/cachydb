@@ -370,6 +370,11 @@ func (e *Engine) isClosed() bool {
 	return e.closed
 }
 
+// Closed reports whether Close has started: from then on every public
+// operation fails with ErrClosed. Health checks use it; it never blocks
+// on in-flight operations.
+func (e *Engine) Closed() bool { return e.isClosed() }
+
 // spawn runs fn in a background goroutine joined by Close. fn must return
 // promptly once ctx is cancelled. It must be called from inside an
 // enter/exit pair (so Close cannot have started waiting on bg yet).

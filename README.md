@@ -49,6 +49,14 @@ go build -o cachydb
 go install github.com/hop-/cachydb@latest
 ```
 
+### Docker
+
+```bash
+docker run -d -p 7601:7601 -v cachydb-data:/data hovhannespalyan/cachydb
+```
+
+See [Docker](#docker) below.
+
 ## Usage
 
 ### Starting the MCP Server
@@ -162,6 +170,47 @@ Then point your MCP client at the endpoint:
 ```
 
 The HTTP endpoint implements the MCP Streamable HTTP transport — clients POST JSON-RPC messages to `/mcp` and receive responses via SSE. Idle sessions expire after 30 minutes. There is no authentication; do not expose the port to untrusted networks.
+
+The HTTP server also answers `GET /healthz`: `200 {"status":"ok","version":"..."}` while the database is open, `503` while it shuts down. `cachydb healthcheck` probes it and exits 0 (healthy) or 1, for container and service-manager healthchecks:
+
+```bash
+TRANSPORT=http cachydb healthcheck                    # http://127.0.0.1:$PORT/healthz (with TRANSPORT=stdio it exits 0 without probing)
+cachydb healthcheck --url http://db.internal:7601/healthz
+```
+
+## Docker
+
+The official image [`hovhannespalyan/cachydb`](https://hub.docker.com/r/hovhannespalyan/cachydb) is a small distroless image for `linux/amd64` and `linux/arm64`. It runs as the non-root user `65532`, keeps data in the `/data` volume, and is configured with the [environment variables](#configuration). Its defaults are `TRANSPORT=http`, `PORT=7601`, `ROOT_DIR=/data`, `DB_NAME=main`. Tags: `latest`, `X.Y`, `X.Y.Z`.
+
+```bash
+# HTTP server at http://localhost:7601/mcp, data in the cachydb-data volume
+docker run -d --name cachydb -p 7601:7601 -v cachydb-data:/data hovhannespalyan/cachydb
+
+# stdio, started by an MCP client (keep -i, no -t)
+docker run -i --rm -v cachydb-data:/data -e TRANSPORT=stdio hovhannespalyan/cachydb
+
+# other commands
+docker run --rm hovhannespalyan/cachydb version --json
+```
+
+With Docker Compose, the repository's [`docker-compose.yml`](docker-compose.yml) runs the HTTP server with a named volume: `docker compose up -d`.
+
+For an agent, point the client at the HTTP container, or let it start a stdio container:
+
+```bash
+claude mcp add --transport http cachydb http://localhost:7601/mcp
+claude mcp add --transport stdio cachydb -- docker run -i --rm -v cachydb-data:/data -e TRANSPORT=stdio hovhannespalyan/cachydb
+```
+
+Notes:
+
+- **Volume permissions**: named volumes work as they are. A bind mount keeps the host directory's owner, so `chown 65532:65532` it first, or run with `--user "$(id -u):$(id -g)"`.
+- **One container per volume**: the data-directory lock allows one cachydb process per volume. Share data between agents through one HTTP container.
+- **Healthcheck**: the image's `HEALTHCHECK` runs `cachydb healthcheck`. It reads `PORT` and `TRANSPORT` from the environment, so set those as environment variables rather than flags.
+- **Shutdown**: `docker stop` sends SIGTERM; cachydb flushes and exits 0.
+- **Build locally**: `docker build --build-arg VERSION=$(git describe --tags --always) -t cachydb .`
+
+The Docker Hub overview is [`DOCKERHUB.md`](DOCKERHUB.md).
 
 ## MCP Tools
 

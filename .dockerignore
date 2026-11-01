@@ -1,0 +1,34 @@
+# Build context for the Dockerfile: it needs go.mod, go.sum, main.go,
+# internal/ and pkg/, including the go:embed sources
+# internal/docs/topics/*.md.
+
+# VCS, CI, editors
+.git
+.gitignore
+.github
+.vscode
+.idea
+
+# Local binaries, build output, data and env files
+cachydb
+build
+bin
+__debug_bin*
+.cachydb
+.env
+examples/*/*
+!examples/*/*.go
+
+# Docs: not needed to build, except the embedded topics
+**/*.md
+!internal/docs/topics/*.md
+dev-docs
+
+# Tests are not compiled into the image
+**/*_test.go
+
+# Container and example files
+Dockerfile
+.dockerignore
+docker-compose.yml
+mcp-config.example.json

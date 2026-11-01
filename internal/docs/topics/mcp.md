@@ -1,7 +1,7 @@
 ---
 name: mcp
 title: Using cachydb as an MCP server
-summary: stdio vs Streamable HTTP, client configuration examples, per-session databases, and the data-directory lock
+summary: stdio vs Streamable HTTP, client configuration examples (incl. Docker), health checks, per-session databases, and the data-directory lock
 ---
 <!--
 Client config formats checked on 2026-11-01 against the official docs:
@@ -108,6 +108,62 @@ Most clients accept the `mcpServers` shape:
 
 Useful arguments: `-R <dir>` data directory, `-d <name>` default database,
 `-t http -p <port>` HTTP transport. See `cachydb docs config`.
+
+## Docker
+
+The official image `hovhannespalyan/cachydb` (linux/amd64, linux/arm64)
+runs the HTTP transport on port 7601 by default, as the non-root user
+65532, with its data in the `/data` volume. Configure it with environment
+variables (see `cachydb docs config`).
+
+```bash
+# HTTP server: http://localhost:7601/mcp
+docker run -d --name cachydb -p 7601:7601 -v cachydb-data:/data hovhannespalyan/cachydb
+
+# Claude Code against the HTTP container
+claude mcp add --transport http cachydb http://localhost:7601/mcp
+
+# Claude Code starting a stdio container per session (keep -i, no -t)
+claude mcp add --transport stdio cachydb -- \
+  docker run -i --rm -v cachydb-data:/data -e TRANSPORT=stdio hovhannespalyan/cachydb
+```
+
+Generic stdio JSON (Claude Desktop, Cursor and other `mcpServers`
+clients):
+
+```json
+{
+  "mcpServers": {
+    "cachydb": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "-v", "cachydb-data:/data",
+               "-e", "TRANSPORT=stdio", "hovhannespalyan/cachydb"]
+    }
+  }
+}
+```
+
+A volume is a data directory: one container at a time (see below). A bind
+mount (`-v /host/dir:/data`) must be writable by UID 65532
+(`chown 65532:65532 /host/dir`), or run with `--user "$(id -u):$(id -g)"`.
+
+## Health checks
+
+The HTTP transport also serves `GET /healthz`: `200
+{"status":"ok","version":"..."}` while the database is open, `503
+{"status":"unavailable"}` while it shuts down. `cachydb healthcheck`
+probes it and exits 0 (healthy) or 1, with the reason on stderr:
+
+```bash
+TRANSPORT=http cachydb healthcheck                    # http://127.0.0.1:$PORT/healthz
+cachydb healthcheck --url http://db.internal:7601/healthz
+```
+
+Without `--url`, it reads `PORT` and `TRANSPORT` (or `-p`, `-t`); if the
+transport is `stdio` there is nothing to probe and it exits 0. It never
+opens the database. The Docker image uses it as its `HEALTHCHECK`, so set
+`PORT` and `TRANSPORT` in a container as environment variables, not
+flags.
 
 ## Choosing the database
 

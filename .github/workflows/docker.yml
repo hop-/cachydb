@@ -1,0 +1,264 @@
+# Builds the official Docker image and publishes it to Docker Hub.
+#
+# - pull_request: lint, build linux/amd64 and smoke-test it. Nothing is
+#   pushed and no secrets are used, so PRs from forks run it too.
+# - push of a v* tag: the same checks, then a multi-arch push of
+#   hovhannespalyan/cachydb:{X.Y.Z, X.Y, latest} with provenance and SBOM,
+#   then a sync of DOCKERHUB.md to the Docker Hub overview.
+# - workflow_dispatch: re-publish an existing tag (it must contain this
+#   Dockerfile).
+#
+# Required repository secrets for publishing: DOCKERHUB_USERNAME and
+# DOCKERHUB_TOKEN (a Docker Hub access token with Read, Write, Delete
+# scope). See dev-docs/DEVELOPMENT.md, "Releasing".
+name: docker
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to (re-)publish, e.g. v0.0.4"
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/docker.yml"
+      - "go.mod"
+      - "go.sum"
+      - "**/*.go"
+      - "internal/docs/topics/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded PR runs; never cancel a release.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: hovhannespalyan/cachydb
+  SMOKE_IMAGE: cachydb:test
+  SMOKE_CONTAINER: cachydb-smoke
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Resolve the version
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          case "$EVENT" in
+            workflow_dispatch) tag="$INPUT_TAG" ;;
+            push) tag="$GITHUB_REF_NAME" ;;
+            *) tag="" ;;
+          esac
+          if [ -n "$tag" ]; then
+            if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+              echo "::error::'$tag' is not a release tag like v1.2.3"
+              exit 1
+            fi
+            version="$tag"
+            release=true
+          else
+            version="v0.0.0-pr.${PR_NUMBER}"
+            release=false
+          fi
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "release=$release"
+          } >> "$GITHUB_OUTPUT"
+          echo "version=$version release=$release"
+
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          # The tag for workflow_dispatch, the PR head for pull_request,
+          # the pushed tag otherwise.
+          ref: >-
+            ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag)
+            || github.event_name == 'pull_request' && github.event.pull_request.head.sha
+            || github.ref }}
+          persist-credentials: false
+
+      - name: Lint the Dockerfile
+        uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: Dockerfile
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          # The semver tags take the version from the resolved tag, so a
+          # workflow_dispatch run gets the same tags as the tag push. On
+          # pull requests there is no tag and no image tag is produced.
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.version.outputs.tag }},enable=${{ steps.version.outputs.release }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.tag }},enable=${{ steps.version.outputs.release }}
+          flavor: |
+            latest=auto
+          labels: |
+            org.opencontainers.image.title=cachydb
+            org.opencontainers.image.description=Lightweight document database with a built-in MCP server
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+
+      # ---- Smoke test: runs before any login or push, without secrets ----
+
+      - name: Build the smoke-test image (linux/amd64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          # The local image store cannot hold attestations.
+          provenance: false
+          tags: ${{ env.SMOKE_IMAGE }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          # Fork PRs may not be allowed to write the cache; that must not
+          # fail the build.
+          cache-to: type=gha,mode=max,ignore-error=true
+
+      - name: "Smoke test: runs as UID 65532"
+        run: |
+          user="$(docker image inspect -f '{{.Config.User}}' "$SMOKE_IMAGE")"
+          echo "image user: $user"
+          [ "$user" = "65532:65532" ]
+
+      - name: "Smoke test: HTTP server becomes healthy"
+        run: |
+          docker run -d --name "$SMOKE_CONTAINER" -p 7601:7601 "$SMOKE_IMAGE"
+          for _ in $(seq 1 30); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' "$SMOKE_CONTAINER")"
+            echo "health: $status"
+            if [ "$status" = "healthy" ]; then exit 0; fi
+            if [ "$(docker inspect -f '{{.State.Running}}' "$SMOKE_CONTAINER")" != "true" ]; then
+              echo "::error::the container exited"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::the container did not become healthy within 30s"
+          exit 1
+
+      - name: "Smoke test: GET /healthz"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          body="$(curl -fsS --max-time 5 http://127.0.0.1:7601/healthz)"
+          echo "$body"
+          echo "$body" | jq -e --arg v "$VERSION" '.status == "ok" and .version == $v'
+
+      - name: "Smoke test: MCP initialize over HTTP"
+        run: |
+          code="$(curl -sS --max-time 10 -o initialize.out -w '%{http_code}' \
+            -X POST http://127.0.0.1:7601/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke-test","version":"1.0.0"}}}')"
+          echo "HTTP $code"
+          cat initialize.out
+          echo
+          [ "$code" = "200" ]
+          grep -q '"serverInfo"' initialize.out
+          grep -q 'cachydb' initialize.out
+
+      - name: "Smoke test: version --json"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          out="$(docker run --rm "$SMOKE_IMAGE" version --json)"
+          echo "$out"
+          echo "$out" | jq -e --arg v "$VERSION" '.version == $v'
+
+      - name: "Smoke test: clean docker stop"
+        run: |
+          start="$(date +%s)"
+          docker stop -t 15 "$SMOKE_CONTAINER"
+          elapsed="$(( $(date +%s) - start ))"
+          code="$(docker inspect -f '{{.State.ExitCode}}' "$SMOKE_CONTAINER")"
+          echo "stopped in ${elapsed}s with exit code $code"
+          [ "$code" = "0" ]
+          [ "$elapsed" -lt 15 ]
+
+      - name: "Smoke test: container logs"
+        if: always()
+        run: docker logs "$SMOKE_CONTAINER" || true
+
+      - name: "Smoke test: stdio transport"
+        run: |
+          init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke-test","version":"1.0.0"}}}'
+          # Keep stdin open briefly so the response is written before EOF.
+          (printf '%s\n' "$init"; sleep 2) \
+            | docker run -i --rm -e TRANSPORT=stdio "$SMOKE_IMAGE" > stdio.out
+          cat stdio.out
+          head -n 1 stdio.out | jq -e '.jsonrpc == "2.0" and .id == 1 and .result.serverInfo.name == "cachydb"'
+
+      # ---- Publish: tag and workflow_dispatch runs only ----
+
+      - name: Check the Docker Hub secrets
+        if: steps.version.outputs.release == 'true'
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          missing=""
+          [ -n "$DOCKERHUB_USERNAME" ] || missing="$missing DOCKERHUB_USERNAME"
+          [ -n "$DOCKERHUB_TOKEN" ] || missing="$missing DOCKERHUB_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "::error::missing repository secret(s):$missing (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
+
+      - name: Log in to Docker Hub
+        if: steps.version.outputs.release == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push (linux/amd64, linux/arm64)
+        if: steps.version.outputs.release == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Sync the Docker Hub overview
+        if: steps.version.outputs.release == 'true'
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.IMAGE }}
+          short-description: Lightweight document database with a built-in MCP server
+          readme-filepath: ./DOCKERHUB.md
