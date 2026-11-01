@@ -17,6 +17,9 @@ import (
 
 const testDefaultDB = "default"
 
+// testVersion is the build version the test servers report.
+const testVersion = "v9.9.9-test"
+
 // newTestServer opens an engine in a temp dir and builds a Server on it.
 // Cleanup closes the server, then the engine.
 func newTestServer(t *testing.T) *Server {
@@ -29,7 +32,7 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
-	s, err := NewServer(ctx, engine, testDefaultDB, "stdio", "")
+	s, err := NewServer(ctx, engine, testDefaultDB, "stdio", "", testVersion)
 	if err != nil {
 		_ = engine.Close(ctx)
 		t.Fatalf("NewServer: %v", err)
@@ -376,7 +379,7 @@ func TestToolErrors(t *testing.T) {
 		args     map[string]any
 		wantText string
 	}{
-		{"use missing database", "use_database", map[string]any{"name": "nope"}, "not found"},
+		{"use missing database", "use_database", map[string]any{"name": "nope"}, "not found (hint: list_databases"},
 		{"delete missing database", "delete_database", map[string]any{"name": "nope"}, "not found"},
 		{"invalid database name", "create_database", map[string]any{"name": "bad/name"}, "invalid name"},
 		{"explicit missing database", "list_collections", map[string]any{"database": "nope"}, "not found"},
@@ -384,6 +387,7 @@ func TestToolErrors(t *testing.T) {
 		{"missing collection", "insert_document", map[string]any{"collection": "nope", "document": map[string]any{"a": 1}}, "not found"},
 		{"duplicate id", "insert_document", map[string]any{"collection": "items", "document": map[string]any{"_id": "x", "name": "Y"}}, "already exists"},
 		{"schema violation", "insert_document", map[string]any{"collection": "items", "document": map[string]any{"name": 5}}, "schema validation"},
+		{"schema violation hint", "insert_document", map[string]any{"collection": "items", "document": map[string]any{"name": 5}}, "cachydb://docs/schema"},
 		{"update missing document", "update_document", map[string]any{"collection": "items", "id": "nope", "updates": map[string]any{"name": "Z"}}, "not found"},
 		{"update _id", "update_document", map[string]any{"collection": "items", "id": "x", "updates": map[string]any{"_id": "y"}}, "schema validation"},
 		{"delete missing document", "delete_document", map[string]any{"collection": "items", "id": "nope"}, "not found"},
@@ -464,7 +468,7 @@ func TestNewServerCreatesDefaultDatabase(t *testing.T) {
 	if _, err := s.engine.Database(testDefaultDB); err != nil {
 		t.Fatalf("default database: %v", err)
 	}
-	if _, err := NewServer(context.Background(), nil, testDefaultDB, "stdio", ""); err == nil {
+	if _, err := NewServer(context.Background(), nil, testDefaultDB, "stdio", "", testVersion); err == nil {
 		t.Fatal("NewServer(nil engine) = nil error, want error")
 	}
 }

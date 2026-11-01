@@ -7,7 +7,8 @@ summary: Errors agents may see from the tools and the CLI, what each means, and 
 
 Tool errors come back as an MCP tool result with `isError: true`. The text
 starts with the action (for example `find documents:`) followed by the
-cause. Invalid arguments are rejected before the tool runs, with a message
+cause; "not found" and schema errors end with a short `(hint: …)`. Invalid
+arguments are rejected before the tool runs, with a message
 starting `validating "arguments":`.
 
 ## Tool errors

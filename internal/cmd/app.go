@@ -80,6 +80,7 @@ func runApp(cmd *cobra.Command, _ []string) error {
 		WithDBName(dbName()).
 		WithTransport(generalTransport).
 		WithPort(generalServerPort).
+		WithVersion(getVersion()).
 		Build(ctx)
 	if err != nil {
 		return err
