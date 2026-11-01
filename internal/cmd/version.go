@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"runtime/debug"
 
 	"github.com/spf13/cobra"
@@ -12,8 +13,8 @@ var (
 		Use:   "version",
 		Short: "Show the application version",
 		Long:  `Display the current version of the application.`,
-		Run: func(cmd *cobra.Command, args []string) {
-			showApplicationVersion()
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return showApplicationVersion(cmd.OutOrStdout())
 		},
 	}
 )
@@ -24,8 +25,9 @@ func init() {
 	rootCmd.AddCommand(versionCmd)
 }
 
-func showApplicationVersion() {
-	fmt.Printf("cachydb version %s\n", getVersion())
+func showApplicationVersion(w io.Writer) error {
+	_, err := fmt.Fprintf(w, "cachydb version %s\n", getVersion())
+	return err
 }
 
 func getVersion() string {

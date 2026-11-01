@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"context"
+	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
-	"github.com/hop-/cachydb/internal/config"
 	"github.com/spf13/cobra"
 )
 
@@ -12,34 +15,31 @@ var (
 		Use:   "cachydb",
 		Short: "A lightweight document-based database with MCP support",
 		Long:  `CachyDB is a lightweight document-based database similar to MongoDB, with Model Context Protocol (MCP) support for AI integration.`,
-		Run: func(cmd *cobra.Command, args []string) {
-			executeApp()
-		},
+		RunE:  runApp,
+		// Execute prints the error once (cobra.CheckErr); commands silence
+		// the usage text themselves once their arguments are valid.
+		SilenceErrors: true,
 	}
 )
 
 // autorun: This function is called automatically to initialize the root command
 func init() {
-	config.Init()
-
 	// Flags for root command
 	setAllFlagsToCmd(rootCmd)
 }
 
+// Execute runs the CLI. SIGINT and SIGTERM cancel the command context, so
+// a running server stops its transport and closes the engine. Errors are
+// printed to stderr and exit with status 1.
 func Execute() {
-
-	err := createRootDirIfNotExists()
-	if err != nil {
-		// TODO: handle error properly
-		panic(err)
+	if configErr != nil {
+		fmt.Fprintln(os.Stderr, "Error:", configErr)
+		os.Exit(1)
 	}
 
-	// Execute the root command
-	cobra.CheckErr(rootCmd.Execute())
-}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	err := rootCmd.ExecuteContext(ctx)
+	stop()
 
-func createRootDirIfNotExists() error {
-	rootDir := config.GetConfig().RootDir
-
-	return os.MkdirAll(rootDir, 0755)
+	cobra.CheckErr(err)
 }
