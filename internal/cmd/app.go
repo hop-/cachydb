@@ -2,8 +2,8 @@ package cmd
 
 import (
 	"context"
+	"errors"
 
-	"github.com/hop-/cachydb/internal/app"
 	"github.com/hop-/cachydb/internal/config"
 	"github.com/spf13/cobra"
 )
@@ -11,9 +11,7 @@ import (
 var appCmd = &cobra.Command{
 	Use:   "app",
 	Short: "Run the application (same as default)",
-	Run: func(cmd *cobra.Command, args []string) {
-		executeApp()
-	},
+	RunE:  runApp,
 }
 
 // autorun: This function is called automatically to initialize the command
@@ -43,36 +41,28 @@ func setAllFlagsToCmd(cmd *cobra.Command) {
 		"",
 		"transport type: stdio or http",
 	)
+	setEngineFlags(cmd.Flags())
 }
 
-func executeApp() {
-	application, err := buildApp()
-	if err != nil {
-		// TODO: handle error appropriately
-		return
-	}
+// runApp opens the engine, runs the MCP transport until it returns (stdin
+// closed, signal, or error), and then always stops the app, which closes
+// the engine with a final flush.
+func runApp(cmd *cobra.Command, _ []string) error {
+	cmd.SilenceUsage = true
+	ctx := cmd.Context()
 
-	ctx := context.Background()
-	err = application.Start(ctx)
-	if err != nil {
-		// TODO: handle error appropriately
-		return
-	}
-
-	defer func() {
-		err := application.Stop()
-		if err != nil {
-			// TODO: handle error appropriately
-		}
-	}()
-}
-
-func buildApp() (*app.App, error) {
-	builder := app.NewBuilder().
+	application, err := newBuilder().
 		WithDBName(config.GetConfig().DBName).
-		WithRootDir(generalRootDir).
 		WithTransport(generalTransport).
-		WithPort(generalServerPort)
+		WithPort(generalServerPort).
+		Build(ctx)
+	if err != nil {
+		return err
+	}
 
-	return builder.Build()
+	startErr := application.Start(ctx)
+	// The signal context may already be cancelled; the shutdown still
+	// needs its own (bounded) context to flush.
+	stopErr := application.Stop(context.WithoutCancel(ctx))
+	return errors.Join(startErr, stopErr)
 }

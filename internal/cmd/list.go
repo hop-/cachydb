@@ -1,7 +1,10 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
 
 	"github.com/hop-/cachydb/pkg/db"
 	"github.com/spf13/cobra"
@@ -12,7 +15,10 @@ var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List databases and their schema versions",
 	Long: `List all available databases in the data directory along with their schema versions.
-This command helps you see what databases exist and their current state.`,
+This command helps you see what databases exist and their current state.
+
+It opens the engine (taking the data-directory lock), so it fails while a
+cachydb server is running on the same data directory.`,
 	RunE: runList,
 }
 
@@ -27,47 +33,56 @@ func init() {
 }
 
 func runList(cmd *cobra.Command, args []string) error {
-	storage, err := db.NewStorageManager(generalRootDir)
-	if err != nil {
-		return fmt.Errorf("failed to create storage manager: %w", err)
-	}
-	defer storage.Close()
+	cmd.SilenceUsage = true
+	return listDatabases(cmd.Context(), cmd.OutOrStdout(), engineOptions(), showCollections)
+}
 
-	dbManager, err := storage.LoadAllDatabases()
-	if err != nil {
-		return fmt.Errorf("failed to load databases: %w", err)
-	}
-
-	databases := dbManager.ListDatabases()
-	if len(databases) == 0 {
-		fmt.Println("No databases found")
-		return nil
-	}
-
-	fmt.Printf("Found %d database(s):\n\n", len(databases))
-	for _, dbName := range databases {
-		database := dbManager.GetDatabase(dbName)
-		if database != nil {
-			fmt.Printf("  %s (schema version: %d)\n", dbName, database.SchemaVersion)
-
-			if showCollections {
-				collections := database.ListCollections()
-				if len(collections) > 0 {
-					for _, collName := range collections {
-						coll, err := database.GetCollection(collName)
-						if err == nil {
-							docCount := len(coll.Documents)
-							fmt.Printf("    └─ %s (%d documents)\n", collName, docCount)
-						}
-					}
-				} else {
-					fmt.Printf("    └─ (no collections)\n")
-				}
-			}
-		} else {
-			fmt.Printf("  %s\n", dbName)
+// listDatabases opens the engine with opts and prints every database with
+// its schema version and, if collections is set, its collections with
+// their document counts.
+func listDatabases(ctx context.Context, w io.Writer, opts db.Options, collections bool) error {
+	err := withEngine(ctx, opts, func(e *db.Engine) error {
+		out := &output{w: w}
+		databases := e.ListDatabases()
+		if len(databases) == 0 {
+			out.printf("No databases found\n")
+			return out.err
 		}
-	}
 
+		out.printf("Found %d database(s):\n\n", len(databases))
+		for _, dbName := range databases {
+			database, err := e.Database(dbName)
+			if err != nil {
+				if errors.Is(err, db.ErrNotFound) {
+					continue
+				}
+				return err
+			}
+			out.printf("  %s (schema version: %d)\n", dbName, database.SchemaVersion())
+
+			if !collections {
+				continue
+			}
+			names := database.ListCollections()
+			if len(names) == 0 {
+				out.printf("    └─ (no collections)\n")
+				continue
+			}
+			for _, collName := range names {
+				coll, err := database.Collection(collName)
+				if err != nil {
+					if errors.Is(err, db.ErrNotFound) {
+						continue
+					}
+					return err
+				}
+				out.printf("    └─ %s (%d documents)\n", collName, coll.Count())
+			}
+		}
+		return out.err
+	})
+	if err != nil {
+		return fmt.Errorf("listing databases: %w", err)
+	}
 	return nil
 }

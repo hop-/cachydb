@@ -1,183 +1,124 @@
 package db
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
 )
 
-// CurrentSchemaVersion is the latest schema version
+// CurrentSchemaVersion is the schema version new databases are created
+// with. Open rejects databases with a newer version (ErrSchemaTooNew).
 const CurrentSchemaVersion = 1
 
-// MigrationFunc is a function that migrates from one version to the next
-type MigrationFunc func(dbManager *DatabaseManager, storage *StorageManager) error
-
-// Example of registering a migration:
+// MigrationFunc migrates the database dbName from one schema version to
+// the next. It runs on an opened engine (after recovery) and must use the
+// normal engine operations, which are WAL-logged. Because the version bump
+// is written after the function returns, a crash in between reruns the
+// migration on the next attempt, so migrations should be idempotent.
 //
-// func init() {
-//     // Migration from version 1 to version 2
-//     db.RegisterMigration(1, func(dbManager *db.DatabaseManager, storage *db.StorageManager) error {
-//         fmt.Println("Running migration 1 -> 2")
-//         // Iterate through all databases
-//         for _, database := range dbManager.Databases {
-//             // Perform migration operations on each database
-//             // Example: Add a new field, transform data, etc.
-//         }
-//         return nil
-//     })
+// Example:
 //
-//     // Migration from version 2 to version 3
-//     db.RegisterMigration(2, func(dbManager *db.DatabaseManager, storage *db.StorageManager) error {
-//         fmt.Println("Running migration 2 -> 3")
-//         // Perform version 2 to 3 migration
-//         return nil
-//     })
-// }
+//	func init() {
+//		db.RegisterMigration(1, func(ctx context.Context, e *db.Engine, dbName string) error {
+//			d, err := e.Database(dbName)
+//			if err != nil {
+//				return err
+//			}
+//			return d.CreateCollection(ctx, "audit", nil)
+//		})
+//	}
+type MigrationFunc func(ctx context.Context, e *Engine, dbName string) error
 
-// MigrationRegistry holds all registered migration functions
-type MigrationRegistry struct {
-	migrations map[int]MigrationFunc // maps from_version -> migration function to reach from_version+1
+// registry holds the registered migrations: from version -> function that
+// migrates to from+1.
+var registry = struct {
 	mu         sync.RWMutex
+	migrations map[int]MigrationFunc
+}{migrations: make(map[int]MigrationFunc)}
+
+// RegisterMigration registers fn as the migration from fromVersion to
+// fromVersion+1, replacing any earlier registration for fromVersion.
+func RegisterMigration(fromVersion int, fn MigrationFunc) {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	registry.migrations[fromVersion] = fn
 }
 
-var globalRegistry = &MigrationRegistry{
-	migrations: make(map[int]MigrationFunc),
+// ListMigrations returns the registered from-versions in ascending order.
+func ListMigrations() []int {
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	return slices.Sorted(maps.Keys(registry.migrations))
 }
 
-// RegisterMigration registers a migration function for a specific version transition
-// fromVersion -> toVersion (toVersion must be fromVersion + 1)
-func RegisterMigration(fromVersion int, migrationFunc MigrationFunc) {
-	globalRegistry.mu.Lock()
-	defer globalRegistry.mu.Unlock()
-	globalRegistry.migrations[fromVersion] = migrationFunc
+func migrationFor(fromVersion int) (MigrationFunc, bool) {
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	fn, ok := registry.migrations[fromVersion]
+	return fn, ok
 }
 
-// GetMigration retrieves a migration function for a specific version
-func GetMigration(fromVersion int) (MigrationFunc, bool) {
-	globalRegistry.mu.RLock()
-	defer globalRegistry.mu.RUnlock()
-	fn, exists := globalRegistry.migrations[fromVersion]
-	return fn, exists
-}
-
-// MigrationManager handles database schema migrations
-type MigrationManager struct {
-	storage *StorageManager
-}
-
-// NewMigrationManager creates a new migration manager
-func NewMigrationManager(storage *StorageManager) *MigrationManager {
-	return &MigrationManager{
-		storage: storage,
+// MigrateDatabase applies the registered migrations to dbName one version
+// at a time until it reaches targetVersion, persisting the new version
+// after each step. Downgrades are rejected. Migrations are serialized per
+// engine.
+func (e *Engine) MigrateDatabase(ctx context.Context, dbName string, targetVersion int) error {
+	if err := e.enter(); err != nil {
+		return err
 	}
+	defer e.exit()
+	e.migrateMu.Lock()
+	defer e.migrateMu.Unlock()
+	return e.migrateDatabase(ctx, dbName, targetVersion)
 }
 
-// MigrateDatabase migrates a database from its current version to the target version
-func (mm *MigrationManager) MigrateDatabase(dbName string, targetVersion int) error {
-	fmt.Printf("Starting migration for database '%s'...\n", dbName)
-
-	// Load database
-	db, err := mm.storage.LoadDatabase(dbName)
+func (e *Engine) migrateDatabase(ctx context.Context, dbName string, targetVersion int) error {
+	d, err := e.Database(dbName)
 	if err != nil {
-		return fmt.Errorf("failed to load database: %w", err)
+		return err
 	}
-
-	currentVersion := db.SchemaVersion
-	if currentVersion == 0 {
-		// Default to version 1 for databases without version info
-		currentVersion = 1
-		db.SchemaVersion = 1
+	current := d.SchemaVersion()
+	if current > targetVersion {
+		return fmt.Errorf("migrating database %q: cannot downgrade from version %d to %d", dbName, current, targetVersion)
 	}
-
-	fmt.Printf("Database '%s' is at version %d, target version: %d\n", dbName, currentVersion, targetVersion)
-
-	if currentVersion == targetVersion {
-		fmt.Printf("Database '%s' is already at version %d, no migration needed\n", dbName, targetVersion)
-		return nil
-	}
-
-	if currentVersion > targetVersion {
-		return fmt.Errorf("cannot downgrade database from version %d to %d", currentVersion, targetVersion)
-	}
-
-	// Create a temporary DatabaseManager with just this database
-	dbManager := NewDatabaseManager()
-	dbManager.Databases[dbName] = db
-
-	// Apply migrations iteratively from currentVersion to targetVersion
-	for version := currentVersion; version < targetVersion; version++ {
-		fmt.Printf("Applying migration from version %d to %d...\n", version, version+1)
-
-		migrationFunc, exists := GetMigration(version)
-		if !exists {
-			return fmt.Errorf("no migration found from version %d to %d", version, version+1)
+	for v := current; v < targetVersion; v++ {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-
-		if err := migrationFunc(dbManager, mm.storage); err != nil {
-			return fmt.Errorf("migration from version %d to %d failed: %w", version, version+1, err)
+		fn, ok := migrationFor(v)
+		if !ok {
+			return fmt.Errorf("migrating database %q: no migration registered from version %d to %d", dbName, v, v+1)
 		}
-
-		// Update version
-		db.SchemaVersion = version + 1
-
-		// Save database with new version
-		if err := mm.storage.SaveDatabase(db); err != nil {
-			return fmt.Errorf("failed to save database after migration to version %d: %w", version+1, err)
+		e.logger.Info("cachydb: migrating database", "database", dbName, "from", v, "to", v+1)
+		if err := fn(ctx, e, dbName); err != nil {
+			return fmt.Errorf("migrating database %q from version %d to %d: %w", dbName, v, v+1, err)
 		}
-
-		fmt.Printf("Successfully migrated to version %d\n", version+1)
+		if err := d.setSchemaVersion(v + 1); err != nil {
+			return fmt.Errorf("migrating database %q: %w", dbName, err)
+		}
 	}
-
-	fmt.Printf("Database '%s' successfully migrated to version %d\n", dbName, targetVersion)
 	return nil
 }
 
-// MigrateAllDatabases migrates all databases to the target version
-func (mm *MigrationManager) MigrateAllDatabases(targetVersion int) error {
-	fmt.Printf("Starting migration of all databases to version %d...\n", targetVersion)
-
-	// Load all databases
-	dbManager, err := mm.storage.LoadAllDatabases()
-	if err != nil {
-		return fmt.Errorf("failed to load databases: %w", err)
+// MigrateAll migrates every database to targetVersion. Databases dropped
+// while it runs are skipped.
+func (e *Engine) MigrateAll(ctx context.Context, targetVersion int) error {
+	if err := e.enter(); err != nil {
+		return err
 	}
-
-	migratedCount := 0
-	for dbName := range dbManager.Databases {
-		if err := mm.MigrateDatabase(dbName, targetVersion); err != nil {
-			return fmt.Errorf("failed to migrate database '%s': %w", dbName, err)
+	defer e.exit()
+	e.migrateMu.Lock()
+	defer e.migrateMu.Unlock()
+	for _, name := range e.ListDatabases() {
+		if err := e.migrateDatabase(ctx, name, targetVersion); err != nil {
+			if errors.Is(err, ErrNotFound) && e.lookupDatabase(name) == nil {
+				continue
+			}
+			return err
 		}
-		migratedCount++
 	}
-
-	fmt.Printf("Successfully migrated %d database(s) to version %d\n", migratedCount, targetVersion)
 	return nil
-}
-
-// GetDatabaseVersion returns the schema version of a database
-func (mm *MigrationManager) GetDatabaseVersion(dbName string) (int, error) {
-	db, err := mm.storage.LoadDatabase(dbName)
-	if err != nil {
-		return 0, fmt.Errorf("failed to load database: %w", err)
-	}
-
-	version := db.SchemaVersion
-	if version == 0 {
-		// Default to version 1 for databases without version info
-		version = 1
-	}
-
-	return version, nil
-}
-
-// ListMigrations returns a list of all registered migrations
-func (mm *MigrationManager) ListMigrations() []int {
-	globalRegistry.mu.RLock()
-	defer globalRegistry.mu.RUnlock()
-
-	versions := make([]int, 0, len(globalRegistry.migrations))
-	for version := range globalRegistry.migrations {
-		versions = append(versions, version)
-	}
-
-	return versions
 }

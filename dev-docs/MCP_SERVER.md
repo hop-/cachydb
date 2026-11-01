@@ -1,294 +1,181 @@
 # MCP Server Reference
 
-The MCP (Model Context Protocol) server is implemented in `internal/mcp/server.go` and exposes CachyDB operations as tools that AI assistants can call.
+The MCP (Model Context Protocol) server lives in `internal/mcp/server.go`
+and exposes CachyDB as tools for AI assistants. It uses the official Go SDK
+(`github.com/modelcontextprotocol/go-sdk` v1.2.0). Handlers only call
+methods of the `*db.Engine` they are given; durability is entirely the
+engine's job (see [STORAGE.md](STORAGE.md)). Overview:
+[PROJECT.md](PROJECT.md).
 
 ## Server Configuration
 
-| Parameter | Source | Default | Description |
-|-----------|--------|---------|-------------|
-| Transport | `TRANSPORT` env / `-t` flag | `stdio` | Transport type |
-| Port | `PORT` env / `-p` flag | `7601` | HTTP transport port |
-| Default DB | `DB_NAME` env | `main` | Initial database name |
-| Root Dir | `ROOT_DIR` env / `-R` flag | `~/.cachydb` | Data directory |
+| Setting | How to set it | Default |
+|---------|---------------|---------|
+| Transport | `-t` / `--transport` flag (`stdio` or `http`) | `stdio` |
+| HTTP port | `-p` / `--port` flag, or `PORT` env var | `7601` |
+| Data directory | `-R` / `--root` flag | `~/.cachydb` |
+| Default database | none that works (see [CLI.md](CLI.md#known-issues)) | `main` |
+
+The `TRANSPORT`, `ROOT_DIR`, and `DB_NAME` environment variables currently
+have no effect; see [CLI.md — Known issues](CLI.md#known-issues).
 
 ## Transports
 
 ### stdio (default)
 
-Communication via stdin/stdout. Used by local AI clients (e.g., Claude Desktop).
+One session over stdin/stdout. stdout carries only JSON-RPC; logs and
+messages go to stderr. The server stops when stdin closes.
 
 ```json
-// mcp-config.json
+{ "mcpServers": { "cachydb": { "command": "/path/to/cachydb", "args": ["-R", "/path/to/data"] } } }
+```
+
+Clients must keep stdin open until they have read their responses: if
+stdin hits EOF while requests are in flight, the SDK drops those responses
+and the process exits with status 1 (`server is closing: EOF`). The engine
+is still closed cleanly.
+
+### Streamable HTTP
+
+`cachydb -t http -p 7601` serves the MCP Streamable HTTP transport (spec
+2025-03-26+) at `http://<host>:7601/mcp`, listening on all interfaces.
+Multiple concurrent sessions are supported. Idle sessions are closed after
+**30 minutes** (`httpSessionTimeout`). There is no authentication or TLS.
+
+```json
+{ "mcpServers": { "cachydb": { "url": "http://localhost:7601/mcp" } } }
+```
+
+## Lifecycle
+
+1. `app.Builder.Build` opens the engine (`db.Open`: lock, recovery).
+2. `NewServer(ctx, engine, defaultDBName, transport, httpAddr)` creates the
+   default database if missing and registers the 12 tools.
+3. `Server.Start(ctx)` runs the transport until `ctx` is cancelled
+   (SIGINT/SIGTERM), stdin closes (stdio), or the transport fails.
+4. `App.Stop` (10s timeout) calls `Server.Close` (ends every session) and
+   then `Engine.Close` (final flush). For HTTP, cancellation first closes
+   the sessions and then shuts the HTTP server down with a 5s timeout.
+
+## Sessions and `use_database`
+
+The selected database is **per MCP session**. `ServerOptions.InitializedHandler`
+registers each session in `Server.sessions`; a goroutine waits on
+`ServerSession.Wait()` and forgets the session when it ends. Each handler
+resolves its database in this order:
+
+1. the tool's `database` argument, if given;
+2. the session's `use_database` choice;
+3. the server default (`main`).
+
+## Tools (12)
+
+All handlers are typed: `mcp.AddTool(server, &mcp.Tool{...}, handler)` with
+an input struct whose JSON schema the SDK generates from the struct tags,
+and a `map[string]interface{}` output. The SDK returns the output as
+structured content and as JSON text content. Every successful result has
+`"success": true`.
+
+| Tool | Arguments | Result fields |
+|------|-----------|---------------|
+| `create_database` | `name` | `message`. An existing name succeeds (no-op) |
+| `list_databases` | — | `databases` (sorted; `[]` when empty) |
+| `delete_database` | `name` | `message` |
+| `use_database` | `name` (must exist) | `message`, `current_database` |
+| `current_database` | — | `current_database` (session choice or default) |
+| `create_collection` | `name`, `database`?, `schema`? | `message` |
+| `list_collections` | `database`? | `collections` (sorted; `[]` when empty), `database` |
+| `insert_document` | `collection`, `document`, `database`? | `id`, `message` |
+| `find_documents` | `collection`, `query`?, `database`? | `count`, `documents` |
+| `update_document` | `collection`, `id`, `updates`, `database`? | `message` |
+| `delete_document` | `collection`, `id`, `database`? | `message` |
+| `create_index` | `collection`, `index_name`, `field_name`, `database`? | `message` |
+
+`?` = optional. There are no tools to drop a collection or an index; the
+engine supports both (`DropCollection`, `DropIndex`) but they are not
+exposed.
+
+### `create_collection` schema
+
+```json
 {
-  "mcpServers": {
-    "cachydb": {
-      "command": "cachydb"
+  "name": "users",
+  "schema": {
+    "fields": {
+      "name": { "type": "string", "required": true },
+      "age":  { "type": "number" }
     }
   }
 }
 ```
 
-### HTTP (Streamable HTTP + SSE)
+Types: `string`, `number`, `boolean`, `object`, `array`, `date`. Omit
+`schema` for a schemaless collection. Names (databases, collections,
+indexes) must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.
 
-Network-accessible endpoint at `/mcp`. Supports multiple concurrent clients.
+### `insert_document`
 
-```bash
-cachydb -t http -p 7601
-# Listens on http://localhost:7601/mcp
-```
+`document` is the data object. A **string** `_id` in it becomes the
+document id; without one a UUID is generated. A non-string `_id` is
+rejected (schema validation error). Numbers are stored as JSON numbers:
+clients read `28` back as `28`, while Go library callers get `float64`.
+
+### `find_documents`
+
+Filters, limit, and skip are nested under `query`:
 
 ```json
-// mcp-config.json
 {
-  "mcpServers": {
-    "cachydb": {
-      "url": "http://localhost:7601/mcp"
-    }
+  "collection": "users",
+  "query": {
+    "filters": [
+      { "field": "age",    "operator": "gte", "value": 18 },
+      { "field": "status", "operator": "in",  "value": ["active", "trial"] }
+    ],
+    "limit": 10,
+    "skip": 0
   }
 }
 ```
 
-## Startup Sequence
-
-1. Create `StorageManager` with configured root directory
-2. Load all databases from disk (binary storage + WAL replay)
-3. Start background sync goroutine (5s interval)
-4. Ensure default database exists (create if missing, log to WAL)
-5. Create MCP `Server` with implementation info (`name: "cachydb"`, `version: "1.0.0"`)
-6. Register all 13 tools
-7. Start selected transport
-
-## Graceful Shutdown
-
-- HTTP transport: context cancellation triggers `httpServer.Shutdown()` with 5s timeout
-- stdio transport: context cancellation stops the transport loop
-- Background syncer performs a final sync before stopping
-
----
-
-## Registered Tools (13)
-
-### Database Management
-
-#### `create_database`
-
-Create a new database.
-
-**Parameters**:
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `name` | string | yes | Database name |
-
-**Behavior**: Creates database in memory → logs `create_database` to WAL.
-
----
-
-#### `list_databases`
-
-List all databases.
-
-**Parameters**: None
-
-**Returns**: JSON array of database names.
-
----
-
-#### `delete_database`
-
-Delete a database and all its collections.
-
-**Parameters**:
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `name` | string | yes | Database name |
-
-**Behavior**: Removes from memory → logs `delete_database` to WAL → marks dirty.
-
----
-
-#### `use_database`
-
-Switch the default database for subsequent operations.
-
-**Parameters**:
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `name` | string | yes | Database name to switch to |
-
-**Behavior**: Updates server's `defaultDBName`. Does not persist (session-level only).
-
----
-
-#### `current_database`
-
-Get the name of the current default database.
-
-**Parameters**: None
-
-**Returns**: Current default database name.
-
----
-
-### Collection Management
-
-#### `create_collection`
-
-Create a new collection, optionally with a schema.
-
-**Parameters**:
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `name` | string | yes | Collection name |
-| `database` | string | no | Target database (uses default if omitted) |
-| `schema` | object | no | Schema definition with field types and required flags |
-
-**Schema format**:
-```json
-{
-  "fields": {
-    "fieldName": { "type": "string", "required": true },
-    "age": { "type": "number", "required": false }
-  }
-}
-```
-
-**Valid types**: `string`, `number`, `boolean`, `object`, `array`, `date`
-
----
-
-#### `list_collections`
-
-List all collections in a database.
-
-**Parameters**:
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `database` | string | no | Target database (uses default if omitted) |
-
----
-
-### Document Operations
-
-#### `insert_document`
-
-Insert a document into a collection.
-
-**Parameters**:
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `collection` | string | yes | Collection name |
-| `document` | object | yes | Document data (key-value pairs) |
-| `database` | string | no | Target database |
-
-**Behavior**:
-1. If `_id` not provided, generates UUID
-2. Validates against collection schema (if defined)
-3. Inserts into in-memory documents map
-4. Updates all indexes
-5. Logs `insert` to WAL (sync)
-6. Marks collection dirty
-
-**Returns**: The inserted document with its `_id`.
-
----
-
-#### `find_documents`
-
-Query documents with filters.
-
-**Parameters**:
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `collection` | string | yes | Collection name |
-| `database` | string | no | Target database |
-| `filters` | array | no | Array of filter objects |
-| `limit` | number | no | Max documents to return |
-| `skip` | number | no | Documents to skip |
-
-**Filter format**:
-```json
-{
-  "filters": [
-    { "field": "status", "operator": "eq", "value": "active" },
-    { "field": "age", "operator": "gte", "value": 18 }
-  ]
-}
-```
-
-**Supported operators**: `eq`, `ne`, `gt`, `lt`, `gte`, `lte`, `in`
-
-**Index usage**: If the first filter uses `eq` and an index exists for that field, performs O(1) lookup instead of full scan.
-
----
-
-#### `update_document`
-
-Update a document by ID.
-
-**Parameters**:
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `collection` | string | yes | Collection name |
-| `id` | string | yes | Document `_id` |
-| `updates` | object | yes | Fields to update (merged into existing data) |
-| `database` | string | no | Target database |
-
-**Behavior**: Partial update — only specified fields are changed, others preserved. Schema validation runs on the updated document.
-
----
-
-#### `delete_document`
-
-Delete a document by ID.
-
-**Parameters**:
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `collection` | string | yes | Collection name |
-| `id` | string | yes | Document `_id` |
-| `database` | string | no | Target database |
-
----
-
-### Index Management
-
-#### `create_index`
-
-Create an index on a collection field.
-
-**Parameters**:
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `collection` | string | yes | Collection name |
-| `index_name` | string | yes | Name for the index |
-| `field_name` | string | yes | Field to index |
-| `database` | string | no | Target database |
-
-**Behavior**: Scans all existing documents to build the index, then persists it. Logs `create_index` to WAL.
-
----
-
-## Error Handling
-
-All tools return errors as MCP tool error responses. Common error patterns:
-- Database/collection not found
-- Document not found (for update/delete by ID)
-- Schema validation failure
-- Duplicate document ID
-- Duplicate index name
-
-## Write Consistency Model
-
-All write operations follow this pattern for durability:
-
-```
-1. Apply to in-memory state (with mutex lock)
-2. Log to WAL synchronously (fsync'd to disk)
-3. Mark dirty for background persistence
-4. Return success to caller
-```
-
-This means:
-- Writes are durable immediately (WAL)
-- Binary storage is eventually consistent (within 5s)
-- On crash, WAL replay restores all committed writes
+- Operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`. All filters must
+  match. Fields are top-level names or `_id` (no dot-notation).
+- Type-aware comparison: numbers compare numerically, strings lexically;
+  values of different types never match `eq/gt/gte/lt/lte`.
+- A document **missing the field matches no operator, including `ne`**
+  (unlike MongoDB's `$ne`).
+- Results are sorted by `_id`; `skip`/`limit` page deterministically.
+  An omitted or empty `query` returns every document.
+- Each document is returned as a flat object with `_id`.
+
+Full semantics: [DATABASE_ENGINE.md — Queries](DATABASE_ENGINE.md#queries).
+
+### `update_document`
+
+`updates` is merged into the document: top-level fields are replaced or
+added, others are kept. `_id` cannot be updated. The schema is validated on
+the merged result.
+
+### `create_index`
+
+Builds a multi-value index from the existing documents. Writes to the whole
+database wait while it builds. Only `eq` filters use indexes.
+
+## Errors
+
+Handler errors are returned to the client as tool errors (`isError: true`)
+whose text names the action and the cause (`toolError` in `server.go`):
+
+| Engine error | Message shape |
+|--------------|---------------|
+| `ErrNotFound`, `ErrExists`, `ErrInvalidName`, `ErrSchemaValidation` | `<action>: <engine message>` |
+| `ErrClosed` | `<action>: the database engine is shut down: …` |
+| `ErrWALFailed`, `ErrWALCorrupt` | `<action>: write-ahead log failure, restart the server: …` |
+| context cancelled / deadline | `<action>: request cancelled: …` |
+
+## Write consistency
+
+A tool call that returns success has its change fsynced to the WAL. It
+survives a crash (`kill -9`, power loss) and is visible to every session.
+Data segments are written by the background flusher; on restart, recovery
+replays any WAL records not yet in the segments.

@@ -2,156 +2,156 @@
 
 ## Purpose
 
-CachyDB is a lightweight document-based database with built-in Model Context Protocol (MCP) support. It stores JSON-like documents in collections within databases, supports schema validation, hash-based indexing, and exposes all functionality as MCP tools for AI assistant integration.
+CachyDB is a lightweight document database with a built-in Model Context
+Protocol (MCP) server. It stores JSON documents in collections inside
+databases, supports optional schema validation and multi-value secondary
+indexes, and exposes everything as MCP tools for AI assistants. It ships as
+one Go binary; `pkg/db` is also usable as an embedded Go library.
+
+Supported platforms: **Linux and macOS**. Windows compiles but is not
+supported (no data-directory lock, no directory fsync).
 
 ## Related docs
 
-- [DATABASE_ENGINE.md](DATABASE_ENGINE.md) — Storage, indexing, WAL, query engine
-- [MCP_SERVER.md](MCP_SERVER.md) — MCP tools, transports, write consistency
-- [CLI.md](CLI.md) — Commands, flags, configuration
-- [DEVELOPMENT.md](DEVELOPMENT.md) — Coding patterns, testing, known issues
+- [DATABASE_ENGINE.md](DATABASE_ENGINE.md) — `pkg/db` public API, documents, schemas, query and index semantics, migrations
+- [STORAGE.md](STORAGE.md) — on-disk layout and formats, WAL, data segments, flush, recovery, compaction, lock order
+- [MCP_SERVER.md](MCP_SERVER.md) — the 12 MCP tools, transports, sessions, errors
+- [CLI.md](CLI.md) — commands, flags, environment variables, known issues
+- [DEVELOPMENT.md](DEVELOPMENT.md) — coding patterns, testing, benchmarks, known limitations
 
 ## High-Level Architecture
 
 ```
-┌───────────────────────────────────────────────────────────┐
-│                       CLI (cobra)                          │
-│  cachydb [app | version | utils list | utils migrate]     │
-└──────────────────────────┬────────────────────────────────┘
-                           │
-┌──────────────────────────▼────────────────────────────────┐
-│                   Application Layer                        │
-│           internal/app (Builder pattern)                   │
-└──────────────────────────┬────────────────────────────────┘
-                           │
-┌──────────────────────────▼────────────────────────────────┐
-│                  MCP Server Layer                          │
-│          internal/mcp (13 registered tools)                │
-│          Transports: stdio | HTTP/SSE                      │
-└──────────────────────────┬────────────────────────────────┘
-                           │
-┌──────────────────────────▼────────────────────────────────┐
-│                  Database Engine (pkg/db)                  │
-│  ┌─────────┐  ┌──────────┐  ┌────────┐  ┌────────────┐  │
-│  │  Query  │  │  Schema  │  │ Index  │  │  Storage   │  │
-│  │ Engine  │  │Validation│  │ (Hash) │  │  Manager   │  │
-│  └─────────┘  └──────────┘  └────────┘  └─────┬──────┘  │
-│                                                │          │
-│                  ┌─────────────────────────────┼───┐      │
-│                  │           WAL               │   │      │
-│                  │   (Write-Ahead Log)         │   │      │
-│                  └─────────────────────────────┘   │      │
-│                                                    │      │
-│                  ┌─────────────────────────────────▼─┐    │
-│                  │      Binary Storage               │    │
-│                  │  (.data + .idx + compression)     │    │
-│                  └───────────────────────────────────┘    │
-└───────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ CLI (cobra)   internal/cmd                                   │
+│ cachydb [app] | version | utils list | utils migrate         │
+│ signal.NotifyContext → RunE → errors to stderr, exit 1       │
+└───────────────┬───────────────────────────────┬──────────────┘
+                │ server                        │ utils
+┌───────────────▼─────────────────┐             │
+│ internal/app (Builder, App)     │             │
+│ opens Engine, Start / Stop      │             │
+└───────────────┬─────────────────┘             │
+┌───────────────▼─────────────────┐             │
+│ internal/mcp (12 tools)         │             │
+│ stdio | Streamable HTTP (/mcp)  │             │
+│ per-session use_database        │             │
+└───────────────┬─────────────────┘             │
+┌───────────────▼───────────────────────────────▼──────────────┐
+│ pkg/db  Engine → Database → Collection                       │
+│  validate → docLock → WAL append+fsync (commit) → memtable   │
+│  ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌────────────────┐  │
+│  │ query /  │ │ schema    │ │ indexes  │ │ LRU cache      │  │
+│  │ compare  │ │ validation│ │ (multi)  │ │ (encoded docs) │  │
+│  └──────────┘ └───────────┘ └──────────┘ └────────────────┘  │
+│  background: flusher · compactor · WAL retention             │
+│  internal/wal       group-commit log, retention              │
+│  internal/segment   append-only zstd data segments, hints,   │
+│                     index snapshots                          │
+│  internal/fsutil    atomic writes, dir fsync, flock          │
+│  internal/cache     byte-bounded LRU                         │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ## Directory Structure
 
 ```
 cachydb/
-├── main.go                     # Entry point → cmd.Execute()
-├── go.mod                      # Module: github.com/hop-/cachydb
+├── main.go                  # → cmd.Execute()
+├── go.mod                   # github.com/hop-/cachydb, Go 1.25.5
 ├── internal/
-│   ├── app/
-│   │   ├── app.go             # App struct wrapping MCP server (Start/Stop)
-│   │   └── builder.go         # Fluent builder for App configuration
-│   ├── cmd/
-│   │   ├── root.go            # Root cobra command, config init
-│   │   ├── app.go             # `app` subcommand + shared flag setup
-│   │   ├── list.go            # `utils list` — list databases
-│   │   ├── migrate.go         # `utils migrate` — schema migrations
-│   │   ├── utils.go           # `utils` command group
-│   │   ├── variables.go       # Shared CLI variables
-│   │   └── version.go         # `version` command
-│   ├── config/
-│   │   ├── config.go          # Config struct + envconfig loading
-│   │   └── config_windows.go  # Windows-specific root dir name
-│   └── mcp/
-│       └── server.go          # MCP server: all tool registrations + handlers
-├── pkg/db/                     # Public database engine library
-│   ├── types.go               # Core types: Document, Collection, Database, etc.
-│   ├── schema.go              # Schema validation logic
-│   ├── index.go               # Hash index CRUD + disk persistence
-│   ├── query.go               # Query engine (Insert, Find, Update, Delete)
-│   ├── storage.go             # StorageManager + background sync
-│   ├── binary_storage.go      # Binary format reader/writer + offset index
-│   ├── wal.go                 # Write-Ahead Log (batched, checksummed)
-│   ├── compression.go         # gzip compress/decompress
-│   └── migration.go           # Schema version migration system
+│   ├── app/                 # Builder (options → Engine + MCP server), App Start/Stop
+│   ├── cmd/                 # cobra commands: root/app, version, utils list/migrate, flags
+│   ├── config/              # envconfig settings, ByteSize parser, Windows root dir name
+│   └── mcp/server.go        # MCP server, tool handlers, sessions, transports
+├── pkg/db/
+│   ├── engine.go            # Engine, Open/Close, database create/drop
+│   ├── database.go          # Database, collection create/drop
+│   ├── collection.go        # Collection state, CreateIndex/DropIndex
+│   ├── document.go          # write path, read path, Find
+│   ├── flush.go             # flusher, checkpoint markers, low-water mark
+│   ├── recovery.go          # load at Open, idempotent WAL replay
+│   ├── compact.go           # background compaction
+│   ├── compare.go index.go  # query comparison, multi-value index
+│   ├── types.go schema.go   # Document, Schema, Query; validation
+│   ├── meta.go format.go    # db.meta / coll.meta, cachydb.format
+│   ├── migration.go         # schema-version migrations
+│   ├── options.go errors.go names.go hooks.go
+│   ├── bench_test.go        # performance benchmarks
+│   └── internal/{wal,segment,fsutil,cache}/
 └── examples/
-    ├── basic/main.go          # Direct Go library usage
-    └── mcp-client/main.go     # Programmatic MCP client usage
+    ├── basic/main.go        # embed pkg/db as a library
+    └── mcp-client/main.go   # drive the binary over stdio MCP
 ```
 
 ## Design Principles
 
-1. **Layered architecture** — `pkg/db` is a standalone reusable library; `internal/mcp` wraps it as MCP tools; `internal/cmd` provides CLI orchestration.
-2. **Builder pattern** — `app.Builder` provides a fluent API for configuring the application before starting.
-3. **Write-ahead durability** — All mutations are logged to WAL synchronously before in-memory state is modified, ensuring crash recovery.
-4. **Background persistence** — A background goroutine lazily syncs dirty data to binary storage every 5 seconds, avoiding write amplification.
-5. **Thread safety** — `sync.RWMutex` protects all shared state (DatabaseManager, Database, Collection, Index).
-6. **Dual storage formats** — Binary (default, compressed) for production; JSON (legacy) for backward compatibility.
-7. **Checkpoint-based recovery** — WAL replay starts from the last checkpoint offset, avoiding full replay on restart.
+1. **Layered**: `pkg/db` is standalone and owns durability; `internal/mcp`
+   maps tools to engine calls; `internal/cmd`/`internal/app` handle the
+   process lifecycle.
+2. **The WAL is the commit point**: a change is fsynced to the WAL before it
+   is applied in memory or acknowledged. Writes are visible only once
+   durable.
+3. **Group commit**: concurrent writers share one fsync; no artificial delay.
+4. **Append-only data**: flushes append only changed documents plus a
+   checkpoint marker; the cost scales with the change, not the collection.
+5. **Last writer wins by WAL offset**: every record carries its WAL offset,
+   so loading and replay are order-independent and idempotent.
+6. **Bounded RAM**: only keys, indexes, memtables, and the LRU cache live in
+   memory; documents are read from disk.
+7. **Clean lifecycle**: exclusive data-directory lock, graceful shutdown
+   with a final flush, only MCP traffic on stdout (logs go to stderr via
+   `slog`).
 
 ## Data Flow
 
-### Write Path (e.g., Insert Document)
+### Write (e.g. `insert_document`)
 
 ```
-MCP Tool Handler
-  │
-  ├─1─► In-memory: Collection.Insert(doc)
-  │      - Schema validation
-  │      - Index update
-  │      - Documents map insertion
-  │
-  ├─2─► WAL: storage.LogInsert(db, coll, doc)
-  │      - Append to WAL batch → flush (sync for writes)
-  │      - CRC32 checksummed entry
-  │
-  └─3─► MarkDirty(db, collection)
-         - Background syncer picks this up every 5s
-         - Writes binary format + offset index
-         - Creates WAL checkpoint
+MCP handler → Collection.Insert(ctx, doc)
+  1. Database.mu (shared) → docLock(id) → read current version
+  2. build after-image, JSON round-trip, schema validation
+  3. WAL append; group commit fsync                 ← commit point
+  4. apply under Collection.mu: memtable, indexes, cache invalidation, count
+  5. return id
+background flusher (every 1s or memtable > 16 MiB):
+  memtable → active data segment + checkpoint marker, one fsync → keydir
 ```
 
-### Read Path (e.g., Find Documents)
+### Read (e.g. `find_documents`)
 
 ```
-MCP Tool Handler
-  │
-  └──► Collection.Find(query)
-       - Check index for eq filters (O(1) lookup)
-       - Full scan for non-indexed filters
-       - Apply remaining filters, skip, limit
-       - Return cloned documents
+Collection.Find(ctx, query)
+  candidates: smallest indexed-eq id set, else all live ids; sorted by _id
+  per id: memtable → flushing → LRU cache → keydir → ReadAt + zstd + JSON
+  filter, skip, stop at skip+limit; return deep copies
 ```
 
-### Startup / Recovery
+### Startup
 
 ```
-1. NewStorageManager(rootDir) → creates WAL manager
-2. storage.LoadAllDatabases()
-   - Reads binary storage files (.data + .idx)
-   - Falls back to JSON if binary not found
-   - Replays WAL entries after last checkpoint
-3. storage.StartBackgroundSync(dbManager)
-4. Ensure default database exists
-5. Create MCP server, register tools
-6. Start transport (stdio or HTTP)
+cmd.Execute → config.Init → cobra → runApp
+  app.Builder.Build → db.Open
+     lock cachydb.lock → check cachydb.format → open WAL (torn-tail fix)
+     → load meta, keydirs, indexes → replay WAL → start flusher,
+       compactor, retention
+  → mcp.NewServer (creates the default database "main" if missing)
+  → App.Start: run stdio or HTTP transport
 ```
 
-## Concurrency Model
+### Shutdown
 
-- **DatabaseManager.mu** — Guards the databases map (add/remove databases)
-- **Database.mu** — Guards the collections map within a database
-- **Collection.mu** — Guards documents and indexes within a collection
-- **Index.mu** — Guards index data map
-- **WALManager.batchMu** — Guards the write batch buffer
-- **StorageManager.dirtyMu** — Guards the dirty entries map
+```
+SIGINT/SIGTERM (or stdin EOF for stdio) → transport returns
+  → App.Stop (10s timeout): close MCP sessions → Engine.Close
+     (final flush, index snapshots, WAL close, lock release)
+```
 
-All read operations use `RLock()`, write operations use `Lock()`.
+## Compatibility
+
+- Data directories from the earlier storage format (JSON / `.data`+`.idx`
+  files, `wal.checkpoint`) are **not readable**. `Open` fails with
+  `ErrIncompatibleDataDir` and asks to move or delete the directory; there
+  is no converter.
+- The old Go API (`DatabaseManager`, `StorageManager`, `WALManager`,
+  `MigrationManager`) is gone; use `db.Open` and the `*Engine` methods.

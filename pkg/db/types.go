@@ -2,7 +2,7 @@ package db
 
 import (
 	"encoding/json"
-	"sync"
+	"reflect"
 	"time"
 )
 
@@ -34,37 +34,6 @@ type Field struct {
 // Schema represents a collection schema
 type Schema struct {
 	Fields map[string]Field `json:"fields"`
-}
-
-// Index represents an index on a collection
-type Index struct {
-	Name      string            `json:"name"`
-	FieldName string            `json:"field_name"`
-	Data      map[string]string `json:"-"` // maps field value to document ID
-	mu        sync.RWMutex
-}
-
-// Collection represents a collection of documents
-type Collection struct {
-	Name      string               `json:"name"`
-	Schema    *Schema              `json:"schema,omitempty"`
-	Documents map[string]*Document `json:"-"` // maps document ID to document
-	Indexes   map[string]*Index    `json:"indexes"`
-	mu        sync.RWMutex
-}
-
-// Database represents the database
-type Database struct {
-	Name          string                 `json:"name"`
-	SchemaVersion int                    `json:"schema_version"` // Schema version for migrations
-	Collections   map[string]*Collection `json:"collections"`
-	mu            sync.RWMutex
-}
-
-// DatabaseManager manages multiple databases
-type DatabaseManager struct {
-	Databases map[string]*Database `json:"databases"`
-	mu        sync.RWMutex
 }
 
 // QueryFilter represents a query filter
@@ -107,90 +76,6 @@ func (d *Document) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// NewIndex creates a new index
-func NewIndex(name, fieldName string) *Index {
-	return &Index{
-		Name:      name,
-		FieldName: fieldName,
-		Data:      make(map[string]string),
-	}
-}
-
-// NewCollection creates a new collection
-func NewCollection(name string, schema *Schema) *Collection {
-	coll := &Collection{
-		Name:      name,
-		Schema:    schema,
-		Documents: make(map[string]*Document),
-		Indexes:   make(map[string]*Index),
-	}
-
-	// Create automatic ID index
-	coll.Indexes["_id"] = NewIndex("_id", "_id")
-
-	return coll
-}
-
-// NewDatabase creates a new database
-func NewDatabase(name string) *Database {
-	return &Database{
-		Name:        name,
-		Collections: make(map[string]*Collection),
-	}
-}
-
-// NewDatabaseManager creates a new database manager
-func NewDatabaseManager() *DatabaseManager {
-	return &DatabaseManager{
-		Databases: make(map[string]*Database),
-	}
-}
-
-// GetDatabase gets a database by name, returns nil if not found
-func (dm *DatabaseManager) GetDatabase(name string) *Database {
-	dm.mu.RLock()
-	defer dm.mu.RUnlock()
-	return dm.Databases[name]
-}
-
-// CreateDatabase creates a new database or returns existing one
-func (dm *DatabaseManager) CreateDatabase(name string) *Database {
-	dm.mu.Lock()
-	defer dm.mu.Unlock()
-
-	if db, exists := dm.Databases[name]; exists {
-		return db
-	}
-
-	db := NewDatabase(name)
-	dm.Databases[name] = db
-	return db
-}
-
-// ListDatabases returns a list of all database names
-func (dm *DatabaseManager) ListDatabases() []string {
-	dm.mu.RLock()
-	defer dm.mu.RUnlock()
-
-	names := make([]string, 0, len(dm.Databases))
-	for name := range dm.Databases {
-		names = append(names, name)
-	}
-	return names
-}
-
-// DeleteDatabase removes a database
-func (dm *DatabaseManager) DeleteDatabase(name string) bool {
-	dm.mu.Lock()
-	defer dm.mu.Unlock()
-
-	if _, exists := dm.Databases[name]; exists {
-		delete(dm.Databases, name)
-		return true
-	}
-	return false
-}
-
 // GetValue safely extracts a value from a document by field name
 func (d *Document) GetValue(fieldName string) (any, bool) {
 	if fieldName == "_id" {
@@ -200,16 +85,95 @@ func (d *Document) GetValue(fieldName string) (any, bool) {
 	return val, ok
 }
 
-// Clone creates a deep copy of the document
+// Clone returns a deep copy of the document: nested maps, slices, and
+// arrays are copied recursively, so mutating the clone never changes the
+// original. Pointers, structs, and other values are copied shallowly.
+// Clone of a nil document is nil.
 func (d *Document) Clone() *Document {
+	if d == nil {
+		return nil
+	}
 	clone := &Document{
 		ID:   d.ID,
-		Data: make(map[string]any),
+		Data: make(map[string]any, len(d.Data)),
 	}
 	for k, v := range d.Data {
-		clone.Data[k] = v
+		clone.Data[k] = deepCopy(v)
 	}
 	return clone
+}
+
+// deepCopy returns a copy of v that shares no map, slice, or array storage
+// with it. The common JSON shapes take a fast path; other map, slice, and
+// array types are copied through reflection with their types preserved.
+func deepCopy(v any) any {
+	switch t := v.(type) {
+	case nil, string, bool, float64, json.Number:
+		return v
+	case map[string]any:
+		if t == nil {
+			return t
+		}
+		m := make(map[string]any, len(t))
+		for k, x := range t {
+			m[k] = deepCopy(x)
+		}
+		return m
+	case []any:
+		if t == nil {
+			return t
+		}
+		s := make([]any, len(t))
+		for i, x := range t {
+			s[i] = deepCopy(x)
+		}
+		return s
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Map, reflect.Slice, reflect.Array:
+		return deepCopyValue(rv).Interface()
+	}
+	return v
+}
+
+// deepCopyValue is deepCopy for reflect values.
+func deepCopyValue(rv reflect.Value) reflect.Value {
+	switch rv.Kind() {
+	case reflect.Interface:
+		if rv.IsNil() {
+			return rv
+		}
+		out := reflect.New(rv.Type()).Elem()
+		out.Set(deepCopyValue(rv.Elem()))
+		return out
+	case reflect.Map:
+		if rv.IsNil() {
+			return rv
+		}
+		out := reflect.MakeMapWithSize(rv.Type(), rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			out.SetMapIndex(iter.Key(), deepCopyValue(iter.Value()))
+		}
+		return out
+	case reflect.Slice:
+		if rv.IsNil() {
+			return rv
+		}
+		out := reflect.MakeSlice(rv.Type(), rv.Len(), rv.Len())
+		for i := range rv.Len() {
+			out.Index(i).Set(deepCopyValue(rv.Index(i)))
+		}
+		return out
+	case reflect.Array:
+		out := reflect.New(rv.Type()).Elem()
+		for i := range rv.Len() {
+			out.Index(i).Set(deepCopyValue(rv.Index(i)))
+		}
+		return out
+	}
+	return rv
 }
 
 // ValidateType checks if a value matches the expected field type

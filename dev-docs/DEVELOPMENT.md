@@ -1,31 +1,22 @@
 # Development Guide
 
-Guide for AI agents and developers working on CachyDB.
+Guide for AI agents and developers working on CachyDB. Overview:
+[PROJECT.md](PROJECT.md).
 
 ## Prerequisites
 
-- Go 1.25+ (see `go.mod` for exact version)
-- No external services required — CachyDB is fully self-contained
+- Go 1.25+ (`go.mod`: `go 1.25.5`)
+- Linux or macOS. Windows must still compile (`GOOS=windows go build ./...`)
+  but is not supported at runtime.
+- No external services.
 
 ## Quick Start
 
 ```bash
-cd cachydb
-
-# Build
-go build -o cachydb
-
-# Run (stdio transport — for MCP client integration)
-./cachydb
-
-# Run (HTTP transport — for development/testing)
-./cachydb -t http -p 7601
-
-# Run tests
-go test ./...
-
-# Run with custom data directory
-./cachydb -R /tmp/cachydb-dev
+go build -o cachydb                       # build
+./cachydb -R /tmp/cachydb-dev             # stdio transport, scratch data dir
+./cachydb -t http -p 7601 -R /tmp/cachydb-dev   # HTTP transport at /mcp
+go test -race ./...                       # all tests
 ```
 
 ## Project Layout & Ownership
@@ -33,136 +24,179 @@ go test ./...
 | Path | Purpose | When to modify |
 |------|---------|----------------|
 | `main.go` | Entry point | Almost never |
-| `internal/cmd/` | CLI commands & flags | Adding new commands or flags |
-| `internal/config/` | Configuration loading | Adding new config options |
-| `internal/app/` | App lifecycle (builder) | Changing startup/shutdown behavior |
-| `internal/mcp/server.go` | MCP tool definitions | Adding/modifying database operations exposed to AI |
-| `pkg/db/types.go` | Core data structures | Adding new fields to documents, collections, etc. |
-| `pkg/db/query.go` | CRUD operations | Modifying query behavior, adding operators |
-| `pkg/db/schema.go` | Schema validation | Adding new field types or validation rules |
-| `pkg/db/index.go` | Indexing system | Changing index behavior or adding index types |
-| `pkg/db/storage.go` | Persistence orchestration | Modifying sync behavior or storage format |
-| `pkg/db/binary_storage.go` | Binary format | Changing on-disk format (requires migration!) |
-| `pkg/db/wal.go` | Write-ahead log | Modifying durability guarantees |
-| `pkg/db/migration.go` | Schema migrations | Adding new migration versions |
-| `pkg/db/compression.go` | Data compression | Changing compression algorithm |
+| `internal/cmd/` | Commands, flags, lifecycle (`signal.NotifyContext`, `RunE`) | New commands or flags |
+| `internal/config/` | Env-var settings, `ByteSize` | New settings |
+| `internal/app/` | `Builder` → `db.Options`, `App.Start/Stop` | Startup/shutdown, new engine options |
+| `internal/mcp/server.go` | Tools, sessions, transports | Exposing engine operations to AI clients |
+| `pkg/db/engine.go`, `database.go`, `collection.go` | Public API, metadata operations | API changes |
+| `pkg/db/document.go` | Write path, read path, `Find` | Document operations, query execution |
+| `pkg/db/compare.go`, `index.go` | Comparison and index semantics | New operators, index behavior |
+| `pkg/db/types.go`, `schema.go` | Public types, schema validation | New field types |
+| `pkg/db/flush.go`, `recovery.go`, `compact.go` | Flush, recovery, compaction | Durability logic (read [STORAGE.md](STORAGE.md) first) |
+| `pkg/db/meta.go`, `format.go` | Meta files, format file, old-format detection | On-disk layout changes |
+| `pkg/db/migration.go` | Schema-version migrations | New migrations |
+| `pkg/db/options.go` | `Options` and defaults | Tuning |
+| `pkg/db/internal/wal/` | WAL format, group commit, retention | WAL changes |
+| `pkg/db/internal/segment/` | Data segments, hints, index snapshots | Data format changes |
+| `pkg/db/internal/fsutil/`, `cache/` | Atomic writes, dir fsync, flock; LRU | Rarely |
 
-## Key Patterns to Follow
+## Rules
 
-### Adding a New MCP Tool
+Follow the Go conventions used throughout the code:
 
-1. Add the tool registration in `internal/mcp/server.go` inside `registerTools()`
-2. Define input parameters using `mcp.NewTool()` with JSON schema
-3. Implement the handler function
-4. Follow the write pattern: **in-memory mutation → WAL log → mark dirty**
-5. Return results as JSON-serialized `mcp.TextContent`
+- `ctx context.Context` is the first parameter and is never stored in a
+  struct. Engine methods that write take a `ctx`.
+- Check every error and wrap it with context (`fmt.Errorf("…: %w", err)`).
+  Return the sentinels from `pkg/db/errors.go` (wrapped) so callers can use
+  `errors.Is`.
+- No panics in library code.
+- Every goroutine has an exit path and is joined on `Close` (engine
+  background work uses `Engine.spawn` / `bgCtx`).
+- **Nothing in `pkg/db` writes to stdout.** Log through `Options.Logger`
+  (`slog`). In stdio mode stdout is the MCP channel; the binary logs to
+  stderr.
+- Never hold `Collection.mu` across file I/O. Respect the lock order in
+  [STORAGE.md](STORAGE.md#concurrency-and-lock-order).
+- Format with `gofmt`; lint with `go vet` (there is no golangci-lint
+  config).
 
-### Adding a New Query Operator
+## Key Patterns
 
-1. Add the operator string constant (e.g., `"regex"`)
-2. Implement comparison logic in `matchFilter()` in `pkg/db/query.go`
-3. Consider whether it can leverage indexes
+### Adding an MCP tool
 
-### Adding a New Field Type
+1. Define an input struct in `internal/mcp/server.go` with `json` and
+   `jsonschema` tags (the SDK generates the input schema from it).
+2. Write a typed handler
+   `func (s *Server) xTool(ctx, req *mcp.CallToolRequest, in XInput) (*mcp.CallToolResult, map[string]interface{}, error)`
+   that calls engine methods only. Resolve the database with
+   `s.databaseName(req.Session, in.Database)` or `s.getCollection(...)`.
+3. Return errors through `toolError(action, err)`; return
+   `map[string]interface{}{"success": true, ...}` on success; use
+   `nonNil` for lists so empty results are `[]`.
+4. Register it in `registerTools` with `mcp.AddTool(server, &mcp.Tool{Name, Description}, s.xTool)`.
+5. Update `TestListToolsUnchanged` in `internal/mcp/server_test.go`, the
+   docs, and the README.
 
-1. Add the constant in `pkg/db/types.go` (e.g., `TypeUUID FieldType = "uuid"`)
-2. Add type validation in `ValidateType()` in `pkg/db/schema.go`
-3. Update documentation
+### Adding a query operator
 
-### Modifying Binary Storage Format
+1. Add a case to `matchesFilter` in `pkg/db/compare.go`, using `compare` /
+   `valuesEqual` for type-aware semantics.
+2. Only `eq` uses indexes (`candidates` in `document.go`); decide whether
+   the new operator can.
+3. Add cases to `compare_test.go` / `document_test.go`.
 
-**Warning**: Changes to binary format require incrementing `BinaryFormatVersion` and implementing backward-compatible reading of older formats.
+### Adding a field type
 
-1. Increment `BinaryFormatVersion` in `pkg/db/binary_storage.go`
-2. Update write logic for new format
-3. Keep read logic that handles both old and new versions
-4. Add a schema migration if needed
+1. Add the `FieldType` constant in `pkg/db/types.go` and a case in
+   `ValidateType`; add it to `Schema.Validate` in `schema.go`.
+2. Remember validation sees the document after a JSON round-trip (numbers
+   are `float64`, arrays `[]any`, objects `map[string]any`).
 
-### Adding a New CLI Command
+### Changing an on-disk format
 
-1. Create a new file in `internal/cmd/` (e.g., `export.go`)
-2. Define the cobra command with `Use`, `Short`, `Run`
-3. Register it with `rootCmd.AddCommand()` or a parent command in `init()`
-4. Add flags as needed
+The WAL, data segment, hint, and snapshot headers carry a version; the data
+directory has `cachydb.format` (`FormatVersion` in `pkg/db/format.go`).
+Bump the relevant version and decide how old files are handled: old data
+directories currently fail fast with `ErrIncompatibleDataDir` rather than
+being converted. Never change the numeric values of WAL ops or record
+types.
 
-## Error Handling Conventions
+### Adding a migration
 
-- Return `fmt.Errorf("context: %w", err)` for wrapped errors
-- MCP handlers return error text to the client (no panics)
-- Storage errors are logged but don't crash the server
-- WAL write failures are critical — operations should fail if WAL write fails
+Register it in an `init` with `db.RegisterMigration(from, fn)` and bump
+`CurrentSchemaVersion`. The function runs on an opened engine and must be
+idempotent (see [DATABASE_ENGINE.md](DATABASE_ENGINE.md#migrations)).
 
-## Thread Safety Rules
+### Adding a CLI command or setting
 
-1. Always acquire locks in this order to avoid deadlocks: `DatabaseManager → Database → Collection → Index`
-2. Use `RLock()` for read-only operations, `Lock()` for mutations
-3. Never hold a lock while performing I/O (release lock, do I/O, re-acquire if needed)
-4. The WAL batch mutex is independent of the data mutexes
+Add the command in `internal/cmd/` with `RunE` and register it in `init`.
+Utility commands open the engine through `withEngine`. A new engine setting
+needs a `Config` field with an `envconfig:"NAME"` tag (not `env:`, see
+[CLI.md — Known issues](CLI.md#known-issues)), a flag in `setEngineFlags`,
+and a `Builder` method that maps it into `db.Options`.
 
 ## Testing
 
-```bash
-# Run all tests
-go test ./...
-
-# Run with verbose output
-go test -v ./...
-
-# Run specific package tests
-go test ./pkg/db/...
-
-# Run with race detector
-go test -race ./...
-```
-
-See [TESTING.md](../TESTING.md) for detailed testing guidelines.
-
-## Common Development Tasks
-
-### Reset local data
+Tests use the stdlib `testing` package: table-driven with `t.Run`, data in
+`t.TempDir()`, no assertion libraries.
 
 ```bash
-rm -rf ~/.cachydb
+go test -race ./...                                          # everything
+go test -race ./pkg/db/...                                   # engine only
+go test -race -count=20 -run 'Crash|Recovery|Torn|Concurrent' ./pkg/db/...   # stress recovery
+test -z "$(gofmt -l .)" && go vet ./...
+GOOS=windows go build ./... && GOOS=darwin go build ./...    # cross-compile check
 ```
 
-### Inspect WAL files
+What exists:
 
-WAL files are in the root directory (`~/.cachydb/wal-*.log`). Each entry is:
-```
-[4 bytes: length][4 bytes: CRC32 checksum][JSON payload]
-```
+- `pkg/db/*_test.go`: regression tests for the investigated defects
+  (`TestRecoveryRegressionF2…`, `TestTornTailsRegressionF4`, …), the
+  crash-point matrix (`crash_test.go`, via the unexported test hook set in
+  `export_test.go`), flush, compaction, recovery, query/index semantics,
+  names, options, format detection.
+- `pkg/db/internal/{wal,segment,cache,fsutil}`: codec, torn-tail,
+  retention, sidecar, LRU, and lock tests.
+- `internal/mcp/server_test.go`: tool list, per-session `use_database`
+  (in-memory transports and HTTP), end-to-end tool flow, errors.
+- `internal/app`, `internal/cmd`, `internal/config`: builder options, lock
+  behavior, utils output, flags, `ByteSize` parsing.
 
-### Inspect binary storage
+### Benchmarks
 
-Collection data files are at `~/.cachydb/<db>/<collection>/collection.data` with the `CACH` magic header.
-
-### Debug with HTTP transport
+`pkg/db/bench_test.go` has `BenchmarkInsertParallel` (group commit),
+`BenchmarkFlushOneChange` (flush cost vs. collection size),
+`BenchmarkGet` (cached/uncached), and `BenchmarkFind` (indexed/scan):
 
 ```bash
-# Start in HTTP mode
-./cachydb -t http -p 7601
-
-# Test with curl (MCP protocol over HTTP)
-curl -X POST http://localhost:7601/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+TMPDIR=$HOME/.cache/cachydb-bench go test -run '^$' -bench . -benchmem ./pkg/db/...
 ```
+
+Run them on a real disk: if `$TMPDIR` is a tmpfs, fsync is free and the
+numbers say nothing about durability costs.
+
+### Manual and MCP testing
+
+See [TESTING.md](../TESTING.md) (MCP Inspector, the example client, stdio
+smoke tests, crash recovery).
+
+## Common Tasks
+
+- **Reset local data**: stop the server, then `rm -rf ~/.cachydb` (or the
+  `-R` directory).
+- **Inspect a data directory**: `cachydb utils list -c -R DIR` (fails while
+  a server holds the lock). The files are binary; their layouts are in
+  [STORAGE.md](STORAGE.md).
+- **Debug over HTTP**: `./cachydb -t http -p 7601 -R /tmp/cdb`, then point
+  the MCP Inspector or `examples/mcp-client` at it. Plain `curl` needs the
+  Streamable HTTP handshake (initialize, then the `Mcp-Session-Id` header).
 
 ## Dependencies
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| `github.com/spf13/cobra` | v1.9.1 | CLI framework |
-| `github.com/kelseyhightower/envconfig` | v1.4.0 | Environment variable config |
-| `github.com/google/uuid` | v1.6.0 | UUID generation for document IDs |
-| `github.com/modelcontextprotocol/go-sdk` | latest | MCP server/client SDK |
+| `github.com/modelcontextprotocol/go-sdk` | v1.2.0 | MCP server/client SDK |
+| `github.com/klauspost/compress` | v1.20.3 | zstd for data segments |
+| `github.com/spf13/cobra` | v1.10.2 | CLI framework |
+| `github.com/kelseyhightower/envconfig` | v1.4.0 | Env-var configuration |
+| `github.com/google/uuid` | v1.6.0 | Document ids |
 
-## Known Limitations & Areas for Improvement
+## Known Limitations
 
-1. **Index limitation**: Hash indexes map value→single docID. Multiple documents with the same indexed value only store the last one. Consider adding multi-value index support.
-2. **Query operators**: Only `eq` leverages indexes. Other operators always trigger full scans.
-3. **No transactions**: Operations are atomic at the single-document level but there's no multi-document transaction support.
-4. **Schema evolution**: Schemas are enforced on write but existing documents aren't retroactively validated when a schema changes.
-5. **Error handling TODOs**: Several `// TODO: handle error` comments in `internal/cmd/` indicate incomplete error handling.
-6. **No authentication**: The HTTP transport has no auth mechanism.
-7. **Single-node only**: No replication or clustering support.
+1. `ROOT_DIR`, `DB_NAME`, and `TRANSPORT` env vars have no effect; see
+   [CLI.md — Known issues](CLI.md#known-issues).
+2. `create_index` blocks writes to the whole database while it builds.
+3. Only `eq` uses indexes; range filters and unindexed fields scan every
+   document from disk/cache; the per-document cost is dominated by JSON
+   decoding, even on a cache hit.
+4. No multi-document transactions; no range, unique, or nested-field
+   indexes; no dot-notation in queries.
+5. Schemas cannot be changed after collection creation.
+6. No MCP tools for dropping collections or indexes (engine supports both).
+7. No authentication or TLS on the HTTP transport.
+8. Single node only; Windows unsupported (no data-dir lock).
+9. A single durable insert is fsync-bound (a few ms); throughput comes
+   from concurrent writers sharing fsyncs. There is no relaxed-durability
+   mode.
+10. stdio: closing stdin while requests are in flight drops their responses
+    and exits 1.
