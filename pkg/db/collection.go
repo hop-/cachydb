@@ -57,7 +57,13 @@ type Collection struct {
 	readers       map[uint32]*segment.Reader // open data segments, opened on first read
 	readersClosed bool                       // engine shutdown: no new readers
 	metaOffset    uint64                     // coll.meta wal_offset
-	dropped       bool
+	created       uint64                     // coll.meta created_offset (immutable; 0 = unknown)
+	// replayTombs holds, during recovery only, the WAL offsets of the
+	// tombstones in the data segments above the checkpoint whose id is not
+	// in the keydir, so replay does not re-apply deletes that are already
+	// durable. nil outside recovery.
+	replayTombs map[string]uint64
+	dropped     bool
 
 	// Flush bookkeeping (§5.4, §7.1), guarded by mu.
 	memBytes    int64  // sum of memtable entry sizes
@@ -86,7 +92,7 @@ type Collection struct {
 	count atomic.Int64 // live documents, kept in sync with keydir and memtable
 }
 
-func newCollection(d *Database, name string, s *Schema, metaOffset uint64) *Collection {
+func newCollection(d *Database, name string, s *Schema, created, metaOffset uint64) *Collection {
 	return &Collection{
 		db:         d,
 		name:       name,
@@ -98,6 +104,7 @@ func newCollection(d *Database, name string, s *Schema, metaOffset uint64) *Coll
 		readers:    make(map[uint32]*segment.Reader),
 		deadBytes:  make(map[uint32]int64),
 		metaOffset: metaOffset,
+		created:    created,
 	}
 }
 
@@ -292,9 +299,10 @@ func (c *Collection) DropIndex(ctx context.Context, name string) error {
 // and WAL offset. Callers hold Database.mu exclusively.
 func (c *Collection) writeMeta(defs map[string]indexDef, off uint64) error {
 	return writeCollMeta(c.dir, collMeta{
-		Name:      c.name,
-		Schema:    c.schema,
-		Indexes:   sortedIndexDefs(defs),
-		WALOffset: off,
+		Name:          c.name,
+		Schema:        c.schema,
+		Indexes:       sortedIndexDefs(defs),
+		WALOffset:     off,
+		CreatedOffset: c.created,
 	})
 }

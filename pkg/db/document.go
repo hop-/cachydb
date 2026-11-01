@@ -273,6 +273,15 @@ func (c *Collection) apply(id string, prev, next *Document, off, lb uint64, size
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.removeInflightLocked(lb)
+	c.applyLocked(id, prev != nil, prev, next, off, size)
+}
+
+// applyLocked is apply without the inflight bookkeeping, shared with WAL
+// replay. existed reports whether a live version of id existed before the
+// write; prev is that version when the caller has it (needed only to
+// update the indexes, so replay passes nil when the collection has none).
+// Callers hold mu exclusively.
+func (c *Collection) applyLocked(id string, existed bool, prev, next *Document, off uint64, size int64) {
 	me, ok := c.memtable[id]
 	if ok && me.walOffset >= off {
 		return // never happens under the doc lock; replay relies on the same rule
@@ -301,9 +310,9 @@ func (c *Collection) apply(id string, prev, next *Document, off, lb uint64, size
 	}
 	c.db.e.cache.Invalidate(c.cacheKey(id))
 	switch {
-	case prev == nil && next != nil:
+	case !existed && next != nil:
 		c.count.Add(1)
-	case prev != nil && next == nil:
+	case existed && next == nil:
 		c.count.Add(-1)
 	}
 }

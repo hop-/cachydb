@@ -38,11 +38,17 @@ type indexDef struct {
 }
 
 // collMeta is the JSON content of <root>/<db>/<coll>/coll.meta.
+// WALOffset is the offset of the record that last wrote the file (create
+// or an index change); CreatedOffset is the offset of the create_coll
+// record of this incarnation of the collection, which WAL replay uses to
+// skip records of an earlier, dropped collection with the same name
+// (§7.3). 0 means unknown.
 type collMeta struct {
-	Name      string     `json:"name"`
-	Schema    *Schema    `json:"schema"`
-	Indexes   []indexDef `json:"indexes"` // sorted by name; never null
-	WALOffset uint64     `json:"wal_offset"`
+	Name          string     `json:"name"`
+	Schema        *Schema    `json:"schema"`
+	Indexes       []indexDef `json:"indexes"` // sorted by name; never null
+	WALOffset     uint64     `json:"wal_offset"`
+	CreatedOffset uint64     `json:"created_offset"`
 }
 
 // WAL payloads for metadata records (§3.1).

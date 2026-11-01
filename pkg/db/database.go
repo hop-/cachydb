@@ -59,9 +59,10 @@ func (d *Database) errDropped() error {
 	return fmt.Errorf("database %q: %w", d.name, ErrNotFound)
 }
 
-// loadCollection loads one collection directory. It returns (nil, nil) for
+// loadCollection reads the coll.meta of one collection directory; its data
+// segments are loaded later by Collection.load. It returns (nil, nil) for
 // a directory without coll.meta (a create that did not reach its meta
-// write).
+// write; WAL replay recreates it if its record is still in the log).
 func (d *Database) loadCollection(name string) (*Collection, error) {
 	dir := collDir(d.e.root, d.name, name)
 	var m collMeta
@@ -75,15 +76,9 @@ func (d *Database) loadCollection(name string) (*Collection, error) {
 	if m.Name != name {
 		return nil, fmt.Errorf("%s: name %q does not match directory %q", filepath.Join(dir, collMetaFile), m.Name, name)
 	}
-	c := newCollection(d, name, m.Schema, m.WALOffset)
+	c := newCollection(d, name, m.Schema, m.CreatedOffset, m.WALOffset)
 	for _, def := range m.Indexes {
 		c.indexes[def.Name] = newIndex(def.Name, def.Field)
-	}
-	if err := c.load(); err != nil {
-		if cerr := c.closeFiles(); cerr != nil {
-			d.e.logger.Warn("cachydb: closing segments after failed load", "dir", dir, "err", cerr)
-		}
-		return nil, err
 	}
 	return c, nil
 }
@@ -129,12 +124,12 @@ func (d *Database) CreateCollection(ctx context.Context, name string, s *Schema)
 	if err := makeDir(dir); err != nil {
 		return fmt.Errorf("creating collection %q: %w", name, err)
 	}
-	if err := writeCollMeta(dir, collMeta{Name: name, Schema: s, WALOffset: off}); err != nil {
+	if err := writeCollMeta(dir, collMeta{Name: name, Schema: s, WALOffset: off, CreatedOffset: off}); err != nil {
 		return fmt.Errorf("creating collection %q: %w", name, err)
 	}
 	done()
 
-	d.collections[name] = newCollection(d, name, s, off)
+	d.collections[name] = newCollection(d, name, s, off, off)
 	return nil
 }
 

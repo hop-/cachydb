@@ -48,6 +48,9 @@ type Engine struct {
 	lwMu         sync.Mutex
 	metaInflight []uint64
 
+	// recov counts what recovery did at Open.
+	recov recoveryStats
+
 	// flushKick wakes the flusher when a memtable exceeds MemtableSize.
 	flushKick chan struct{}
 
@@ -73,8 +76,10 @@ type Engine struct {
 // the exclusive directory lock (ErrDataDirInUse if another process — or
 // another Engine in this process — holds it), checks the on-disk format
 // (ErrIncompatibleDataDir), removes leftovers of interrupted drops, opens
-// the WAL, loads database and collection metadata and the collections'
-// data segments, and starts the background flusher and WAL retention. A
+// the WAL, loads database and collection metadata, the collections' data
+// segments and indexes, replays the WAL idempotently (see recovery.go),
+// and starts the background flusher and WAL retention. A WAL that ends
+// before an offset the data references fails with ErrWALCorrupt. A
 // database whose schema version is newer than CurrentSchemaVersion fails
 // with ErrSchemaTooNew; an older one is logged.
 func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
@@ -143,14 +148,16 @@ func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 		databases: make(map[string]*Database),
 		flushKick: make(chan struct{}, 1),
 	}
-	if err := e.loadMetadata(ctx); err != nil {
+	if err := e.recover(ctx); err != nil {
 		e.closeCollectionFiles()
 		return nil, fmt.Errorf("opening %s: %w", root, err)
 	}
 	e.bgCtx, e.bgCancel = context.WithCancel(context.Background())
 	e.startFlusher()
-	// Retention gets the low-water mark before anything can run a
-	// retention pass: without it nothing counts as processed.
+	// Retention starts only after replay: before it, records that only
+	// replay can recover are not yet in any memtable, so the low-water
+	// mark would count them as processed. It gets the low-water mark
+	// before anything can run a retention pass.
 	e.wal.StartRetention(e.lowWater)
 	return e, nil
 }
@@ -167,9 +174,8 @@ func (e *Engine) closeCollectionFiles() {
 	}
 }
 
-// loadMetadata reads every <db>/db.meta and <db>/<coll>/coll.meta. The meta
-// files are the metadata state; WAL replay on top of them is added by the
-// recovery step of the engine.
+// loadMetadata reads every <db>/db.meta and <db>/<coll>/coll.meta into
+// e.databases. Data segments are loaded afterwards (loadCollections).
 func (e *Engine) loadMetadata(ctx context.Context) error {
 	entries, err := os.ReadDir(e.root)
 	if err != nil {
@@ -184,7 +190,7 @@ func (e *Engine) loadMetadata(ctx context.Context) error {
 		}
 		d, err := e.loadDatabase(ent.Name())
 		if err != nil {
-			return err // Open closes the collections loaded so far
+			return err
 		}
 		if d != nil {
 			e.databases[d.name] = d
@@ -193,8 +199,10 @@ func (e *Engine) loadMetadata(ctx context.Context) error {
 	return nil
 }
 
-// loadDatabase loads one database directory. It returns (nil, nil) for a
-// directory without db.meta (a create that did not reach its meta write).
+// loadDatabase reads the metadata of one database directory and of its
+// collections. It returns (nil, nil) for a directory without db.meta (a
+// create that did not reach its meta write; WAL replay recreates it if its
+// record is still in the log).
 func (e *Engine) loadDatabase(name string) (*Database, error) {
 	dir := dbDir(e.root, name)
 	var m dbMeta
@@ -230,11 +238,6 @@ func (e *Engine) loadDatabase(name string) (*Database, error) {
 		}
 		c, err := d.loadCollection(ent.Name())
 		if err != nil {
-			for _, loaded := range d.collections {
-				if cerr := loaded.closeFiles(); cerr != nil {
-					e.logger.Warn("cachydb: closing segments after failed open", "database", name, "collection", loaded.name, "err", cerr)
-				}
-			}
 			return nil, err
 		}
 		if c != nil {
