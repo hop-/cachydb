@@ -27,12 +27,15 @@ go test -race ./...                       # all tests
 | `internal/cmd/` | Commands, flags, lifecycle (`signal.NotifyContext`, `RunE`) | New commands or flags |
 | `internal/config/` | Env-var settings, `ByteSize` | New settings |
 | `internal/app/` | `Builder` → `db.Options`, `App.Start/Stop` | Startup/shutdown, new engine options |
-| `internal/mcp/server.go` | Tools, sessions, transports | Exposing engine operations to AI clients |
+| `internal/mcp/server.go` | Handlers, sessions, transports | Exposing engine operations to AI clients |
+| `internal/mcp/tools.go`, `docs.go` | Tool definitions (typed schemas, annotations, examples); instructions, docs resources, generated tools topic | New tools, tool descriptions |
+| `internal/docs/` | Embedded agent docs topics (`topics/*.md`) | Documentation an agent needs |
 | `pkg/db/engine.go`, `database.go`, `collection.go` | Public API, metadata operations | API changes |
 | `pkg/db/document.go` | Write path, read path, `Find` | Document operations, query execution |
 | `pkg/db/compare.go`, `index.go` | Comparison and index semantics | New operators, index behavior |
 | `pkg/db/types.go`, `schema.go` | Public types, schema validation | New field types |
 | `pkg/db/flush.go`, `recovery.go`, `compact.go` | Flush, recovery, compaction | Durability logic (read [STORAGE.md](STORAGE.md) first) |
+| `pkg/db/backpressure.go`, `metacp.go` | `MaxPendingBytes` write backpressure; `cachydb.metacp` metadata checkpoint | Durability logic |
 | `pkg/db/meta.go`, `format.go` | Meta files, format file, old-format detection | On-disk layout changes |
 | `pkg/db/migration.go` | Schema-version migrations | New migrations |
 | `pkg/db/options.go` | `Options` and defaults | Tuning |
@@ -64,18 +67,23 @@ Follow the Go conventions used throughout the code:
 
 ### Adding an MCP tool
 
-1. Define an input struct in `internal/mcp/server.go` with `json` and
-   `jsonschema` tags (the SDK generates the input schema from it).
-2. Write a typed handler
-   `func (s *Server) xTool(ctx, req *mcp.CallToolRequest, in XInput) (*mcp.CallToolResult, map[string]interface{}, error)`
+1. Define typed input and output structs in `internal/mcp/tools.go` with
+   `json` and `jsonschema` (description) tags. Use a named string type plus
+   an entry in `schemaOptions` for an enum.
+2. Write a typed handler in `server.go`:
+   `func (s *Server) xTool(ctx, req *mcp.CallToolRequest, in XInput) (*mcp.CallToolResult, XOutput, error)`
    that calls engine methods only. Resolve the database with
    `s.databaseName(req.Session, in.Database)` or `s.getCollection(...)`.
-3. Return errors through `toolError(action, err)`; return
-   `map[string]interface{}{"success": true, ...}` on success; use
-   `nonNil` for lists so empty results are `[]`.
-4. Register it in `registerTools` with `mcp.AddTool(server, &mcp.Tool{Name, Description}, s.xTool)`.
-5. Update `TestListToolsUnchanged` in `internal/mcp/server_test.go`, the
-   docs, and the README.
+3. Return errors through `toolError(action, err)`; return the output with
+   `Success: true`; use `nonNil` for lists so empty results are `[]` (the
+   output schema is validated).
+4. Add a `newSpec(...)` entry to `toolSpecs` with a 1–3 sentence
+   description, annotations (`readOnly(...)` or `writing(...)`), and an
+   example call. Registration, `ToolDefinitions()`, the `tools` docs topic,
+   and the MCP resources follow from it.
+5. Update `TestListToolsUnchanged`, the annotation table in
+   `selfdesc_test.go`, the example order in `TestToolExamplesAreValid`,
+   the docs topics that mention tools, and the README.
 
 ### Adding a query operator
 
@@ -110,10 +118,22 @@ idempotent (see [DATABASE_ENGINE.md](DATABASE_ENGINE.md#migrations)).
 ### Adding a CLI command or setting
 
 Add the command in `internal/cmd/` with `RunE` and register it in `init`.
-Utility commands open the engine through `withEngine`. A new engine setting
-needs a `Config` field with an `envconfig:"NAME"` tag (not `env:`, see
-[CLI.md — Known issues](CLI.md#known-issues)), a flag in `setEngineFlags`,
-and a `Builder` method that maps it into `db.Options`.
+Give it an `Example` (a test requires one on every command). Utility
+commands open the engine through `withEngine`. A new engine setting needs a
+`Config` field with an `envconfig:"NAME"` tag (`envconfig` ignores `env:`
+tags), a flag in `setEngineFlags` whose default is the configured value
+(flag > env > default) and whose usage names the env var, a `Builder`
+method that maps it into `db.Options`, and a row in
+`internal/docs/topics/config.md`.
+
+### Changing the agent docs
+
+Topics live in `internal/docs/topics/<name>.md` with front matter (`name`,
+`title`, `summary`); the order is `docs.Names`. Tests check that every
+topic parses and that every `cachydb docs <topic>` /
+`cachydb://docs/<topic>` reference (in topics, help text, and the server
+instructions) exists. Never hand-write tool reference content: the `tools`
+topic is generated from `toolSpecs`.
 
 ## Testing
 
@@ -123,9 +143,10 @@ Tests use the stdlib `testing` package: table-driven with `t.Run`, data in
 ```bash
 go test -race ./...                                          # everything
 go test -race ./pkg/db/...                                   # engine only
-go test -race -count=20 -run 'Crash|Recovery|Torn|Concurrent' ./pkg/db/...   # stress recovery
+go test -race -count=1000 -run 'Crash|Recovery|Torn|Concurrent' ./pkg/db/...   # stress recovery (slow)
 test -z "$(gofmt -l .)" && go vet ./...
-GOOS=windows go build ./... && GOOS=darwin go build ./...    # cross-compile check
+for os in linux darwin freebsd openbsd netbsd dragonfly solaris illumos windows; do GOOS=$os go build ./... || echo "FAIL $os"; done
+GOOS=aix GOARCH=ppc64 go build ./...                         # aix exists only on ppc64
 ```
 
 What exists:
@@ -133,14 +154,25 @@ What exists:
 - `pkg/db/*_test.go`: regression tests for the investigated defects
   (`TestRecoveryRegressionF2…`, `TestTornTailsRegressionF4`, …), the
   crash-point matrix (`crash_test.go`, via the unexported test hook set in
-  `export_test.go`), flush, compaction, recovery, query/index semantics,
-  names, options, format detection.
+  `export_test.go`; on failure the crash hook trace, the data-directory
+  listing, and a line diff of the state are logged), flush, compaction
+  (including small-segment merges), recovery, the metadata checkpoint
+  (`metacp_test.go`), backpressure and the parallel flusher
+  (`backpressure_test.go`), the decoded cache (clone safety), query/index
+  semantics, names, options, format detection.
 - `pkg/db/internal/{wal,segment,cache,fsutil}`: codec, torn-tail,
   retention, sidecar, LRU, and lock tests.
-- `internal/mcp/server_test.go`: tool list, per-session `use_database`
-  (in-memory transports and HTTP), end-to-end tool flow, errors.
+- `internal/mcp`: tool list, per-session `use_database` (in-memory
+  transports and HTTP), end-to-end tool flow, errors (`server_test.go`);
+  schema enums, annotations, output schemas, `ToolDefinitions` vs. the
+  registered tools and the tools topic, valid examples, instructions over
+  both handshakes, docs resources, helpful argument errors
+  (`selfdesc_test.go`); stdio EOF handling (`stdio_test.go`).
+- `internal/docs`: topic parsing, order, and cross-references.
 - `internal/app`, `internal/cmd`, `internal/config`: builder options, lock
-  behavior, utils output, flags, `ByteSize` parsing.
+  behavior, utils output, flags, env-var precedence (flag > env >
+  default), `docs` output (index, topics, `--all`, JSON, unknown topic),
+  `version --json`, help examples, `ByteSize` parsing.
 
 ### Benchmarks
 
@@ -175,7 +207,8 @@ smoke tests, crash recovery).
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| `github.com/modelcontextprotocol/go-sdk` | v1.2.0 | MCP server/client SDK |
+| `github.com/modelcontextprotocol/go-sdk` | v1.8.0 | MCP server/client SDK |
+| `github.com/google/jsonschema-go` | v0.4.3 | Tool input/output schemas (the SDK's schema package) |
 | `github.com/klauspost/compress` | v1.20.3 | zstd for data segments |
 | `github.com/spf13/cobra` | v1.10.2 | CLI framework |
 | `github.com/kelseyhightower/envconfig` | v1.4.0 | Env-var configuration |
@@ -183,20 +216,21 @@ smoke tests, crash recovery).
 
 ## Known Limitations
 
-1. `ROOT_DIR`, `DB_NAME`, and `TRANSPORT` env vars have no effect; see
-   [CLI.md — Known issues](CLI.md#known-issues).
+1. An idle collection pins the WAL replay start at its last checkpoint
+   (`cachydb.metacp` bounds only the metadata records).
 2. `create_index` blocks writes to the whole database while it builds.
 3. Only `eq` uses indexes; range filters and unindexed fields scan every
-   document from disk/cache; the per-document cost is dominated by JSON
-   decoding, even on a cache hit.
+   document (from the memtable, the decoded-document cache, or disk).
 4. No multi-document transactions; no range, unique, or nested-field
    indexes; no dot-notation in queries.
 5. Schemas cannot be changed after collection creation.
 6. No MCP tools for dropping collections or indexes (engine supports both).
 7. No authentication or TLS on the HTTP transport.
-8. Single node only; Windows unsupported (no data-dir lock).
+8. Single node only. The data-directory lock needs `flock` (Linux, macOS,
+   the BSDs); elsewhere (Windows, Solaris, illumos, AIX) it is a no-op with
+   a logged warning, and Windows is unsupported at runtime.
 9. A single durable insert is fsync-bound (a few ms); throughput comes
    from concurrent writers sharing fsyncs. There is no relaxed-durability
    mode.
-10. stdio: closing stdin while requests are in flight drops their responses
-    and exits 1.
+10. stdio: closing stdin exits 0, but the SDK drops the responses of
+    requests still in flight.

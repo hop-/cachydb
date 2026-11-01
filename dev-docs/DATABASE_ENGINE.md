@@ -23,7 +23,8 @@ It is idempotent. Calls after `Close` return `ErrClosed`.
 ### Options (`pkg/db/options.go`)
 
 Zero-valued fields take the defaults. For `WALRetentionAge`,
-`WALRetentionSize`, and `CacheSize` a **negative** value means "disabled".
+`WALRetentionSize`, `CacheSize`, and `MaxPendingBytes` a **negative** value
+means "disabled".
 
 | Field | Default | Meaning |
 |-------|---------|---------|
@@ -35,11 +36,19 @@ Zero-valued fields take the defaults. For `WALRetentionAge`,
 | `DataSegmentSize` | 64 MiB | Data segment roll-over size; also the compaction output cap |
 | `FlushInterval` | 1s | Flush and compaction tick |
 | `MemtableSize` | 16 MiB | Per-collection memtable size that triggers an early flush |
-| `CacheSize` | 64 MiB | LRU document cache; negative = cache disabled |
+| `CacheSize` | 64 MiB | LRU cache of decoded documents (charged twice their encoded size); negative = cache disabled |
 | `CompactionRatio` | 0.5 | Dead/total bytes of sealed segments that triggers compaction; must be in (0,1] |
+| `MaxPendingBytes` | `4 × MemtableSize × max(1, GOMAXPROCS/2)`, max 1 GiB | Write backpressure: document writes wait (honoring `ctx`) while the unflushed bytes of all collections are at or above it; negative = no limit |
+| `FlushWorkers` | `min(GOMAXPROCS, 4)` | Collections flushed in parallel by one flush pass; must be >= 0 |
 
 The defaults were kept after the benchmarks in `pkg/db/bench_test.go`; the
 reasoning is in the comment above the constants in `options.go`.
+
+A document write (`Insert`, `Update`, `Delete`) can block on
+`MaxPendingBytes` when the disk is slower than the writers. It returns
+`ctx.Err()` if its context ends first (nothing is written) and `ErrClosed`
+if the engine closes. `FormatVersion` and `WALFormatVersion` are the
+on-disk format versions this build reads and writes.
 
 ## API
 

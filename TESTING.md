@@ -65,9 +65,9 @@ this one fail with "data directory is in use by another cachydb process".
    }
    ```
 
-   Use the `-R` flag for the data directory; the `ROOT_DIR` and `DB_NAME`
-   environment variables currently have no effect (see
-   [`dev-docs/CLI.md`](dev-docs/CLI.md#known-issues)).
+   `-R` sets the data directory (or `"env": {"ROOT_DIR": "..."}`), `-d`
+   the default database. `cachydb docs mcp` has config examples for
+   Claude Code, Claude Desktop, Cursor, and VS Code.
 
 2. Restart Claude Desktop
 3. You should see CachyDB tools available in the tool panel
@@ -94,8 +94,8 @@ The server reads JSON-RPC lines on stdin and writes only JSON-RPC to stdout
 (logs go to stderr). Two things matter when piping requests:
 
 - **Keep stdin open** until the responses arrive. If stdin closes while
-  requests are still in flight, the MCP SDK drops their responses and the
-  process exits with status 1. Append a `sleep`.
+  requests are still in flight, the MCP SDK drops their responses (the
+  process still exits 0). Append a `sleep`.
 - **Requests run concurrently.** Responses can arrive out of order, and a
   request does not wait for the previous one, so a `find_documents` piped
   right after an `insert_document` may not see the new document. Send
@@ -124,7 +124,20 @@ More requests to try (send each after the previous response):
 ```
 
 `use_database` applies to the current session only; a new process (or HTTP
-session) starts on `main` again.
+session) starts on the default database (`main`, or `-d`) again.
+
+Self-description to check:
+
+```JSON
+{"jsonrpc":"2.0","id":11,"method":"resources/list","params":{}}
+{"jsonrpc":"2.0","id":12,"method":"resources/read","params":{"uri":"cachydb://docs/query"}}
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"find_documents","arguments":{"collection":"events","query":{"filters":[{"field":"n","operator":"like","value":1}]}}}}
+```
+
+The `initialize` result carries `instructions`, and `tools/list` shows
+typed input/output schemas with annotations; the last call fails with a
+`validating "arguments"` error listing the valid operators. Without an MCP
+client, `cachydb docs tools --format json` prints the same tool schemas.
 
 ## Durability Smoke Tests
 

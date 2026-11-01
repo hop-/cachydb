@@ -27,6 +27,7 @@ bounded cache live in RAM.
 <root>/                               # Options.Dir (CLI: -R, default ~/.cachydb)
 ├── cachydb.lock                      # exclusive flock target (data-dir lock)
 ├── cachydb.format                    # {"format":"cachydb","version":2}
+├── cachydb.metacp                    # {"offset":N}: metadata checkpoint (see Recovery)
 ├── wal-00000000000000000001.log      # WAL segments, named by first offset (20 digits)
 ├── wal-00000000000004213377.log
 ├── .deleted-<offset>/                # transient: dropped database awaiting removal
@@ -45,6 +46,7 @@ bounded cache live in RAM.
   (`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`, `pkg/db/names.go`), so names never
   collide with engine files and never escape the root.
 - File names: `pkg/db/engine.go` (`cachydb.lock`), `pkg/db/format.go`,
+  `pkg/db/metacp.go`,
   `pkg/db/meta.go`, `pkg/db/internal/wal/segment.go`,
   `pkg/db/internal/segment/{segment,hint,snapshot}.go`.
 
@@ -62,6 +64,15 @@ file written atomically.
 
 All metadata writes use `fsutil.WriteFileAtomic` (temp file → fsync →
 rename → fsync directory).
+
+Platform notes (`pkg/db/internal/fsutil`): the data-directory lock is a
+non-blocking `flock` on linux, darwin, freebsd, openbsd, netbsd, and
+dragonfly (`lock_flock.go`). Every other platform (Windows, Solaris,
+illumos, AIX, …) gets a no-op lock (`lock_other.go`) whose `Supported()`
+is false, and `Open` logs *"data-dir locking unsupported on <GOOS>"*.
+`SyncDir` treats `EINVAL` and `ENOTSUP` from a directory fsync as success
+(some network and FUSE file systems reject it); on non-unix platforms it is
+a no-op.
 
 | File | JSON fields |
 |------|-------------|
@@ -173,13 +184,19 @@ u32 raw_len · u8 codec · body
 | `count` | live document count, O(1) |
 
 The LRU document cache (`pkg/db/internal/cache`) is one per engine, bounded
-by `CacheSize` bytes (64 MiB, can be disabled). It stores encoded JSON keyed by
-`(db, coll, id)` and tagged with the WAL offset, so a stale entry never
-matches a newer version.
+by `CacheSize` bytes (64 MiB, can be disabled). It stores immutable
+**decoded** documents (`cachedDoc`, charged twice their encoded length)
+keyed by `(db, coll, id)` and tagged with the WAL offset, so a stale entry
+never matches a newer version. The cached pointer is never handed out:
+`Get` returns a deep clone, and `Find` clones only the documents it
+returns. A cached `Get` is ~8.5× faster than an uncached one
+(`BenchmarkGet`).
 
 ## Write path (`pkg/db/document.go`)
 
 ```
+0. backpressure: while the engine's unflushed bytes >= MaxPendingBytes,
+   wait (no lock held; ctx-aware; ErrClosed on Close) and kick the flusher
 1. Database.mu (shared, held to the end; blocks drops/index changes)
 2. docLock(id): 256 striped mutexes, FNV-1a of the id
 3. read current version: memtable → flushing → cache → keydir + segment
@@ -201,7 +218,10 @@ background; `Open` removes leftovers.
 ## Flush, checkpoint markers, low-water mark (`pkg/db/flush.go`)
 
 Each collection is flushed every `FlushInterval` (1s), immediately when its
-memtable exceeds `MemtableSize` (16 MiB), and on `Close`:
+memtable exceeds `MemtableSize` (16 MiB), and on `Close`. One flush pass
+(`flushAll`) flushes the eligible collections in parallel through a pool of
+`FlushWorkers` goroutines (default `min(GOMAXPROCS, 4)`); flushes of one
+collection are still serialized by its `flushMu`:
 
 1. Under `Collection.mu`: `flushing = memtable`, new memtable, compute the
    checkpoint `cp` (one below the smallest offset of this collection's
@@ -215,6 +235,17 @@ memtable exceeds `MemtableSize` (16 MiB), and on `Close`:
 A failed flush truncates the segment back, keeps `flushing` readable and the
 old checkpoint, and retries next tick. The cost of a flush depends on the
 number of changed documents, not the collection size.
+
+**Backpressure** (`pkg/db/backpressure.go`): the engine keeps an atomic
+count of the unflushed bytes of all collections (memtable plus flushing
+entry sizes). A document write waits before its WAL append while the count
+is at or above `MaxPendingBytes` (default `4 × MemtableSize ×
+max(1, GOMAXPROCS/2)`, capped at 1 GiB; negative = no limit), so memory
+stays bounded when the disk is slower than the writers. A waiting writer
+kicks the flusher, which then flushes every collection rather than only
+full memtables. Each completed flush and each drop releases its bytes and
+wakes the waiters; `Close` wakes them with `ErrClosed`. Metadata
+operations do not wait.
 
 The engine **low-water mark** is the smallest WAL offset not yet durable in
 a data segment or metadata file: min over every collection's memtable,
@@ -235,23 +266,38 @@ deleted by retention.
 4. Fail with `ErrWALCorrupt` if the data references an offset at or beyond
    the end of the WAL (WAL files are missing).
 5. Replay the WAL from the oldest offset any meta file or checkpoint may be
-   missing. Each record is applied only if its effect is missing: document
+   missing: `min(metacp+1, every collection's replay floor + 1)`, where the
+   floor is `max(checkpoint, created_offset, the database's wal_offset)`.
+   `cachydb.metacp` holds `{"offset": N}`: every metadata record at or
+   below N is reflected in the meta files. N is the metadata-only
+   low-water mark − 1, rewritten atomically (when it advances) after each
+   metadata operation, after recovery, and on `Close`. A missing,
+   unreadable, or implausible file (N at or past the end of the WAL) logs
+   a warning and falls back to one past the minimum meta-file
+   `wal_offset`. An idle collection still pins the start at its last
+   checkpoint. Each record is applied only if its effect is missing: document
    records iff their offset beats the current version's; create/drop
    records iff the meta file's `wal_offset` (and `created_offset`) is
    older. Replay never fails on "already exists" or "not found". Replayed
    changes land in memtables and are flushed normally.
-6. Start the flusher, compactor, and WAL retention.
+6. Write `cachydb.metacp`, then start the flusher, compactor, and WAL
+   retention.
 
 ## Compaction (`pkg/db/compact.go`)
 
 One goroutine checks every collection each `FlushInterval`. A collection
 is compacted when its candidate segments (sealed, excluding the active
 segment and the segment holding the newest checkpoint marker) number at
-least 2 and their dead bytes reach `CompactionRatio` (0.5) of their total.
+least 2 and their dead bytes reach `CompactionRatio` (0.5) of their total,
+or, failing that, when at least 4 adjacent candidates are each smaller than
+`DataSegmentSize/4` (merged even when fully live).
 
 - **Run selection** (`pickCompactionRun`): the contiguous run of candidates
   with the most dead bytes (the oldest on ties), capped at one segment
   (`DataSegmentSize`) of live data. It is not strictly the oldest run.
+  Small-segment merges (`pickSmallRun`) take the oldest run of ≥ 4 small
+  adjacent candidates, extended while the merged live bytes fit in
+  `DataSegmentSize`.
 - The active segment is sealed first, so every later flush goes to a newer
   segment than the output.
 - A put is copied iff the keydir still points at it. Tombstones are dropped
@@ -277,11 +323,13 @@ Engine.metaMu → Database.mu → compactMu → flushMu → Collection.mu
 | `docLocks[256]` | one document's read-modify-write; held across the WAL append |
 | `Collection.mu` | keydir, memtables, indexes, inflight; memory-only sections |
 | `flushMu`, `compactMu` | serialize flush / compaction per collection, and against drops |
+| `Engine.lwMu`, `metacpMu` | leaf locks: in-flight metadata offsets; `cachydb.metacp` rewrites |
 | WAL writer, flusher, compactor, retention, drop removal | background goroutines; all exit on `Close` |
 
-`Close` waits for in-flight operations, stops the background goroutines,
-runs a final flush, writes index snapshots, closes segments and the WAL,
-and releases the lock. Public calls after `Close` return `ErrClosed`.
+`Close` wakes writers waiting on backpressure, waits for in-flight
+operations, stops the background goroutines, runs a final flush, writes
+index snapshots and `cachydb.metacp`, closes segments and the WAL, and
+releases the lock. Public calls after `Close` return `ErrClosed`.
 
 ## Crash-point test hooks
 

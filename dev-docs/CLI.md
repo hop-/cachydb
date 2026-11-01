@@ -32,11 +32,53 @@ The server takes the data-directory lock; a second server (or a `utils`
 command) on the same directory fails with *"data directory is in use by
 another cachydb process"*.
 
+Unknown transports fail at startup (`invalid transport "x": use stdio or
+http`).
+
+### `cachydb docs`
+
+Prints the built-in, agent-facing documentation (`internal/docs`). It never
+opens the engine, so it works while a server runs.
+
+```bash
+cachydb docs                         # topic index: name — summary
+cachydb docs <topic>                 # one topic (markdown)
+cachydb docs --all                   # every topic, in order
+cachydb docs <topic> --format json   # {"name","title","summary","content"}
+cachydb docs --format json           # index: [{"name","title","summary"}]
+```
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--all` | `-a` | `false` | Print every topic (with `--format json`: an array of topic objects) |
+| `--format` | `-f` | `md` | `md` or `json` |
+
+Topics, in order: `overview`, `quickstart`, `mcp`, `tools`, `query`,
+`schema`, `config`, `errors`. The `tools` topic is generated from
+`mcpserver.ToolDefinitions()`; in JSON it adds
+`"tools":[{"name","description","annotations","inputSchema","outputSchema","example"}]`.
+An unknown topic exits 1 with the topic list on stderr and nothing on
+stdout. The same topics are MCP resources `cachydb://docs/<topic>` (see
+[MCP_SERVER.md](MCP_SERVER.md#self-description)).
+
 ### `cachydb version`
 
 Prints `cachydb version <v>`. Resolution order: build-time `-ldflags`
 (`cmd.Version`), then the module version from `debug.ReadBuildInfo()`, then
-`v0.0.0-dev`.
+`v0.0.0-dev`. The MCP server reports the same version in its
+implementation info.
+
+`cachydb version --json` prints:
+
+```json
+{"version": "v0.0.3", "go": "go1.26.4", "storageFormat": 2, "walFormat": 1, "mcpProtocol": "2026-07-28"}
+```
+
+`storageFormat` is `db.FormatVersion` (`cachydb.format`), `walFormat` is
+`db.WALFormatVersion`, and `mcpProtocol` is the newest protocol version the
+MCP SDK supports (`mcp.SupportedProtocolVersions()[0]`).
+
+Every command's `--help` has an `Examples` section.
 
 ### `cachydb utils`
 
@@ -98,7 +140,8 @@ step. Downgrades fail. No migrations are registered in this build.
 ## Configuration
 
 Settings come from environment variables (`internal/config/config.go`,
-loaded with `envconfig`) and are overridden by flags. A malformed value
+loaded with `envconfig` using `envconfig:"NAME"` tags) and are overridden
+by flags: the flag defaults are the configured values. A malformed value
 (e.g. `WAL_RETENTION_AGE=soon`) aborts startup with exit status 1.
 
 | Environment variable | Default | Flag |
@@ -122,6 +165,7 @@ Precedence: flag > environment variable > default.
   if the result is a whole number of bytes (`1.5GiB`). Negative values are
   rejected.
 - **Durations**: Go syntax (`90m`, `24h`, `168h`).
+- **Empty values**: `DB_NAME=` or `TRANSPORT=` count as unset.
 - **Default root**: `$HOME/.cachydb` (`CachyDB` instead of `.cachydb` on
   Windows, which is unsupported). If the home directory cannot be found,
   `./.cachydb`.
@@ -142,9 +186,10 @@ main.go → cmd.Execute()
   rootCmd.ExecuteContext(ctx)
     runApp                              # root / app
       newBuilder() … Build(ctx)         # db.Open + mcp.NewServer
-      App.Start(ctx)                    # until signal / stdin EOF / error
+      App.Start(ctx)                    # until signal / stdin EOF (exit 0) / error
       App.Stop(WithoutCancel(ctx))      # 10s: sessions, Engine.Close
     runList / runMigrate                # utils: withEngine(Open … Close)
+    runDocs / version                   # print to stdout; never open the engine
   cobra.CheckErr(err)                   # print + exit 1
 ```
 
