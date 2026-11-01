@@ -1,4 +1,4 @@
-//go:build unix
+//go:build linux || darwin || freebsd || openbsd || netbsd || dragonfly
 
 package fsutil
 
@@ -61,5 +61,20 @@ func TestAcquireLockErrors(t *testing.T) {
 				t.Errorf("error = %v, must not be ErrLocked", err)
 			}
 		})
+	}
+}
+
+func TestAcquireLockSupported(t *testing.T) {
+	l, err := AcquireLock(filepath.Join(t.TempDir(), "cachydb.lock"))
+	if err != nil {
+		t.Fatalf("AcquireLock: %v", err)
+	}
+	defer func() {
+		if err := l.Release(); err != nil {
+			t.Errorf("Release: %v", err)
+		}
+	}()
+	if !l.Supported() {
+		t.Fatal("Supported() = false on a flock platform")
 	}
 }

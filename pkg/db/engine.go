@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
 
@@ -101,6 +102,10 @@ func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 			return nil, fmt.Errorf("opening %s: %w", root, ErrDataDirInUse)
 		}
 		return nil, fmt.Errorf("opening %s: %w", root, err)
+	}
+	if !lock.Supported() {
+		opts.Logger.Warn("cachydb: data-dir locking unsupported on "+runtime.GOOS+
+			"; do not open this directory from two processes at once", "dir", root)
 	}
 	defer func() {
 		if err != nil {
