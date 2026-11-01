@@ -128,9 +128,10 @@ Precedence: flag > environment variable > default.
 
 ## Known issues
 
-- **stdio exit status on early EOF**: if stdin closes while requests are
-  still in flight, the MCP SDK drops their responses and `cachydb` exits 1
-  (`server is closing: EOF`). Keep stdin open until the responses arrive.
+- **stdio responses in flight at EOF**: closing stdin ends the session
+  cleanly (exit status 0), but the MCP SDK (v1.8.0) cancels requests that
+  are still in flight and does not write their responses. Keep stdin open
+  until the responses arrive.
 
 ## Execution Flow
 

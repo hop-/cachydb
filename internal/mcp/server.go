@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hop-/cachydb/pkg/db"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -32,7 +33,8 @@ type Server struct {
 	defaultDBName string
 	transport     string
 	httpAddr      string
-	stderr        io.Writer // startup/shutdown messages; never stdout
+	stderr        io.Writer     // startup/shutdown messages; never stdout
+	stdio         mcp.Transport // the stdio transport; tests replace it
 
 	// sessions maps *mcp.ServerSession to *sessionState: the database the
 	// session selected with use_database.
@@ -78,6 +80,7 @@ func NewServer(ctx context.Context, engine *db.Engine, defaultDBName, transport,
 		transport:     transport,
 		httpAddr:      httpAddr,
 		stderr:        os.Stderr,
+		stdio:         &mcp.StdioTransport{},
 	}
 
 	s.server = mcp.NewServer(&mcp.Implementation{
@@ -88,8 +91,23 @@ func NewServer(ctx context.Context, engine *db.Engine, defaultDBName, transport,
 			s.trackSession(req.Session)
 		},
 	})
+	// Clients on protocol 2026-07-28 and later skip the initialize
+	// handshake (server/discover), so InitializedHandler never runs for
+	// them: also track the session on every request it sends.
+	s.server.AddReceivingMiddleware(s.trackSessionMiddleware)
 	s.registerTools(s.server)
 	return s, nil
+}
+
+// trackSessionMiddleware registers the session of every incoming request
+// (see trackSession) before handling it.
+func (s *Server) trackSessionMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		if ss, ok := req.GetSession().(*mcp.ServerSession); ok && ss != nil {
+			s.trackSession(ss)
+		}
+		return next(ctx, method, req)
+	}
 }
 
 // Start runs the configured transport until ctx is cancelled or, for
@@ -185,13 +203,38 @@ func (s *Server) sessionDatabase(ss *mcp.ServerSession) string {
 	return ""
 }
 
-// startStdio serves one session over stdin/stdout.
+// errServerClosing matches the SDK's internal "server is closing" JSON-RPC
+// error (code -32004); the SDK's WireError.Is compares codes.
+var errServerClosing = &jsonrpc.Error{Code: -32004}
+
+// isEndOfInput reports whether err only says that the client closed its
+// end of the stdio connection, which is a normal way for a session to end.
+func isEndOfInput(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, mcp.ErrConnectionClosed) ||
+		errors.Is(err, errServerClosing)
+}
+
+// startStdio serves one session over stdin/stdout. The session ends when
+// ctx is cancelled or the client closes stdin; both are a clean shutdown
+// and return nil, so the engine is closed and the process exits 0.
+//
+// When stdin closes while requests are still in flight, the SDK (v1.8.0)
+// cancels them and their responses are not written: a client must keep
+// stdin open until it has read the responses it needs.
 func (s *Server) startStdio(ctx context.Context) error {
-	err := s.server.Run(ctx, &mcp.StdioTransport{})
-	if err != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+	err := s.server.Run(ctx, s.stdio)
+	switch {
+	case err == nil:
 		return nil
+	case ctx.Err() != nil && errors.Is(err, ctx.Err()):
+		return nil
+	case isEndOfInput(err):
+		return nil
+	default:
+		return fmt.Errorf("stdio transport: %w", err)
 	}
-	return err
 }
 
 // httpHandler returns the Streamable HTTP handler serving s.server.
