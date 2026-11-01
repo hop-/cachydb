@@ -117,8 +117,32 @@ func captureModel(t *testing.T, e *Engine) model {
 func checkModel(t *testing.T, e *Engine, want model) {
 	t.Helper()
 	if got, w := captureModel(t, e).dump(), want.dump(); got != w {
-		t.Errorf("state mismatch\n--- got\n%s--- want\n%s", got, w)
+		t.Errorf("state mismatch\n--- got\n%s--- want\n%s--- differing lines\n%s", got, w, lineDiff(got, w))
 	}
+}
+
+// lineDiff lists the lines only in got ("+") or only in want ("-").
+func lineDiff(got, want string) string {
+	count := func(s string) map[string]int {
+		m := map[string]int{}
+		for _, l := range strings.Split(strings.TrimSuffix(s, "\n"), "\n") {
+			m[l]++
+		}
+		return m
+	}
+	g, w := count(got), count(want)
+	var b strings.Builder
+	for _, l := range slices.Sorted(maps.Keys(g)) {
+		for range g[l] - w[l] {
+			fmt.Fprintf(&b, "+ %s\n", l)
+		}
+	}
+	for _, l := range slices.Sorted(maps.Keys(w)) {
+		for range w[l] - g[l] {
+			fmt.Fprintf(&b, "- %s\n", l)
+		}
+	}
+	return b.String()
 }
 
 // chopTail removes n bytes from the end of path (a torn write).
@@ -263,7 +287,7 @@ func TestCrashMatrix(t *testing.T) {
 					want := buildCrashBase(t, opts)
 
 					armed := opts
-					crashAt(&armed, p)
+					crashAt(t, &armed, p)
 					e := openEngine(t, armed)
 					d := mustDB(t, e, "app")
 					c := mustColl(t, d, "c")
@@ -278,7 +302,8 @@ func TestCrashMatrix(t *testing.T) {
 					crashed := errors.Is(opErr, errSimulatedCrash) || errors.Is(flushErr, errSimulatedCrash)
 					wantCrash := p == hookAfterSegWrite || p == hookAfterSegSync || (p == hookMetaWrite) == op.meta
 					if crashed != wantCrash {
-						t.Fatalf("crashed = %v, want %v (op error %v, flush error %v)", crashed, wantCrash, opErr, flushErr)
+						t.Logf("expected state before the operation:\n%s", want.dump())
+						t.Fatalf("crashed = %v, want %v at hook %s (op error %v, flush error %v)", crashed, wantCrash, p, opErr, flushErr)
 					}
 					e.abandon()
 					if torn {

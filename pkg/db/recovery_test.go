@@ -54,7 +54,7 @@ func TestRecoveryRegressionF2SchemalessCreateColl(t *testing.T) {
 		e.abandon()
 
 		armed := opts
-		crashAt(&armed, hookMetaWrite)
+		crashAt(t, &armed, hookMetaWrite)
 		e = openEngine(t, armed)
 		if err := mustDB(t, e, "app").CreateCollection(ctx, "c", nil); !errors.Is(err, errSimulatedCrash) {
 			t.Fatalf("CreateCollection = %v, want a simulated crash", err)
@@ -106,7 +106,7 @@ func TestRecoveryRegressionF3UpdateReplay(t *testing.T) {
 	e.abandon()
 
 	armed := opts
-	crashAt(&armed, hookAfterWALSync)
+	crashAt(t, &armed, hookAfterWALSync)
 	e, c = openColl(t, armed)
 	if _, err := c.Update(ctx, "flushed", map[string]any{"v": 4}); !errors.Is(err, errSimulatedCrash) {
 		t.Fatalf("Update = %v, want a simulated crash", err)
@@ -254,7 +254,7 @@ func TestCrashRegressionF7SegSyncBeforeKeydir(t *testing.T) {
 			e.abandon()
 
 			armed := opts
-			crashAt(&armed, hookAfterSegSync)
+			crashAt(t, &armed, hookAfterSegSync)
 			e, c = openColl(t, armed)
 			if _, err := c.Update(ctx, "a", map[string]any{"v": 10}); err != nil {
 				t.Fatal(err)
@@ -553,7 +553,7 @@ func TestRecoveryMetadataReplay(t *testing.T) {
 			e.abandon()
 
 			armed := opts
-			crashAt(&armed, hookMetaWrite)
+			crashAt(t, &armed, hookMetaWrite)
 			e = openEngine(t, armed)
 			if err := tt.run(e); !errors.Is(err, errSimulatedCrash) {
 				t.Fatalf("got %v, want a simulated crash", err)

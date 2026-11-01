@@ -591,7 +591,7 @@ func TestCrashCompactBeforeSwap(t *testing.T) {
 				tt.mod(&opts)
 			}
 			armed := opts
-			crashAt(&armed, hookCompactBeforeSwap)
+			crashAt(t, &armed, hookCompactBeforeSwap)
 			e := openEngine(t, armed)
 			d := mustCreateDB(t, e, "app")
 			if err := d.CreateCollection(ctx, "c", nil); err != nil {
