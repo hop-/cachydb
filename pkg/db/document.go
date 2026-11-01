@@ -180,6 +180,10 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// Backpressure: wait, holding no lock, while too much is unflushed.
+	if err := e.waitPending(ctx); err != nil {
+		return nil, err
+	}
 
 	// Lock order (§11): Database.mu (R) → docLock → Collection.mu. The
 	// shared database lock blocks drops and index changes until the write
@@ -286,9 +290,12 @@ func (c *Collection) applyLocked(id string, existed bool, prev, next *Document, 
 	if ok && me.walOffset >= off {
 		return // never happens under the doc lock; replay relies on the same rule
 	}
+	delta := size
 	if ok {
 		c.memBytes -= me.size
+		delta -= me.size
 	}
+	c.db.e.pending.add(delta)
 	// memMin stays a lower bound of the memtable's offsets: an overwritten
 	// entry may leave it lower than the true minimum, which only makes the
 	// low-water mark more conservative.

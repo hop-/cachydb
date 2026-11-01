@@ -652,6 +652,7 @@ func (c *Collection) closeForReplayDrop() {
 	}
 	c.mu.Lock()
 	c.dropped = true
+	c.releasePendingLocked()
 	c.mu.Unlock()
 }
 

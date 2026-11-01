@@ -62,6 +62,7 @@ func (e *Engine) abandon() {
 		e.gateMu.Lock()
 		e.closed = true
 		e.gateMu.Unlock()
+		e.pending.broadcast()
 		e.ops.Wait()
 		e.bgCancel()
 		e.bg.Wait()

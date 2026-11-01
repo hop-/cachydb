@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"time"
 )
 
@@ -31,7 +32,27 @@ const (
 	defaultMemtableSize     int64         = 16 << 20 // 16 MiB per collection
 	defaultCacheSize        int64         = 64 << 20 // 64 MiB
 	defaultCompactionRatio  float64       = 0.5
+	// maxDefaultPendingBytes caps the computed MaxPendingBytes default.
+	maxDefaultPendingBytes int64 = 1 << 30 // 1 GiB
+	// maxDefaultFlushWorkers caps the computed FlushWorkers default.
+	maxDefaultFlushWorkers = 4
 )
+
+// defaultMaxPendingBytes is 4 × MemtableSize × max(1, GOMAXPROCS/2),
+// capped at 1 GiB: enough for several collections to fill a memtable each
+// while others flush, so steady writers never wait on a healthy disk.
+func defaultMaxPendingBytes(memtableSize int64) int64 {
+	n := 4 * memtableSize * int64(max(1, runtime.GOMAXPROCS(0)/2))
+	if n <= 0 || n > maxDefaultPendingBytes { // n <= 0: overflow
+		return maxDefaultPendingBytes
+	}
+	return n
+}
+
+// defaultFlushWorkers is min(GOMAXPROCS, 4).
+func defaultFlushWorkers() int {
+	return min(runtime.GOMAXPROCS(0), maxDefaultFlushWorkers)
+}
 
 // Options configures an Engine. Zero-valued fields take the defaults
 // above. For WALRetentionAge, WALRetentionSize, and CacheSize a negative
@@ -48,6 +69,15 @@ type Options struct {
 	MemtableSize     int64         // 16 MiB per collection
 	CacheSize        int64         // 64 MiB; negative = cache disabled
 	CompactionRatio  float64       // 0.5; must be in (0,1]
+	// MaxPendingBytes bounds the unflushed document bytes of all
+	// collections (memtables plus flushing tables): a document write waits
+	// before its WAL append, honoring its ctx, while the total is at or
+	// above it. Default 4 × MemtableSize × max(1, GOMAXPROCS/2), capped at
+	// 1 GiB; negative = no limit.
+	MaxPendingBytes int64
+	// FlushWorkers is how many collections the flusher flushes in
+	// parallel. Default min(GOMAXPROCS, 4).
+	FlushWorkers int
 
 	testHook func(hookPoint) error // unexported; set only from export_test.go (see #crash-hooks)
 	// testSegWriter, when set (tests only), wraps every active data
@@ -80,6 +110,17 @@ func (o Options) withDefaults() (Options, error) {
 
 	if o.CompactionRatio == 0 {
 		o.CompactionRatio = defaultCompactionRatio
+	}
+	if o.MaxPendingBytes == 0 && o.MemtableSize >= 0 {
+		o.MaxPendingBytes = defaultMaxPendingBytes(o.MemtableSize)
+	} else if o.MaxPendingBytes < 0 {
+		o.MaxPendingBytes = 0 // no limit
+	}
+	if o.FlushWorkers == 0 {
+		o.FlushWorkers = defaultFlushWorkers()
+	}
+	if o.FlushWorkers < 0 {
+		return o, fmt.Errorf("options: FlushWorkers must be >= 0, got %d", o.FlushWorkers)
 	}
 
 	for _, f := range []struct {

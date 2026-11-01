@@ -70,10 +70,11 @@ type Collection struct {
 	dropped     bool
 
 	// Flush bookkeeping (§5.4, §7.1), guarded by mu.
-	memBytes    int64  // sum of memtable entry sizes
-	memMin      uint64 // <= smallest walOffset in memtable (meaningful when non-empty)
-	flushingMin uint64 // <= smallest walOffset in flushing (meaningful when non-nil)
-	checkpoint  uint64 // value of the last checkpoint marker durable in the data segments
+	memBytes      int64  // sum of memtable entry sizes
+	flushingBytes int64  // sum of flushing entry sizes (counted in Engine.pending until the flush completes)
+	memMin        uint64 // <= smallest walOffset in memtable (meaningful when non-empty)
+	flushingMin   uint64 // <= smallest walOffset in flushing (meaningful when non-nil)
+	checkpoint    uint64 // value of the last checkpoint marker durable in the data segments
 	// deadBytes counts, per data segment, the bytes of records the keydir
 	// no longer references: superseded and deleted versions, tombstones,
 	// and checkpoint markers. Compaction (§9) uses it.
@@ -142,6 +143,7 @@ func (c *Collection) Name() string { return c.name }
 func (c *Collection) markDropped() {
 	c.mu.Lock()
 	c.dropped = true
+	c.releasePendingLocked()
 	readers := c.readers
 	c.readers = make(map[uint32]*segment.Reader)
 	c.mu.Unlock()

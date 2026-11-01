@@ -10,6 +10,7 @@ import (
 	"maps"
 	"os"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/hop-/cachydb/pkg/db/internal/segment"
@@ -206,10 +207,10 @@ func (e *Engine) startFlusher() {
 	}()
 }
 
-// flushLoop flushes every collection each FlushInterval and the
-// collections over MemtableSize when kicked. It exits when ctx is
-// cancelled (Close), or after a simulated crash (tests), as a dead process
-// would.
+// flushLoop flushes every collection each FlushInterval and, when kicked,
+// the collections over MemtableSize, or every collection while writers
+// wait on MaxPendingBytes. It exits when ctx is cancelled (Close), or after
+// a simulated crash (tests), as a dead process would.
 func (e *Engine) flushLoop(ctx context.Context) {
 	t := time.NewTicker(e.opts.FlushInterval)
 	defer t.Stop()
@@ -220,7 +221,7 @@ func (e *Engine) flushLoop(ctx context.Context) {
 			return
 		case <-t.C:
 		case <-e.flushKick:
-			onlyFull = true
+			onlyFull = !e.overLimit()
 		}
 		if err := e.flushAll(ctx, onlyFull); errors.Is(err, errSimulatedCrash) {
 			return
@@ -229,28 +230,66 @@ func (e *Engine) flushLoop(ctx context.Context) {
 }
 
 // flushAll flushes every collection (only those whose memtable exceeds
-// MemtableSize if onlyFull). Failures are logged and joined; the failed
-// collections keep their data in memory and are retried by the next pass.
-// It stops between collections when ctx ends, and at once after a
-// simulated crash.
+// MemtableSize if onlyFull), up to FlushWorkers at a time. Failures are
+// logged and joined; the failed collections keep their data in memory and
+// are retried by the next pass. It starts no new flush once ctx ends or a
+// flush hit a simulated crash, and returns after every started flush.
 func (e *Engine) flushAll(ctx context.Context, onlyFull bool) error {
-	var errs []error
+	var todo []*Collection
 	for _, c := range e.allCollections() {
-		if err := ctx.Err(); err != nil {
-			errs = append(errs, err)
-			break
-		}
 		if onlyFull && !c.memtableFull() {
 			continue
 		}
-		if err := c.flush(); err != nil {
+		todo = append(todo, c)
+	}
+
+	var (
+		mu      sync.Mutex
+		errs    []error
+		crashed bool
+		wg      sync.WaitGroup
+	)
+	stop := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return crashed
+	}
+	sem := make(chan struct{}, max(1, e.opts.FlushWorkers))
+	for _, c := range todo {
+		if err := ctx.Err(); err != nil {
+			mu.Lock()
+			errs = append(errs, err)
+			mu.Unlock()
+			break
+		}
+		sem <- struct{}{}
+		if stop() {
+			<-sem
+			break
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			err := c.flush()
+			if err == nil {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
 			if errors.Is(err, errSimulatedCrash) {
-				return err
+				crashed = true
+				errs = append(errs, err)
+				return
 			}
 			e.logger.Error("cachydb: flush failed; the changes stay in memory and the WAL and are retried",
 				"database", c.db.name, "collection", c.name, "err", err)
 			errs = append(errs, err)
-		}
+		}()
+	}
+	wg.Wait()
+	if crashed {
+		return errSimulatedCrash
 	}
 	return errors.Join(errs...)
 }
@@ -284,16 +323,26 @@ func (c *Collection) flush() error {
 	}
 	switch {
 	case c.flushing == nil:
-		c.flushing, c.flushingMin = c.memtable, c.memMin
+		c.flushing, c.flushingMin, c.flushingBytes = c.memtable, c.memMin, c.memBytes
 	case len(c.memtable) > 0:
 		// Retry after a failed flush: flushing ∪ memtable, newer wins.
 		merged := maps.Clone(c.flushing)
+		var replaced int64
 		for id, me := range c.memtable {
 			if old, ok := merged[id]; !ok || me.walOffset > old.walOffset {
+				if ok {
+					replaced += old.size
+				}
 				merged[id] = me
+			} else {
+				replaced += me.size // superseded by the flushing entry
 			}
 		}
 		c.flushing, c.flushingMin = merged, min(c.flushingMin, c.memMin)
+		c.flushingBytes += c.memBytes - replaced
+		if replaced != 0 {
+			e.pending.release(replaced)
+		}
 	}
 	c.memtable, c.memMin, c.memBytes = make(map[string]memEntry), 0, 0
 	cp := c.flushCheckpointLocked()
@@ -350,9 +399,11 @@ func (c *Collection) flush() error {
 	}
 	marker := locs[len(locs)-1]
 	c.deadBytes[marker.Seg] += int64(marker.Size)
-	c.flushing, c.flushingMin = nil, 0
+	flushed := c.flushingBytes
+	c.flushing, c.flushingMin, c.flushingBytes = nil, 0, 0
 	c.checkpoint = cp
 	c.mu.Unlock()
+	e.pending.release(flushed) // wakes writers waiting on MaxPendingBytes
 	c.markerSeg = marker.Seg
 
 	for i := range recs {

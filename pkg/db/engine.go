@@ -52,8 +52,13 @@ type Engine struct {
 	// recov counts what recovery did at Open.
 	recov recoveryStats
 
-	// flushKick wakes the flusher when a memtable exceeds MemtableSize.
+	// flushKick wakes the flusher when a memtable exceeds MemtableSize or
+	// writers wait on MaxPendingBytes.
 	flushKick chan struct{}
+
+	// pending counts the unflushed bytes of all collections for write
+	// backpressure (backpressure.go).
+	pending *pendingBytes
 
 	// Close gate: public operations enter() before touching state and
 	// exit() when done; Close sets closed and waits for them.
@@ -152,6 +157,7 @@ func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 		cache:     newDocCache(opts.CacheSize),
 		databases: make(map[string]*Database),
 		flushKick: make(chan struct{}, 1),
+		pending:   newPendingBytes(),
 	}
 	if err := e.recover(ctx); err != nil {
 		e.closeCollectionFiles()
@@ -272,6 +278,7 @@ func (e *Engine) close(ctx context.Context) error {
 	e.gateMu.Lock()
 	e.closed = true
 	e.gateMu.Unlock()
+	e.pending.broadcast() // writers waiting on MaxPendingBytes return ErrClosed
 	if err := waitCtx(ctx, &e.ops); err != nil {
 		errs = append(errs, fmt.Errorf("waiting for in-flight operations: %w", err))
 	}
