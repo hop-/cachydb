@@ -187,8 +187,11 @@ func (d *Database) DropCollection(ctx context.Context, name string) error {
 		return fmt.Errorf("dropping collection %q in database %q: %w", name, d.name, ErrNotFound)
 	}
 
-	// Wait for a running flush and keep the flusher away from the
-	// directory while it is renamed (lock order: Database.mu → flushMu).
+	// Wait for a running compaction and flush and keep both away from
+	// the directory while it is renamed (lock order: Database.mu →
+	// compactMu → flushMu).
+	c.compactMu.Lock()
+	defer c.compactMu.Unlock()
 	c.flushMu.Lock()
 	defer c.flushMu.Unlock()
 	off, done, err := e.appendMetaWAL(ctx, wal.Record{Op: wal.OpDropColl, DB: d.name, Coll: name})

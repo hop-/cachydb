@@ -166,6 +166,12 @@ func (c *Collection) load(ctx context.Context) (uint64, error) {
 	var maxOff uint64
 	newest := make(map[string]uint64) // highest WAL offset seen per id, puts and tombstones
 	total := make(map[uint32]int64)   // record bytes per segment
+	for _, seg := range segs {
+		total[seg] = 0
+	}
+	if len(segs) > 0 {
+		c.nextSeg = segs[len(segs)-1] + 1
+	}
 	visit := func(en segment.HintEntry) {
 		total[en.Loc.Seg] += int64(en.Loc.Size)
 		maxOff = max(maxOff, en.WALOffset)
@@ -173,7 +179,9 @@ func (c *Collection) load(ctx context.Context) (uint64, error) {
 			s.observe(en)
 		}
 		if en.Type == segment.TypeCheckpoint {
-			c.checkpoint = max(c.checkpoint, en.WALOffset)
+			if en.WALOffset >= c.checkpoint {
+				c.checkpoint, c.markerSeg = en.WALOffset, en.Loc.Seg
+			}
 			return
 		}
 		if prev, ok := newest[en.ID]; ok && prev >= en.WALOffset {
@@ -220,6 +228,7 @@ func (c *Collection) load(ctx context.Context) (uint64, error) {
 			c.deadBytes[seg] = dead
 		}
 	}
+	c.segBytes = total
 	c.count.Store(int64(len(c.keydir)))
 	if err := c.loadIndexes(ctx, snaps); err != nil {
 		return 0, fmt.Errorf("loading indexes of collection %q: %w", c.name, err)

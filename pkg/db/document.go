@@ -385,17 +385,29 @@ func (c *Collection) readStored(id string, ke keyEntry) (*Document, error) {
 
 // acquireReader returns the reader of data segment seg with a reference
 // taken (the caller must Release it), opening the segment on first use.
-// It returns errSegmentRetired if the segment was retired.
+// It returns errSegmentRetired if compaction retired the segment, also
+// when that happens while the segment is being opened.
 func (c *Collection) acquireReader(seg uint32) (*segment.Reader, error) {
 	c.mu.RLock()
 	r, ok := c.readers[seg]
+	_, gone := c.retired[seg]
 	c.mu.RUnlock()
+	if gone {
+		return nil, errSegmentRetired
+	}
 	if !ok {
 		nr, err := segment.OpenReader(c.dir, seg)
 		if err != nil {
+			c.mu.RLock()
+			_, gone = c.retired[seg]
+			c.mu.RUnlock()
+			if gone {
+				return nil, errSegmentRetired // removed by compaction meanwhile
+			}
 			return nil, fmt.Errorf("collection %q: %w", c.name, err)
 		}
 		c.mu.Lock()
+		_, gone = c.retired[seg]
 		switch {
 		case c.dropped:
 			c.mu.Unlock()
@@ -405,6 +417,10 @@ func (c *Collection) acquireReader(seg uint32) (*segment.Reader, error) {
 			c.mu.Unlock()
 			_ = nr.Close() // read-only file, nothing to lose
 			return nil, ErrClosed
+		case gone:
+			c.mu.Unlock()
+			_ = nr.Close() // read-only file of a retired segment, nothing to lose
+			return nil, errSegmentRetired
 		}
 		if r, ok = c.readers[seg]; !ok {
 			c.readers[seg] = nr

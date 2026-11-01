@@ -26,9 +26,10 @@ type Reader struct {
 
 	mu        sync.Mutex
 	refs      int
-	closing   bool // Retire or Close called: Acquire fails, file closes at refs == 0
-	retired   bool // Retire called: the file is removed when closed
-	finalized bool // the file has been closed
+	closing   bool        // Retire or Close called: Acquire fails, file closes at refs == 0
+	retired   bool        // Retire called: the file is removed when closed
+	finalized bool        // the file has been closed
+	onErr     func(error) // set by RetireWith: receives deferred close/remove errors
 }
 
 // OpenReader opens segment seg in dir for reading and validates its header.
@@ -121,10 +122,10 @@ func (r *Reader) Release() {
 	if fin {
 		r.finalized = true
 	}
-	remove := r.retired
+	remove, onErr := r.retired, r.onErr
 	r.mu.Unlock()
 	if fin {
-		r.finalize(remove)
+		r.finalize(remove, onErr)
 	}
 }
 
@@ -132,10 +133,16 @@ func (r *Reader) Release() {
 // file is closed and removed once the refcount reaches 0 (immediately if
 // no reference is held). Calling it again has no effect.
 //
-// Close and remove errors cannot be reported here: a failed removal leaves
-// an orphaned segment file, which holds only records superseded by newer
-// copies (last writer wins by WAL offset), so it is harmless.
-func (r *Reader) Retire() {
+// Close and remove errors are dropped; use RetireWith to observe them. A
+// failed removal leaves an orphaned segment file on disk.
+func (r *Reader) Retire() { r.RetireWith(nil) }
+
+// RetireWith is Retire that reports the close and remove errors of the
+// (possibly deferred) finalization to onErr, if it is not nil. onErr runs
+// on the goroutine that drops the last reference — the caller of
+// RetireWith or of the last Release — so it must be safe to call from any
+// goroutine and must not block. A missing file is not an error.
+func (r *Reader) RetireWith(onErr func(error)) {
 	r.mu.Lock()
 	if r.retired {
 		r.mu.Unlock()
@@ -143,6 +150,7 @@ func (r *Reader) Retire() {
 	}
 	r.retired = true
 	r.closing = true
+	r.onErr = onErr
 	alreadyClosed := r.finalized
 	fin := r.refs == 0 && !r.finalized
 	if fin {
@@ -151,11 +159,10 @@ func (r *Reader) Retire() {
 	r.mu.Unlock()
 	switch {
 	case fin:
-		r.finalize(true)
+		r.finalize(true, onErr)
 	case alreadyClosed:
-		// Closed earlier by Close; only the removal is left. Best effort,
-		// see above.
-		_ = os.Remove(r.path)
+		// Closed earlier by Close; only the removal is left.
+		report(onErr, removeFile(r.path))
 	}
 }
 
@@ -183,13 +190,29 @@ func (r *Reader) Close() error {
 	return nil
 }
 
-// finalize closes the file and optionally removes it. It runs exactly once
-// (guarded by r.finalized) and outside r.mu.
-func (r *Reader) finalize(remove bool) {
-	// Best effort: the file is read-only, so a close error loses nothing.
-	_ = r.f.Close()
+// finalize closes the file and optionally removes it, reporting errors to
+// onErr. It runs exactly once (guarded by r.finalized) and outside r.mu.
+func (r *Reader) finalize(remove bool, onErr func(error)) {
+	// The file is read-only, so a close error loses nothing; it is only
+	// reported.
+	if err := r.f.Close(); err != nil {
+		report(onErr, fmt.Errorf("segment: closing %s: %w", r.path, err))
+	}
 	if remove {
-		// Best effort, see Retire.
-		_ = os.Remove(r.path)
+		report(onErr, removeFile(r.path))
+	}
+}
+
+// removeFile removes path; a missing file is not an error.
+func removeFile(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("segment: removing %s: %w", path, err)
+	}
+	return nil
+}
+
+func report(onErr func(error), err error) {
+	if err != nil && onErr != nil {
+		onErr(err)
 	}
 }

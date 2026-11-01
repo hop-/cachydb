@@ -328,6 +328,9 @@ func (c *Collection) flush() error {
 
 	// 3. Repoint the keydir (memory only).
 	c.mu.Lock()
+	for _, loc := range locs {
+		c.segBytes[loc.Seg] += int64(loc.Size)
+	}
 	for i, en := range entries {
 		loc := locs[i]
 		old, had := c.keydir[en.id]
@@ -350,6 +353,7 @@ func (c *Collection) flush() error {
 	c.flushing, c.flushingMin = nil, 0
 	c.checkpoint = cp
 	c.mu.Unlock()
+	c.markerSeg = marker.Seg
 
 	for i := range recs {
 		c.activeHint = append(c.activeHint, segment.HintEntry{
@@ -390,9 +394,11 @@ func flushRecords(flushing map[string]memEntry, cp uint64) ([]flushEntry, []segm
 	return entries, recs, nil
 }
 
-// ensureActive opens the active data segment if it is not open: segment 1
-// for a collection without segments, the next segment after a sealed one,
-// or the current one again after a failed flush. Callers hold flushMu.
+// ensureActive opens the active data segment if it is not open: a new
+// segment (id nextSeg, so it is newer than every existing segment,
+// compaction outputs included) for a collection without segments or after
+// a sealed one, or the current one again after a failed flush. Callers
+// hold flushMu.
 func (c *Collection) ensureActive() error {
 	if c.active != nil {
 		return nil
@@ -401,22 +407,28 @@ func (c *Collection) ensureActive() error {
 		w   *segment.Writer
 		err error
 	)
-	switch {
-	case c.activeSeg == 0:
-		w, err = c.createSegment(1)
-	case c.activeSealed:
-		w, err = c.createSegment(c.activeSeg + 1)
-	default:
+	if c.activeSeg == 0 || c.activeSealed {
+		c.activeHint = nil
+		w, err = c.createSegment(c.nextSeg)
+	} else {
 		w, err = c.openActiveSegment(c.activeSeg)
 	}
 	if err != nil {
 		return err
 	}
-	if w.Seg() != c.activeSeg {
-		c.activeHint = nil
-	}
-	c.activeSeg, c.activeSealed = w.Seg(), false
+	seg := w.Seg()
+	c.activeSeg, c.activeSealed = seg, false
+	c.nextSeg = max(c.nextSeg, seg+1)
 	c.active = c.db.e.wrapSegmentWriter(w)
+	c.mu.Lock()
+	if _, ok := c.segBytes[seg]; !ok {
+		var n int64
+		for _, h := range c.activeHint {
+			n += int64(h.Loc.Size)
+		}
+		c.segBytes[seg] = n
+	}
+	c.mu.Unlock()
 	return nil
 }
 

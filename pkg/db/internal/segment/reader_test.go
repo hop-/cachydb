@@ -206,3 +206,79 @@ func TestReaderConcurrentReadAndRetire(t *testing.T) {
 		t.Error("file still exists after all references were released")
 	}
 }
+
+func TestReaderRetireWithReportsErrors(t *testing.T) {
+	tests := []struct {
+		name     string
+		refs     int  // references outstanding at RetireWith
+		readOnly bool // the directory refuses the removal
+		wantErr  bool
+	}{
+		{"removed at once", 0, false, false},
+		{"removed at last release", 1, false, false},
+		{"removal fails at once", 0, true, true},
+		{"removal fails at last release", 1, true, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.readOnly && os.Geteuid() == 0 {
+				t.Skip("root ignores directory permissions")
+			}
+			dir := t.TempDir()
+			writeSegment(t, dir, 1, 2)
+			r := mustOpenReader(t, dir, 1)
+			for range tt.refs {
+				if !r.Acquire() {
+					t.Fatal("Acquire failed")
+				}
+			}
+			if tt.readOnly {
+				if err := os.Chmod(dir, 0o500); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+			}
+			var (
+				mu   sync.Mutex
+				errs []error
+			)
+			r.RetireWith(func(err error) {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+			})
+			for range tt.refs {
+				r.Release()
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if got := len(errs) > 0; got != tt.wantErr {
+				t.Errorf("errors reported = %v, want error: %v", errs, tt.wantErr)
+			}
+			if tt.readOnly {
+				if err := os.Chmod(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if exists := fileExists(t, DataPath(dir, 1)); exists != tt.wantErr {
+				t.Errorf("file exists = %v after retire, want %v", exists, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestReaderRetireWithMissingFileIsNotAnError(t *testing.T) {
+	dir := t.TempDir()
+	writeSegment(t, dir, 1, 1)
+	r := mustOpenReader(t, dir, 1)
+	if err := os.Remove(DataPath(dir, 1)); err != nil {
+		t.Fatal(err)
+	}
+	r.RetireWith(func(err error) { t.Errorf("unexpected error: %v", err) })
+}
+
+func TestHintPath(t *testing.T) {
+	if got, want := HintPath("/d", 7), hintPath("/d", 7); got != want {
+		t.Errorf("HintPath = %s, want %s", got, want)
+	}
+}

@@ -60,8 +60,8 @@ type Engine struct {
 	closed bool
 	ops    sync.WaitGroup
 
-	// Background goroutines (drop removal, flusher; compaction in a later
-	// task) run under bgCtx and are joined by Close. bgCtx is the
+	// Background goroutines (drop removal, flusher, compactor) run under
+	// bgCtx and are joined by Close. bgCtx is the
 	// engine's lifetime context, not a request context: it is cancelled
 	// only by Close.
 	bgCtx    context.Context
@@ -78,7 +78,7 @@ type Engine struct {
 // (ErrIncompatibleDataDir), removes leftovers of interrupted drops, opens
 // the WAL, loads database and collection metadata, the collections' data
 // segments and indexes, replays the WAL idempotently (see recovery.go),
-// and starts the background flusher and WAL retention. A WAL that ends
+// and starts the background flusher, compactor, and WAL retention. A WAL that ends
 // before an offset the data references fails with ErrWALCorrupt. A
 // database whose schema version is newer than CurrentSchemaVersion fails
 // with ErrSchemaTooNew; an older one is logged.
@@ -154,6 +154,7 @@ func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 	}
 	e.bgCtx, e.bgCancel = context.WithCancel(context.Background())
 	e.startFlusher()
+	e.startCompactor()
 	// Retention starts only after replay: before it, records that only
 	// replay can recover are not yet in any memtable, so the low-water
 	// mark would count them as processed. It gets the low-water mark
@@ -481,14 +482,17 @@ func (e *Engine) DropDatabase(ctx context.Context, name string) error {
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	// Wait for running flushes and keep the flusher away from the
-	// directory while it is renamed (lock order: Database.mu → flushMu).
+	// Wait for running compactions and flushes and keep both away from
+	// the directory while it is renamed (lock order: Database.mu →
+	// compactMu → flushMu).
 	for _, c := range d.collections {
+		c.compactMu.Lock()
 		c.flushMu.Lock()
 	}
 	defer func() {
 		for _, c := range d.collections {
 			c.flushMu.Unlock()
+			c.compactMu.Unlock()
 		}
 	}()
 	off, done, err := e.appendMetaWAL(ctx, wal.Record{Op: wal.OpDropDB, DB: name})

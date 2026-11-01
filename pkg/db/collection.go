@@ -56,8 +56,12 @@ type Collection struct {
 	inflight      []uint64
 	readers       map[uint32]*segment.Reader // open data segments, opened on first read
 	readersClosed bool                       // engine shutdown: no new readers
-	metaOffset    uint64                     // coll.meta wal_offset
-	created       uint64                     // coll.meta created_offset (immutable; 0 = unknown)
+	// retired holds the data segments compaction replaced (§9). Their
+	// files are removed (once no read holds them), and no reader may be
+	// opened for them again.
+	retired    map[uint32]struct{}
+	metaOffset uint64 // coll.meta wal_offset
+	created    uint64 // coll.meta created_offset (immutable; 0 = unknown)
 	// replayTombs holds, during recovery only, the WAL offsets of the
 	// tombstones in the data segments above the checkpoint whose id is not
 	// in the keydir, so replay does not re-apply deletes that are already
@@ -74,6 +78,9 @@ type Collection struct {
 	// no longer references: superseded and deleted versions, tombstones,
 	// and checkpoint markers. Compaction (§9) uses it.
 	deadBytes map[uint32]int64
+	// segBytes holds the record bytes of every live data segment (the
+	// active one included); its keys are the collection's live segments.
+	segBytes map[uint32]int64
 
 	// flushMu serializes flushes of this collection and guards the active
 	// segment fields below. Drops hold it while renaming the collection
@@ -82,8 +89,22 @@ type Collection struct {
 	flushMu      sync.Mutex
 	active       segmentWriter       // open active data segment; nil when not open
 	activeSeg    uint32              // id of the active segment; 0 = no segment yet
-	activeSealed bool                // activeSeg is sealed; the next flush creates activeSeg+1
+	activeSealed bool                // activeSeg is sealed; the next flush creates segment nextSeg
 	activeHint   []segment.HintEntry // records of the active segment, for its hint file
+	// nextSeg is the id of the next data segment to create (max existing
+	// + 1): the active segment and compaction outputs both take ids from
+	// it, so ids are never reused and always grow.
+	nextSeg uint32
+	// markerSeg is the segment holding the newest checkpoint marker (0 if
+	// none). Compaction never rewrites it, so the marker survives (§9).
+	markerSeg uint32
+
+	// compactMu serializes compactions of this collection with each other
+	// and with drops: a compaction holds it for its whole run, including
+	// its file I/O outside flushMu, so drops take it before flushMu to
+	// keep compaction away from a directory being renamed. Lock order:
+	// Database.mu → compactMu → flushMu → mu.
+	compactMu sync.Mutex
 
 	// docLocks serializes read-modify-write of one document; stripe chosen
 	// by FNV-1a of the id (see docLock).
@@ -102,7 +123,10 @@ func newCollection(d *Database, name string, s *Schema, created, metaOffset uint
 		memtable:   make(map[string]memEntry),
 		indexes:    make(map[string]*index),
 		readers:    make(map[uint32]*segment.Reader),
+		retired:    make(map[uint32]struct{}),
 		deadBytes:  make(map[uint32]int64),
+		segBytes:   make(map[uint32]int64),
+		nextSeg:    1,
 		metaOffset: metaOffset,
 		created:    created,
 	}

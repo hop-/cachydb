@@ -39,6 +39,10 @@ type HintEntry struct {
 	Loc       Location
 }
 
+// HintPath returns the path of the hint file of segment seg in dir,
+// <dir>/seg-%06d.hint (compaction removes it with a retired segment).
+func HintPath(dir string, seg uint32) string { return hintPath(dir, seg) }
+
 // hintPath returns <dir>/seg-%06d.hint.
 func hintPath(dir string, seg uint32) string {
 	return filepath.Join(dir, fmt.Sprintf("%s%06d%s", dataPrefix, seg, hintSuffix))
