@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -82,5 +83,80 @@ func unsetenv(t *testing.T, key string) {
 	t.Helper()
 	if err := os.Unsetenv(key); err != nil {
 		t.Fatalf("unsetenv %s: %v", key, err)
+	}
+}
+
+func TestInitServerSettings(t *testing.T) {
+	keys := []string{"PORT", "ROOT_DIR", "DB_NAME", "TRANSPORT"}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	defaultRoot := filepath.Join(home, ".cachydb")
+	if windowsRootDirName != "" {
+		defaultRoot = filepath.Join(home, windowsRootDirName)
+	}
+
+	tests := []struct {
+		name      string
+		env       map[string]string
+		wantPort  int
+		wantRoot  string
+		wantDB    string
+		wantTrans string
+		wantErr   bool
+	}{
+		{name: "defaults", wantPort: 7601, wantRoot: defaultRoot, wantDB: "main", wantTrans: "stdio"},
+		{
+			name:     "from env",
+			env:      map[string]string{"PORT": "8123", "ROOT_DIR": "/srv/cachydb", "DB_NAME": "app", "TRANSPORT": "http"},
+			wantPort: 8123, wantRoot: "/srv/cachydb", wantDB: "app", wantTrans: "http",
+		},
+		{
+			name:     "empty values mean unset",
+			env:      map[string]string{"ROOT_DIR": "", "DB_NAME": "", "TRANSPORT": ""},
+			wantPort: 7601, wantRoot: defaultRoot, wantDB: "main", wantTrans: "stdio",
+		},
+		{name: "invalid port", env: map[string]string{"PORT": "http"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, k := range keys {
+				t.Setenv(k, tt.env[k])
+				if _, ok := tt.env[k]; !ok {
+					unsetenv(t, k)
+				}
+			}
+			t.Cleanup(func() {
+				// Reload the real environment for later tests.
+				if err := Init(); err != nil {
+					t.Logf("reloading config: %v", err)
+				}
+			})
+
+			err := Init()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("Init() succeeded, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Init(): %v", err)
+			}
+			c := GetConfig()
+			if c.Port != tt.wantPort {
+				t.Errorf("Port = %d, want %d", c.Port, tt.wantPort)
+			}
+			if c.RootDir != tt.wantRoot {
+				t.Errorf("RootDir = %q, want %q", c.RootDir, tt.wantRoot)
+			}
+			if c.DBName != tt.wantDB {
+				t.Errorf("DBName = %q, want %q", c.DBName, tt.wantDB)
+			}
+			if c.Transport != tt.wantTrans {
+				t.Errorf("Transport = %q, want %q", c.Transport, tt.wantTrans)
+			}
+		})
 	}
 }

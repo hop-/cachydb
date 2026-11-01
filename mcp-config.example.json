@@ -2,11 +2,7 @@
   "mcpServers": {
     "cachydb": {
       "command": "/path/to/cachydb",
-      "args": [],
-      "env": {
-        "DB_NAME": "main",
-        "ROOT_DIR": "/home/user/.cachydb"
-      }
+      "args": ["-R", "/path/to/data", "-d", "main"]
     }
   }
 }

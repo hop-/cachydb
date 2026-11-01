@@ -5,12 +5,15 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/hop-/cachydb/internal/config"
 	"github.com/hop-/cachydb/pkg/db"
+	"github.com/spf13/cobra"
 )
 
 func openEngine(t *testing.T, dir string) *db.Engine {
@@ -336,6 +339,131 @@ func TestEngineFlagsOnCommands(t *testing.T) {
 				if !tt.lookup(flag) {
 					t.Errorf("--%s missing", flag)
 				}
+			}
+		})
+	}
+}
+
+// TestServerSettingsPrecedence checks flag > env > default for the server
+// settings: the environment is loaded with config.Init, the flags get their
+// defaults from it, and an explicit flag wins.
+func TestServerSettingsPrecedence(t *testing.T) {
+	envKeys := []string{"ROOT_DIR", "DB_NAME", "TRANSPORT", "PORT"}
+	savedRoot, savedDB := generalRootDir, generalDBName
+	savedTransport, savedPort := generalTransport, generalServerPort
+	t.Cleanup(func() {
+		generalRootDir, generalDBName = savedRoot, savedDB
+		generalTransport, generalServerPort = savedTransport, savedPort
+	})
+
+	type want struct {
+		root, db, transport string
+		port                int
+	}
+	defaults := func(t *testing.T) want {
+		t.Helper()
+		home, err := os.UserHomeDir()
+		if err != nil {
+			home = "."
+		}
+		return want{root: filepath.Join(home, config.GetConfig().RootDirName), db: "main", transport: "stdio", port: 7601}
+	}
+
+	tests := []struct {
+		name string
+		env  map[string]string
+		args []string
+		want func(t *testing.T) want
+	}{
+		{name: "defaults", want: defaults},
+		{
+			name: "env only",
+			env:  map[string]string{"ROOT_DIR": "/env/root", "DB_NAME": "envdb", "TRANSPORT": "http", "PORT": "8000"},
+			want: func(*testing.T) want { return want{root: "/env/root", db: "envdb", transport: "http", port: 8000} },
+		},
+		{
+			name: "flag only",
+			args: []string{"-R", "/flag/root", "-d", "flagdb", "-t", "http", "-p", "9000"},
+			want: func(*testing.T) want { return want{root: "/flag/root", db: "flagdb", transport: "http", port: 9000} },
+		},
+		{
+			name: "flag over env",
+			env:  map[string]string{"ROOT_DIR": "/env/root", "DB_NAME": "envdb", "TRANSPORT": "http", "PORT": "8000"},
+			args: []string{"--root", "/flag/root", "--db", "flagdb", "--transport", "stdio", "--port", "9000"},
+			want: func(*testing.T) want { return want{root: "/flag/root", db: "flagdb", transport: "stdio", port: 9000} },
+		},
+		{
+			name: "env and flag mixed",
+			env:  map[string]string{"ROOT_DIR": "/env/root", "TRANSPORT": "http"},
+			args: []string{"-d", "flagdb"},
+			want: func(t *testing.T) want {
+				w := defaults(t)
+				w.root, w.db, w.transport = "/env/root", "flagdb", "http"
+				return w
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Registered before t.Setenv, so it runs after the environment
+			// is restored and reloads the original configuration.
+			t.Cleanup(func() {
+				if err := config.Init(); err != nil {
+					t.Errorf("restoring config: %v", err)
+				}
+			})
+			for _, k := range envKeys {
+				t.Setenv(k, tt.env[k])
+				if _, ok := tt.env[k]; !ok {
+					if err := os.Unsetenv(k); err != nil {
+						t.Fatalf("unsetenv %s: %v", k, err)
+					}
+				}
+			}
+			if err := config.Init(); err != nil {
+				t.Fatalf("config.Init: %v", err)
+			}
+
+			cmd := &cobra.Command{Use: "test", RunE: func(*cobra.Command, []string) error { return nil }}
+			setAllFlagsToCmd(cmd)
+			cmd.SetArgs(tt.args)
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+
+			w := tt.want(t)
+			if got := rootDir(); got != w.root {
+				t.Errorf("root = %q, want %q", got, w.root)
+			}
+			if got := dbName(); got != w.db {
+				t.Errorf("db = %q, want %q", got, w.db)
+			}
+			if generalTransport != w.transport {
+				t.Errorf("transport = %q, want %q", generalTransport, w.transport)
+			}
+			if generalServerPort != w.port {
+				t.Errorf("port = %d, want %d", generalServerPort, w.port)
+			}
+		})
+	}
+}
+
+func TestValidateTransport(t *testing.T) {
+	tests := []struct {
+		transport string
+		wantErr   bool
+	}{
+		{transport: "stdio"},
+		{transport: "http"},
+		{transport: "", wantErr: true},
+		{transport: "HTTP", wantErr: true},
+		{transport: "sse", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.transport, func(t *testing.T) {
+			err := validateTransport(tt.transport)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateTransport(%q) = %v, wantErr %v", tt.transport, err, tt.wantErr)
 			}
 		})
 	}

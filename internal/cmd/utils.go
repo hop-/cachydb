@@ -70,6 +70,15 @@ func rootDir() string {
 	return config.GetConfig().RootDir
 }
 
+// dbName returns the default database from the flags, falling back to
+// the configured default at runtime.
+func dbName() string {
+	if generalDBName != "" {
+		return generalDBName
+	}
+	return config.GetConfig().DBName
+}
+
 // newBuilder returns an app builder with the data directory and engine
 // settings from the flags.
 func newBuilder() *app.Builder {

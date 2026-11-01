@@ -18,6 +18,7 @@ var (
 	generalRootDir          string
 	generalServerPort       int
 	generalTransport        string
+	generalDBName           string
 	generalWALRetentionAge  time.Duration
 	generalWALRetentionSize config.ByteSize
 	generalCacheSize        config.ByteSize

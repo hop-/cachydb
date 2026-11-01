@@ -20,9 +20,10 @@ cachydb app [flags]
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--transport` | `-t` | `stdio` (when empty) | `stdio` or `http`; any value other than `http` means stdio |
+| `--transport` | `-t` | `stdio` (or `TRANSPORT`) | `stdio` or `http`; any other value fails |
+| `--db` | `-d` | `main` (or `DB_NAME`) | Default database; created at startup if missing |
 | `--port` | `-p` | `7601` (or `PORT`) | HTTP port (listens on all interfaces, path `/mcp`) |
-| `--root` | `-R` | `~/.cachydb` | Data directory |
+| `--root` | `-R` | `~/.cachydb` (or `ROOT_DIR`) | Data directory |
 | `--wal-retention-age` | | `24h` (or `WAL_RETENTION_AGE`) | Keep processed WAL segments this long; Go duration; `0` = no age limit |
 | `--wal-retention-size` | | `1GiB` (or `WAL_RETENTION_SIZE`) | Keep at most this much processed WAL; `0` = no size limit |
 | `--cache-size` | | `64MiB` (or `CACHE_SIZE`) | Document cache size; `0` = cache disabled |
@@ -100,15 +101,17 @@ Settings come from environment variables (`internal/config/config.go`,
 loaded with `envconfig`) and are overridden by flags. A malformed value
 (e.g. `WAL_RETENTION_AGE=soon`) aborts startup with exit status 1.
 
-| Environment variable | Default | Flag | Works? |
-|----------------------|---------|------|--------|
-| `PORT` | `7601` | `-p` | yes |
-| `WAL_RETENTION_AGE` | `24h` | `--wal-retention-age` | yes |
-| `WAL_RETENTION_SIZE` | `1GiB` | `--wal-retention-size` | yes |
-| `CACHE_SIZE` | `64MiB` | `--cache-size` | yes |
-| `ROOT_DIR` | `~/.cachydb` | `-R` | **no**, use `-R` |
-| `DB_NAME` | `main` | none | **no**, the default database is `main` |
-| `TRANSPORT` | `stdio` | `-t` | **no**, use `-t` |
+| Environment variable | Default | Flag |
+|----------------------|---------|------|
+| `PORT` | `7601` | `-p, --port` |
+| `ROOT_DIR` | `~/.cachydb` | `-R, --root` |
+| `DB_NAME` | `main` | `-d, --db` |
+| `TRANSPORT` | `stdio` | `-t, --transport` |
+| `WAL_RETENTION_AGE` | `24h` | `--wal-retention-age` |
+| `WAL_RETENTION_SIZE` | `1GiB` | `--wal-retention-size` |
+| `CACHE_SIZE` | `64MiB` | `--cache-size` |
+
+Precedence: flag > environment variable > default.
 
 - **`0` disables**: `WAL_RETENTION_AGE=0` / `WAL_RETENTION_SIZE=0` remove
   that retention limit (both 0 keeps all processed WAL forever);
@@ -125,13 +128,6 @@ loaded with `envconfig`) and are overridden by flags. A malformed value
 
 ## Known issues
 
-- **`ROOT_DIR`, `DB_NAME`, and `TRANSPORT` do not work.** The `Config`
-  struct tags these fields with `env:"..."`, which `envconfig` ignores; it
-  derives the names from the field names instead (`ROOTDIR`, `DBNAME`).
-  `TRANSPORT` is read, but the `--transport` flag defaults to `""`, which
-  overrides it, so the server always uses stdio unless `-t http` is given.
-  Use the `-R` and `-t` flags. The default database cannot be changed
-  reliably; it is `main`.
 - **stdio exit status on early EOF**: if stdin closes while requests are
   still in flight, the MCP SDK drops their responses and `cachydb` exits 1
   (`server is closing: EOF`). Keep stdin open until the responses arrive.
