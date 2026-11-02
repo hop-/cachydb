@@ -48,9 +48,12 @@ func indexKey(v any) (string, bool) {
 // maps to the set of ids of the documents holding that value. A field
 // whose value is an array is indexed under the key of each indexable
 // element (plan 004 §2.3; objects and arrays nested in it are skipped), so
-// one document may appear under several keys. Documents whose field is
-// missing or not indexable have no entry. An index is not safe for
-// concurrent use; the owning collection serializes access.
+// one document may appear under several keys. Two marker keys, which no
+// value maps to, make counts and distinct values exact without reading
+// documents: arrayMarker holds the documents whose field is an array, and
+// unindexedMarker those whose value (or an element of it) is not
+// indexable. Documents whose field is missing have no entry. An index is
+// not safe for concurrent use; the owning collection serializes access.
 type index struct {
 	name, field string
 	keys        map[string]map[string]struct{} // key -> set of ids
@@ -148,22 +151,116 @@ func (ix *index) docKeys(doc *Document) []string {
 	return valueKeys(v)
 }
 
-// valueKeys returns the index keys of a field value (see docKeys).
+// Marker keys (see index). Value keys always have a type tag other than
+// "a" and "u".
+const (
+	arrayMarker     = "a:"
+	unindexedMarker = "u:"
+)
+
+// valueKeys returns the index keys of a field value (see docKeys),
+// marker keys included.
 func valueKeys(v any) []string {
 	if key, ok := indexKey(v); ok {
 		return []string{key}
 	}
 	elems, ok := listValues(v)
 	if !ok {
-		return nil
+		return []string{unindexedMarker}
 	}
-	var keys []string
+	keys := []string{arrayMarker}
+	unindexed := false
 	for _, e := range elems {
-		if key, ok := indexKey(e); ok && !slices.Contains(keys, key) {
+		key, ok := indexKey(e)
+		switch {
+		case !ok:
+			unindexed = true
+		case !slices.Contains(keys, key):
 			keys = append(keys, key)
 		}
 	}
+	if unindexed {
+		keys = append(keys, unindexedMarker)
+	}
 	return keys
+}
+
+// isMarkerKey reports whether key is a marker key, not a value key.
+func isMarkerKey(key string) bool { return key == arrayMarker || key == unindexedMarker }
+
+// countEq returns the number of documents whose field equals the
+// indexable value v as a whole (array values excluded).
+func (ix *index) countEq(v any) int {
+	set, _ := ix.lookupSet(v)
+	return len(set) - intersectionSize(set, ix.keys[arrayMarker])
+}
+
+// countHas returns the number of documents whose field is an array with
+// an element equal to the indexable value v.
+func (ix *index) countHas(v any) int {
+	set, _ := ix.lookupSet(v)
+	return intersectionSize(set, ix.keys[arrayMarker])
+}
+
+// intersectionSize returns |a ∩ b|.
+func intersectionSize(a, b map[string]struct{}) int {
+	if len(b) < len(a) {
+		a, b = b, a
+	}
+	n := 0
+	for id := range a {
+		if _, ok := b[id]; ok {
+			n++
+		}
+	}
+	return n
+}
+
+// distinctValues returns the distinct values held in the field, array
+// elements included, decoded from the keys; false if some document holds
+// a value that is not indexable (the keys then miss it).
+func (ix *index) distinctValues() ([]any, bool) {
+	if len(ix.keys[unindexedMarker]) > 0 {
+		return nil, false
+	}
+	out := make([]any, 0, len(ix.keys))
+	for key := range ix.keys {
+		if isMarkerKey(key) {
+			continue
+		}
+		v, ok := decodeIndexKey(key)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, v)
+	}
+	return out, true
+}
+
+// decodeIndexKey returns the value of a value key (see indexKey).
+func decodeIndexKey(key string) (any, bool) {
+	if len(key) < 2 || key[1] != ':' {
+		return nil, false
+	}
+	body := key[2:]
+	switch key[0] {
+	case 'z':
+		return nil, body == ""
+	case 'b':
+		switch body {
+		case "t":
+			return true, true
+		case "f":
+			return false, true
+		}
+		return nil, false
+	case 'n':
+		f, err := strconv.ParseFloat(body, 64)
+		return f, err == nil
+	case 's':
+		return body, true
+	}
+	return nil, false
 }
 
 // lookupSet returns the set of ids under the key of v (shared with the

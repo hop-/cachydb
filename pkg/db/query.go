@@ -344,3 +344,228 @@ func project(doc *Document, owned bool, fields []string) *Document {
 	}
 	return out
 }
+
+// CountDocuments returns the number of documents matching q's filters and
+// OR groups (plan 004 §2.6; sort, fields, skip, and limit are ignored). A
+// nil or empty query returns Count(). A single eq or has filter on _id or
+// an indexed field, with nothing else, is answered from the index without
+// reading documents; anything else reads the candidates like Find.
+func (c *Collection) CountDocuments(ctx context.Context, q *Query) (int, error) {
+	n, _, err := c.countDocuments(ctx, q)
+	return n, err
+}
+
+// countDocuments implements CountDocuments and also reports how many
+// candidates it read (0 for the fast paths).
+func (c *Collection) countDocuments(ctx context.Context, q *Query) (int, int, error) {
+	e := c.db.e
+	if err := e.enter(); err != nil {
+		return 0, 0, err
+	}
+	defer e.exit()
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	var filters []QueryFilter
+	var anyOf [][]QueryFilter
+	if q != nil {
+		filters, anyOf = q.Filters, q.Any
+	}
+	p, err := prepareQuery(&Query{Filters: filters, Any: anyOf})
+	if err != nil {
+		return 0, 0, err
+	}
+	if n, ok, err := c.countFast(p); err != nil || ok {
+		return n, 0, err
+	}
+	ids, err := c.candidates(p.filters)
+	if err != nil {
+		return 0, 0, err
+	}
+	n := 0
+	examined, err := c.scan(ctx, ids, p, func(*Document, bool) bool {
+		n++
+		return true
+	})
+	return n, examined, err
+}
+
+// countFast answers a count without reading documents when it can.
+func (c *Collection) countFast(p *preparedQuery) (int, bool, error) {
+	if len(p.anyOf) > 0 || len(p.filters) > 1 {
+		return 0, false, nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.dropped {
+		return 0, false, c.errDropped()
+	}
+	if len(p.filters) == 0 {
+		return c.Count(), true, nil
+	}
+	f := p.filters[0]
+	if f.Field == "_id" {
+		if f.Operator != "eq" {
+			return 0, false, nil
+		}
+		id, ok := f.Value.(string)
+		if !ok || !c.liveLocked(id) {
+			return 0, true, nil
+		}
+		return 1, true, nil
+	}
+	if f.Operator != "eq" && f.Operator != "has" {
+		return 0, false, nil
+	}
+	if _, ok := indexKey(f.Value); !ok {
+		return 0, false, nil
+	}
+	ix := c.indexOnLocked(f.Field)
+	if ix == nil {
+		return 0, false, nil
+	}
+	if f.Operator == "eq" {
+		return ix.countEq(f.Value), true, nil
+	}
+	return ix.countHas(f.Value), true, nil
+}
+
+// liveLocked reports whether the document id exists. Callers hold mu.
+func (c *Collection) liveLocked(id string) bool {
+	for _, layer := range []map[string]memEntry{c.memtable, c.flushing} {
+		if me, ok := layer[id]; ok {
+			return me.doc != nil
+		}
+	}
+	_, ok := c.keydir[id]
+	return ok
+}
+
+// Distinct returns the distinct values of field among the documents
+// matching q's filters and OR groups (plan 004 §2.6; a nil q matches
+// every document). An array value contributes each of its elements.
+// Values are deduplicated with the type-aware equality of eq (objects and
+// arrays by their canonical JSON) and sorted in the sort order of Find.
+// Documents without the field contribute nothing. Without filters, an
+// indexed field is answered from the index keys without reading
+// documents.
+func (c *Collection) Distinct(ctx context.Context, field string, q *Query) ([]any, error) {
+	vals, _, err := c.distinct(ctx, field, q)
+	return vals, err
+}
+
+// distinct implements Distinct and also reports how many candidates it
+// read (0 for the index path).
+func (c *Collection) distinct(ctx context.Context, field string, q *Query) ([]any, int, error) {
+	if field == "" {
+		return nil, 0, fmt.Errorf("distinct: field must not be empty")
+	}
+	e := c.db.e
+	if err := e.enter(); err != nil {
+		return nil, 0, err
+	}
+	defer e.exit()
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	var filters []QueryFilter
+	var anyOf [][]QueryFilter
+	if q != nil {
+		filters, anyOf = q.Filters, q.Any
+	}
+	p, err := prepareQuery(&Query{Filters: filters, Any: anyOf})
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if len(p.filters) == 0 && len(p.anyOf) == 0 {
+		vals, ok, err := c.distinctFast(field)
+		if err != nil {
+			return nil, 0, err
+		}
+		if ok {
+			return sortDistinct(vals), 0, nil
+		}
+	}
+
+	ids, err := c.candidates(p.filters)
+	if err != nil {
+		return nil, 0, err
+	}
+	seen := make(map[string]any)
+	add := func(v any) {
+		key, ok := indexKey(v)
+		if !ok {
+			key = "j:" + canonicalJSON(v)
+		}
+		if _, dup := seen[key]; !dup {
+			seen[key] = deepCopy(v)
+		}
+	}
+	examined, err := c.scan(ctx, ids, p, func(doc *Document, _ bool) bool {
+		v, ok := doc.GetValue(field)
+		if !ok {
+			return true
+		}
+		if elems, isList := listValues(v); isList {
+			for _, el := range elems {
+				add(el)
+			}
+		} else {
+			add(v)
+		}
+		return true
+	})
+	if err != nil {
+		return nil, examined, err
+	}
+	vals := make([]any, 0, len(seen))
+	for _, v := range seen {
+		vals = append(vals, v)
+	}
+	return sortDistinct(vals), examined, nil
+}
+
+// distinctFast returns the distinct values of field without reading
+// documents (every live id for _id, or the keys of an index on field),
+// or false.
+func (c *Collection) distinctFast(field string) ([]any, bool, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.dropped {
+		return nil, false, c.errDropped()
+	}
+	if field == "_id" {
+		ids := c.liveIDsLocked()
+		out := make([]any, len(ids))
+		for i, id := range ids {
+			out[i] = id
+		}
+		return out, true, nil
+	}
+	ix := c.indexOnLocked(field)
+	if ix == nil {
+		return nil, false, nil
+	}
+	vals, ok := ix.distinctValues()
+	return vals, ok, nil
+}
+
+// sortDistinct sorts vals in the sort order of Find (ascending) and
+// returns it.
+func sortDistinct(vals []any) []any {
+	sv := make([]sortValue, len(vals))
+	for i, v := range vals {
+		sv[i] = newSortValue(v, true)
+	}
+	idx := make([]int, len(vals))
+	for i := range idx {
+		idx[i] = i
+	}
+	slices.SortFunc(idx, func(a, b int) int { return compareSortValues(sv[a], sv[b]) })
+	out := make([]any, len(vals))
+	for i, j := range idx {
+		out[i] = vals[j]
+	}
+	return out
+}

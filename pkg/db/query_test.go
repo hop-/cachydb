@@ -137,8 +137,8 @@ func TestIndexElementKeys(t *testing.T) {
 			}
 		}
 	})
-	if want := []string{"n:1", "s:x", "s:y", "s:z"}; !slices.Equal(keys, want) {
-		t.Errorf("keys = %v, want %v (nested objects and arrays skipped)", keys, want)
+	if want := []string{"a:", "n:1", "s:x", "s:y", "s:z", "u:"}; !slices.Equal(keys, want) {
+		t.Errorf("keys = %v, want %v (nested objects and arrays only marked)", keys, want)
 	}
 	if got := ix.lookup("x"); !slices.Equal(got, []string{"a", "c"}) {
 		t.Errorf("lookup(x) = %v", got)
@@ -157,7 +157,7 @@ func TestIndexElementKeys(t *testing.T) {
 	}
 
 	ix.remove("a", idxDoc("a", map[string]any{"tags": []any{"x", "y", "x", 1.0, map[string]any{"o": 1.0}, []any{"n"}}}))
-	if _, ok := ix.keys["n:1"]; ok || !slices.Equal(ix.lookup("x"), []string{"c"}) {
+	if _, ok := ix.keys["n:1"]; ok || ix.keys[unindexedMarker] != nil || !slices.Equal(ix.lookup("x"), []string{"c"}) {
 		t.Errorf("remove left element keys behind: %v", ix.keys)
 	}
 }
@@ -362,5 +362,101 @@ func TestFindProjection(t *testing.T) {
 	all, err := c.Find(ctx, &Query{Fields: []string{}, Limit: 1})
 	if err != nil || len(all) != 1 || len(all[0].Data) != 4 {
 		t.Errorf("empty field list = %v, %v; want whole documents", all, err)
+	}
+}
+
+func TestCountDocuments(t *testing.T) {
+	ctx := context.Background()
+	_, c := newTestColl(t, nil, nil)
+	if err := c.CreateIndex(ctx, "by_tags", "tags"); err != nil {
+		t.Fatal(err)
+	}
+	seedKB(t, c) // k4 has tags "storage" as a scalar
+
+	tests := []struct {
+		name     string
+		q        *Query
+		want     int
+		examined int
+	}{
+		{"nil query", nil, 5, 0},
+		{"empty query", &Query{}, 5, 0},
+		{"indexed has", &Query{Filters: []QueryFilter{{"tags", "has", "storage"}}}, 2, 0},
+		{"indexed eq excludes arrays", &Query{Filters: []QueryFilter{{"tags", "eq", "storage"}}}, 1, 0},
+		{"indexed has absent", &Query{Filters: []QueryFilter{{"tags", "has", "x"}}}, 0, 0},
+		{"_id eq", &Query{Filters: []QueryFilter{{"_id", "eq", "k2"}}}, 1, 0},
+		{"_id eq absent", &Query{Filters: []QueryFilter{{"_id", "eq", "zz"}}}, 0, 0},
+		{"unindexed eq scans", &Query{Filters: []QueryFilter{{"type", "eq", "note"}}}, 2, 5},
+		{"two filters use candidates", &Query{Filters: []QueryFilter{{"tags", "has", "storage"}, {"type", "eq", "note"}}}, 1, 3},
+		{"any groups", &Query{Any: [][]QueryFilter{{{"type", "eq", "decision"}}, {{"prio", "eq", 1}}}}, 2, 5},
+		{"skip, limit, and sort ignored", &Query{Skip: 3, Limit: 1, Sort: []SortKey{{Field: "prio"}}}, 5, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			n, examined, err := c.countDocuments(ctx, tt.q)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n != tt.want || examined != tt.examined {
+				t.Errorf("count = %d after reading %d, want %d after %d", n, examined, tt.want, tt.examined)
+			}
+			var q Query
+			if tt.q != nil {
+				q = Query{Filters: tt.q.Filters, Any: tt.q.Any}
+			}
+			if docs, err := c.Find(ctx, &q); err != nil || len(docs) != n {
+				t.Errorf("Find returned %d documents, count %d (%v)", len(docs), n, err)
+			}
+		})
+	}
+	if err := c.Delete(ctx, "k1"); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := c.CountDocuments(ctx, &Query{Filters: []QueryFilter{{"tags", "has", "storage"}}}); n != 1 {
+		t.Errorf("count after a delete = %d, want 1", n)
+	}
+}
+
+func TestDistinct(t *testing.T) {
+	ctx := context.Background()
+	_, c := newTestColl(t, nil, nil)
+	mustInsert(t, c, "a", map[string]any{"v": []any{"x", 1.0, "x", true}, "k": 1})
+	mustInsert(t, c, "b", map[string]any{"v": 1, "k": 2})
+	mustInsert(t, c, "c", map[string]any{"v": "1", "k": 1})
+	mustInsert(t, c, "d", map[string]any{"v": nil, "k": 2})
+	mustInsert(t, c, "e", map[string]any{"v": []any{}, "k": 1})
+	mustInsert(t, c, "f", map[string]any{"k": 2}) // missing
+
+	want := []any{nil, true, 1.0, "1", "x"}
+	got, examined, err := c.distinct(ctx, "v", nil)
+	if err != nil || !reflect.DeepEqual(got, want) || examined != 6 {
+		t.Errorf("distinct(v) = %#v after %d reads, %v; want %#v after 6", got, examined, err, want)
+	}
+
+	if err := c.CreateIndex(ctx, "by_v", "v"); err != nil {
+		t.Fatal(err)
+	}
+	got, examined, err = c.distinct(ctx, "v", &Query{})
+	if err != nil || !reflect.DeepEqual(got, want) || examined != 0 {
+		t.Errorf("indexed distinct(v) = %#v after %d reads, %v; want %#v from the index", got, examined, err, want)
+	}
+	got, _, err = c.distinct(ctx, "v", &Query{Filters: []QueryFilter{{"k", "eq", 1}}})
+	if want := []any{true, 1.0, "1", "x"}; err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("distinct(v | k=1) = %#v, %v; want %#v", got, err, want)
+	}
+
+	// An object value is not indexable: the index path gives way to a scan.
+	mustInsert(t, c, "g", map[string]any{"v": []any{map[string]any{"b": 1.0, "a": 2.0}, map[string]any{"a": 2, "b": 1}}})
+	mustInsert(t, c, "h", map[string]any{"v": map[string]any{"z": 1.0}})
+	got, examined, err = c.distinct(ctx, "v", nil)
+	want = []any{nil, true, 1.0, "1", "x", map[string]any{"a": 2.0, "b": 1.0}, map[string]any{"z": 1.0}}
+	if err != nil || !reflect.DeepEqual(got, want) || examined != 8 {
+		t.Errorf("distinct(v) with objects = %#v after %d reads, %v; want %#v after 8", got, examined, err, want)
+	}
+	if ids, err := c.Distinct(ctx, "_id", nil); err != nil || len(ids) != 8 || ids[0] != "a" {
+		t.Errorf("distinct(_id) = %v, %v", ids, err)
+	}
+	if _, err := c.Distinct(ctx, "", nil); err == nil {
+		t.Error("empty field accepted")
 	}
 }

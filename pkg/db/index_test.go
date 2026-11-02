@@ -98,13 +98,16 @@ func TestIndexMultiValue(t *testing.T) {
 		})
 	}
 
-	t.Run("missing and non-indexable fields have no entry", func(t *testing.T) {
+	t.Run("missing fields have no entry, non-indexable ones only a marker", func(t *testing.T) {
 		total := 0
 		for _, ids := range ix.keys {
 			total += len(ids)
 		}
-		if total != 7 {
-			t.Fatalf("indexed %d ids, want 7 (a, b, c, d, e, h, i)", total)
+		if total != 9 {
+			t.Fatalf("indexed %d ids, want 9 (a, b, c, d, e, h, i; h and g under markers)", total)
+		}
+		if !slices.Equal(sortedIDs(ix.keys[unindexedMarker]), []string{"g"}) || !slices.Equal(sortedIDs(ix.keys[arrayMarker]), []string{"h"}) {
+			t.Fatalf("markers = %v / %v, want [g] / [h]", ix.keys[unindexedMarker], ix.keys[arrayMarker])
 		}
 	})
 
