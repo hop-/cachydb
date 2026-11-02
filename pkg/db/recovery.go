@@ -548,13 +548,26 @@ func (e *Engine) replay(ctx context.Context) (uint64, error) {
 		}
 		return nil
 	})
+	if err != nil {
+		return from, fmt.Errorf("WAL replay from offset %d: %w", from, mapWALErr(err))
+	}
+	// A rename whose record is gone (it cannot be: the record stays in
+	// the WAL until coll.meta is rewritten) is finished at the offset
+	// coll.meta has, so the directory and its meta agree again.
+	for _, d := range e.databases {
+		for name, c := range d.renamePending {
+			e.logger.Warn("cachydb: finishing a collection rename without its WAL record",
+				"database", d.name, "collection", c.name, "new_name", name)
+			if err := d.finishRename(c, name, c.metaOffset); err != nil {
+				return from, err
+			}
+		}
+		d.renamePending = nil
+	}
 	for _, d := range e.databases {
 		for _, c := range d.collections {
 			c.replayTombs = nil
 		}
-	}
-	if err != nil {
-		return from, fmt.Errorf("WAL replay from offset %d: %w", from, mapWALErr(err))
 	}
 	return from, nil
 }
@@ -582,6 +595,13 @@ func (e *Engine) replayRecord(ctx context.Context, r wal.Record) (bool, error) {
 	if d == nil {
 		return false, nil
 	}
+	if _, ok := d.renamePending[r.Coll]; ok {
+		// The name's directory holds a collection renamed to it whose
+		// rename record comes later: records about the name before that
+		// belong to earlier collections of the name, which were gone
+		// before the rename (it requires a free name).
+		return false, nil
+	}
 	c := d.collections[r.Coll]
 	switch r.Op {
 	case wal.OpCreateColl:
@@ -599,6 +619,13 @@ func (e *Engine) replayRecord(ctx context.Context, r wal.Record) (bool, error) {
 			return false, nil
 		}
 		return true, c.replayIndexOp(ctx, r)
+	case wal.OpUpdateSchema:
+		if c == nil || c.metaOffset >= r.Offset {
+			return false, nil
+		}
+		return true, c.replayUpdateSchema(r)
+	case wal.OpRenameColl:
+		return d.replayRename(c, r)
 	case wal.OpPutDoc, wal.OpDeleteDoc:
 		if c == nil || r.Offset <= c.replayFloor() {
 			return false, nil
@@ -739,6 +766,91 @@ func (c *Collection) replayIndexOp(ctx context.Context, r wal.Record) error {
 			c.db.e.logger.Warn("cachydb: removing snapshot of dropped index", "collection", c.name, "index", p.Name, "err", err)
 		}
 	}
+	return nil
+}
+
+// replayUpdateSchema applies an update_schema record whose effect
+// coll.meta does not reflect yet.
+func (c *Collection) replayUpdateSchema(r wal.Record) error {
+	var p updateSchemaPayload
+	if err := json.Unmarshal(r.Payload, &p); err != nil {
+		return fmt.Errorf("%w: decoding update_schema payload: %w", ErrWALCorrupt, err)
+	}
+	if err := c.writeMetaWith(p.Schema, c.indexDefs(), r.Offset); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.schema = p.Schema
+	c.metaOffset = r.Offset
+	c.mu.Unlock()
+	return nil
+}
+
+// replayRename applies a rename_coll record (plan 004 §3.4) whose effect
+// is missing; c is the collection currently under the record's old name
+// (nil if none). The cases, in order:
+//
+//   - c's directory was already renamed but its coll.meta not rewritten
+//     (a crash between the two): rewrite coll.meta and finish the rename;
+//   - the new name already holds the renamed collection (or a later one):
+//     the rename is applied, and a c created before the record is a copy
+//     replay re-created from older records; it is removed, as the rename
+//     removed the old name;
+//   - c predates the record and the new name is free: rename the
+//     directory, rewrite coll.meta, and re-key the collection;
+//   - otherwise the record is obsolete.
+func (d *Database) replayRename(c *Collection, r wal.Record) (bool, error) {
+	var p renameCollPayload
+	if err := json.Unmarshal(r.Payload, &p); err != nil {
+		return false, fmt.Errorf("%w: decoding rename_coll payload: %w", ErrWALCorrupt, err)
+	}
+	if err := ValidateName("collection", p.NewName); err != nil {
+		return false, err
+	}
+	switch t := d.collections[p.NewName]; {
+	case c != nil && c.pendingRename == p.NewName:
+		delete(d.renamePending, p.NewName)
+		return true, d.finishRename(c, p.NewName, r.Offset)
+	case t != nil && (t.metaOffset >= r.Offset || t.created > r.Offset):
+		if c == nil || c.created >= r.Offset {
+			return false, nil
+		}
+		return true, d.replayDropColl(c, r.Offset)
+	case c != nil && c.created < r.Offset && c.metaOffset < r.Offset && t == nil:
+		if _, busy := d.renamePending[p.NewName]; busy {
+			// The new name's directory holds a later collection renamed
+			// to it: this collection went away under the new name
+			// before that, through records replay skips.
+			return true, d.replayDropColl(c, r.Offset)
+		}
+		if err := c.detach(); err != nil {
+			d.e.logger.Warn("cachydb: closing segments of a collection renamed by WAL replay",
+				"database", d.name, "collection", c.name, "err", err)
+		}
+		newDir := collDir(d.e.root, d.name, p.NewName)
+		if err := renameDir(c.dir, newDir); err != nil {
+			return false, err
+		}
+		c.dir = newDir
+		return true, d.finishRename(c, p.NewName, r.Offset)
+	default:
+		return false, nil
+	}
+}
+
+// finishRename rewrites the coll.meta of c, whose directory is already
+// the new name's, and registers it under the new name (recovery only).
+func (d *Database) finishRename(c *Collection, newName string, off uint64) error {
+	if err := c.detach(); err != nil {
+		d.e.logger.Warn("cachydb: closing segments of a collection renamed by WAL replay",
+			"database", d.name, "collection", c.name, "err", err)
+	}
+	delete(d.collections, c.name)
+	nc := c.moveState(newName, c.dir, off)
+	if err := nc.writeMeta(nc.indexDefs(), off); err != nil {
+		return err
+	}
+	d.collections[newName] = nc
 	return nil
 }
 

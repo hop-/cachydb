@@ -23,6 +23,11 @@ const (
 	OpDropColl    Op = 6 // payload: none
 	OpCreateIndex Op = 7 // payload: {"name":..., "field":...}
 	OpDropIndex   Op = 8 // payload: {"name":...}
+	// OpUpdateSchema replaces a collection's schema (plan 004 §3.3).
+	OpUpdateSchema Op = 9 // payload: {"schema": <Schema or null>}
+	// OpRenameColl renames collection Coll within database DB (plan 004
+	// §3.4).
+	OpRenameColl Op = 10 // payload: {"new_name":...}
 )
 
 // String returns the format name of the op (e.g. "put_doc").
@@ -44,12 +49,16 @@ func (o Op) String() string {
 		return "create_index"
 	case OpDropIndex:
 		return "drop_index"
+	case OpUpdateSchema:
+		return "update_schema"
+	case OpRenameColl:
+		return "rename_coll"
 	default:
 		return fmt.Sprintf("op(%d)", uint8(o))
 	}
 }
 
-func (o Op) valid() bool { return o >= OpPutDoc && o <= OpDropIndex }
+func (o Op) valid() bool { return o >= OpPutDoc && o <= OpRenameColl }
 
 // Record is one WAL entry. Offset and Time are assigned by Log.Append; any
 // values the caller sets are overwritten.

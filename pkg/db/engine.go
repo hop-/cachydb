@@ -264,6 +264,9 @@ func (e *Engine) loadDatabase(name string) (*Database, error) {
 			return nil, err
 		}
 		if c != nil {
+			if _, dup := d.collections[c.name]; dup {
+				return nil, fmt.Errorf("%s: two directories hold collection %q", dir, c.name)
+			}
 			d.collections[c.name] = c
 		}
 	}

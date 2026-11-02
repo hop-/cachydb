@@ -19,6 +19,8 @@ func allOpsRecords() []Record {
 		{Op: OpDropColl, DB: "shop", Coll: "orders"},
 		{Op: OpCreateIndex, DB: "shop", Coll: "users", Payload: []byte(`{"name":"by_age","field":"age"}`)},
 		{Op: OpDropIndex, DB: "shop", Coll: "users", Payload: []byte(`{"name":"by_age"}`)},
+		{Op: OpUpdateSchema, DB: "shop", Coll: "users", Payload: []byte(`{"schema":null}`)},
+		{Op: OpRenameColl, DB: "shop", Coll: "users", Payload: []byte(`{"new_name":"people"}`)},
 	}
 }
 
@@ -90,7 +92,7 @@ func TestValidateRecord(t *testing.T) {
 		{name: "valid", rec: Record{Op: OpCreateDB, DB: "d"}},
 		{name: "max name length", rec: Record{Op: OpPutDoc, DB: strings.Repeat("x", maxNameLen)}},
 		{name: "op zero", rec: Record{Op: 0, DB: "d"}, wantErr: true},
-		{name: "op out of range", rec: Record{Op: OpDropIndex + 1, DB: "d"}, wantErr: true},
+		{name: "op out of range", rec: Record{Op: OpRenameColl + 1, DB: "d"}, wantErr: true},
 		{name: "db too long", rec: Record{Op: OpCreateDB, DB: long}, wantErr: true},
 		{name: "coll too long", rec: Record{Op: OpCreateColl, DB: "d", Coll: long}, wantErr: true},
 		{name: "id too long", rec: Record{Op: OpPutDoc, DB: "d", Coll: "c", ID: long}, wantErr: true},
