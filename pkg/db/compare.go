@@ -3,9 +3,12 @@ package db
 import (
 	"cmp"
 	"encoding/json"
+	"maps"
 	"math"
 	"reflect"
+	"slices"
 	"strings"
+	"time"
 )
 
 // Query semantics (R5). Values are compared by type, never through their
@@ -177,4 +180,109 @@ func matchesFilter(doc *Document, f QueryFilter) bool {
 		return false
 	}
 	return false
+}
+
+// $now values (plan 004 §1.1). In document data and in filter values, a
+// value that is exactly the object {"$now": true} stands for the server's
+// current time, as an RFC 3339 UTC string with nanoseconds. Any other
+// object with a "$now" key is ordinary data.
+
+// nowKey is the only key of a $now value.
+const nowKey = "$now"
+
+// isNowValue reports whether v is exactly {"$now": true}.
+func isNowValue(v any) bool {
+	m, ok := v.(map[string]any)
+	if !ok || len(m) != 1 {
+		return false
+	}
+	b, ok := m[nowKey].(bool)
+	return ok && b
+}
+
+// nowString formats now the way $now values are stored.
+func nowString(now time.Time) string { return now.UTC().Format(time.RFC3339Nano) }
+
+// ResolveNow returns v with every {"$now": true} value, at any depth in
+// objects ([map[string]any]) and arrays ([]any), replaced by now formatted
+// as an RFC 3339 UTC string with nanoseconds. v is not modified: the parts
+// that change are copied, the rest is shared. The engine applies it to
+// document data and filter values itself; callers use it to resolve
+// values the same way.
+func ResolveNow(v any, now time.Time) any {
+	out, _ := resolveNow(v, nowString(now))
+	return out
+}
+
+// resolveNow replaces $now values in v with ts and reports whether it
+// replaced any. Unchanged subtrees are returned as they are.
+func resolveNow(v any, ts string) (any, bool) {
+	switch t := v.(type) {
+	case map[string]any:
+		if isNowValue(t) {
+			return ts, true
+		}
+		var out map[string]any
+		for k, x := range t {
+			nx, changed := resolveNow(x, ts)
+			if !changed {
+				continue
+			}
+			if out == nil {
+				out = maps.Clone(t)
+			}
+			out[k] = nx
+		}
+		if out == nil {
+			return v, false
+		}
+		return out, true
+	case []any:
+		var out []any
+		for i, x := range t {
+			nx, changed := resolveNow(x, ts)
+			if !changed {
+				continue
+			}
+			if out == nil {
+				out = slices.Clone(t)
+			}
+			out[i] = nx
+		}
+		if out == nil {
+			return v, false
+		}
+		return out, true
+	}
+	return v, false
+}
+
+// resolveNowData returns data with its $now values replaced by ts (data
+// itself when it has none).
+func resolveNowData(data map[string]any, ts string) map[string]any {
+	if data == nil {
+		return nil
+	}
+	out, _ := resolveNow(data, ts)
+	return out.(map[string]any)
+}
+
+// resolveNowFilters returns filters with $now filter values replaced by
+// ts (filters itself when there are none).
+func resolveNowFilters(filters []QueryFilter, ts string) []QueryFilter {
+	var out []QueryFilter
+	for i, f := range filters {
+		v, changed := resolveNow(f.Value, ts)
+		if !changed {
+			continue
+		}
+		if out == nil {
+			out = slices.Clone(filters)
+		}
+		out[i].Value = v
+	}
+	if out == nil {
+		return filters
+	}
+	return out
 }

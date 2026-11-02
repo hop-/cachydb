@@ -8,6 +8,7 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -83,11 +84,12 @@ func (c *Collection) Insert(ctx context.Context, doc *Document) (string, error) 
 	if len(id) > maxIDLen {
 		return "", fmt.Errorf("inserting document: id is %d bytes, max %d", len(id), maxIDLen)
 	}
+	data := resolveNowData(doc.Data, nowString(time.Now()))
 	_, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
 		if cur != nil {
 			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrExists)
 		}
-		return &Document{ID: id, Data: doc.Data}, nil
+		return &Document{ID: id, Data: data}, nil
 	})
 	if err != nil {
 		return "", err
@@ -126,6 +128,7 @@ func (c *Collection) Update(ctx context.Context, id string, set map[string]any) 
 	if _, ok := set["_id"]; ok {
 		return nil, fmt.Errorf("%w: updating document %q: field \"_id\" cannot be changed", ErrSchemaValidation, id)
 	}
+	set = resolveNowData(set, nowString(time.Now()))
 	next, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
 		if cur == nil {
 			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
@@ -220,7 +223,8 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 			return nil, err
 		}
 		if err := c.schema.ValidateDocument(next); err != nil {
-			return nil, fmt.Errorf("%w: document %q in collection %q: %w", ErrSchemaValidation, id, c.name, err)
+			// A *SchemaError, which wraps ErrSchemaValidation.
+			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, err)
 		}
 		rec.Op, rec.Payload = wal.OpPutDoc, payload
 	}
@@ -504,8 +508,9 @@ func (c *Collection) find(ctx context.Context, q *Query) ([]*Document, int, erro
 	}
 	skip := max(q.Skip, 0)
 	limit := max(q.Limit, 0)
+	filters := resolveNowFilters(q.Filters, nowString(time.Now()))
 
-	ids, err := c.candidates(q.Filters)
+	ids, err := c.candidates(filters)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -522,7 +527,7 @@ func (c *Collection) find(ctx context.Context, q *Query) ([]*Document, int, erro
 		if err != nil {
 			return nil, examined, err
 		}
-		if doc == nil || !matchesAll(doc, q.Filters) {
+		if doc == nil || !matchesAll(doc, filters) {
 			continue // deleted since the candidates were taken, or no match
 		}
 		matched++
