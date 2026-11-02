@@ -834,7 +834,7 @@ func TestCreateIndexOnPopulatedCollection(t *testing.T) {
 		&Document{ID: "s3", Data: map[string]any{"g": "a"}},
 	)
 	mustInsert(t, c, "m1", map[string]any{"g": "a"})
-	mustInsert(t, c, "m2", map[string]any{"g": []any{"a"}}) // not indexable
+	mustInsert(t, c, "m2", map[string]any{"g": []any{"a"}}) // indexed per element (plan 004)
 	mustInsert(t, c, "m3", map[string]any{"other": 1})      // field missing
 	if err := c.Delete(ctx, "s3"); err != nil {
 		t.Fatal(err)
@@ -848,7 +848,7 @@ func TestCreateIndexOnPopulatedCollection(t *testing.T) {
 		defer c.mu.RUnlock()
 		return c.indexes["by_g"].lookup(v)
 	}
-	if got, want := lookup("a"), []string{"m1", "s1"}; !slices.Equal(got, want) {
+	if got, want := lookup("a"), []string{"m1", "m2", "s1"}; !slices.Equal(got, want) {
 		t.Errorf("index a = %v, want %v", got, want)
 	}
 	if got, want := lookup("b"), []string{"s2"}; !slices.Equal(got, want) {
@@ -863,12 +863,14 @@ func TestCreateIndexOnPopulatedCollection(t *testing.T) {
 	if err := c.Delete(ctx, "s2"); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := lookup("a"), []string{"m1", "m4"}; !slices.Equal(got, want) {
+	if got, want := lookup("a"), []string{"m1", "m2", "m4"}; !slices.Equal(got, want) {
 		t.Errorf("index a after writes = %v, want %v", got, want)
 	}
 	if got, want := lookup("b"), []string{"s1"}; !slices.Equal(got, want) {
 		t.Errorf("index b after writes = %v, want %v", got, want)
 	}
+	// m2 is a candidate through its element key, but eq keeps
+	// whole-value semantics: the re-check drops it.
 	found, err := c.Find(ctx, &Query{Filters: []QueryFilter{{Field: "g", Operator: "eq", Value: "a"}}})
 	if err != nil {
 		t.Fatal(err)

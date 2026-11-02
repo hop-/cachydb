@@ -81,8 +81,8 @@ func TestIndexMultiValue(t *testing.T) {
 		v    any
 		want []string
 	}{
-		{"same value all returned sorted", 30, []string{"a", "b", "c"}},
-		{"float lookup", 30.0, []string{"a", "b", "c"}},
+		{"same value all returned sorted, array elements included", 30, []string{"a", "b", "c", "h"}},
+		{"float lookup", 30.0, []string{"a", "b", "c", "h"}},
 		{"string kept apart", "30", []string{"d"}},
 		{"other number", 31, []string{"e"}},
 		{"null", nil, []string{"i"}},
@@ -103,18 +103,19 @@ func TestIndexMultiValue(t *testing.T) {
 		for _, ids := range ix.keys {
 			total += len(ids)
 		}
-		if total != 6 {
-			t.Fatalf("indexed %d ids, want 6 (a, b, c, d, e, i)", total)
+		if total != 7 {
+			t.Fatalf("indexed %d ids, want 7 (a, b, c, d, e, h, i)", total)
 		}
 	})
 
 	t.Run("removing one keeps the others", func(t *testing.T) {
 		ix.remove("b", docs["b"])
-		if got := ix.lookup(30); !slices.Equal(got, []string{"a", "c"}) {
-			t.Fatalf("after remove b: lookup(30) = %v, want [a c]", got)
+		if got := ix.lookup(30); !slices.Equal(got, []string{"a", "c", "h"}) {
+			t.Fatalf("after remove b: lookup(30) = %v, want [a c h]", got)
 		}
 		ix.remove("a", docs["a"])
 		ix.remove("c", docs["c"])
+		ix.remove("h", docs["h"])
 		if got := ix.lookup(30); got != nil {
 			t.Fatalf("after removing all: lookup(30) = %v, want nil", got)
 		}

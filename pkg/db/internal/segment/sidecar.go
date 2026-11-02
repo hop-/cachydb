@@ -14,7 +14,7 @@ import (
 // little-endian like the data segments:
 //
 //	[4]byte magic       "CDBH" (hint) or "CDBI" (index snapshot)
-//	u16     version     sidecarVersion
+//	u16     version     hintVersion or snapshotVersion
 //	...     body        format specific
 //	u32     crc32c      Castagnoli, over every byte before it
 //
@@ -24,7 +24,14 @@ import (
 // foreign file) fails the checksum or the structural checks and is reported
 // as ErrCorrupt.
 const (
-	sidecarVersion    = 1
+	// hintVersion is the hint file format version.
+	hintVersion = 1
+	// snapshotVersion is the index snapshot format version. Version 2
+	// (plan 004) indexes each element of an array value under its own
+	// key; version 1 snapshots are rejected, so their indexes are
+	// rebuilt on open.
+	snapshotVersion = 2
+
 	sidecarMagicLen   = 4
 	sidecarHeaderSize = sidecarMagicLen + 2 // magic + version
 	sidecarCRCSize    = 4
@@ -39,10 +46,10 @@ func sidecarCorrupt(path, reason string) error {
 }
 
 // newSidecar starts a sidecar buffer with the magic and version.
-func newSidecar(magic string, sizeHint int) []byte {
+func newSidecar(magic string, version uint16, sizeHint int) []byte {
 	buf := make([]byte, 0, sidecarHeaderSize+sizeHint+sidecarCRCSize)
 	buf = append(buf, magic...)
-	return binary.LittleEndian.AppendUint16(buf, sidecarVersion)
+	return binary.LittleEndian.AppendUint16(buf, version)
 }
 
 // finishSidecar appends the checksum over everything written so far.
@@ -60,7 +67,7 @@ func appendString(buf []byte, s string) []byte {
 // readSidecar reads path and verifies its magic, version and checksum. It
 // returns the body between the header and the checksum. A missing file is
 // reported with an error wrapping os.ErrNotExist.
-func readSidecar(path, magic string) ([]byte, error) {
+func readSidecar(path, magic string, version uint16) ([]byte, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("segment: reading %s: %w", path, err)
@@ -71,7 +78,7 @@ func readSidecar(path, magic string) ([]byte, error) {
 	if !bytes.Equal(data[:sidecarMagicLen], []byte(magic)) {
 		return nil, sidecarCorrupt(path, "bad magic")
 	}
-	if v := binary.LittleEndian.Uint16(data[sidecarMagicLen:]); v != sidecarVersion {
+	if v := binary.LittleEndian.Uint16(data[sidecarMagicLen:]); v != version {
 		return nil, sidecarCorrupt(path, fmt.Sprintf("unsupported version %d", v))
 	}
 	end := len(data) - sidecarCRCSize

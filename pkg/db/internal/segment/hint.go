@@ -95,7 +95,7 @@ func WriteHint(dir string, seg uint32, entries []HintEntry) error {
 		size += hintEntryMinSize + len(e.ID)
 	}
 
-	buf := newSidecar(hintMagic, size)
+	buf := newSidecar(hintMagic, hintVersion, size)
 	buf = binary.LittleEndian.AppendUint32(buf, seg)
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(entries)))
 	for i := range entries {
@@ -118,7 +118,7 @@ func WriteHint(dir string, seg uint32, entries []HintEntry) error {
 // a damaged one returns an error wrapping ErrCorrupt.
 func ReadHint(dir string, seg uint32) ([]HintEntry, error) {
 	path := hintPath(dir, seg)
-	body, err := readSidecar(path, hintMagic)
+	body, err := readSidecar(path, hintMagic, hintVersion)
 	if err != nil {
 		return nil, err
 	}

@@ -659,46 +659,81 @@ func (c *Collection) find(ctx context.Context, q *Query) ([]*Document, int, erro
 }
 
 // candidates returns, sorted, the ids Find must examine for filters: the
-// smallest candidate set among eq filters on _id or on an indexed field
-// with an indexable value, otherwise every live id.
+// smallest candidate set among eq filters on _id and the index-backed
+// filters on an indexed field (eq and has with an indexable value; has_any,
+// the union of its values' sets; has_all, their intersection), otherwise
+// every live id. Candidates are a superset of the matches: Find re-checks
+// every filter.
 func (c *Collection) candidates(filters []QueryFilter) ([]string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.dropped {
 		return nil, c.errDropped()
 	}
+	if ids, ok := c.indexedCandidatesLocked(filters); ok {
+		return ids, nil
+	}
+	return c.liveIDsLocked(), nil
+}
+
+// indexedCandidatesLocked returns the smallest index-backed candidate set
+// for filters (see candidates), or false if no filter can use an index.
+// Callers hold mu.
+func (c *Collection) indexedCandidatesLocked(filters []QueryFilter) ([]string, bool) {
 	var best []string
 	found := false
 	for _, f := range filters {
-		if f.Operator != "eq" {
-			continue
-		}
-		var ids []string
-		switch {
-		case f.Field == "_id":
-			// The keydir/memtable are the primary index. A non-string
-			// value equals no id.
-			if s, ok := f.Value.(string); ok {
-				ids = []string{s}
-			}
-		default:
-			if _, ok := indexKey(f.Value); !ok {
-				continue // objects/arrays/NaN: not indexed, scan
-			}
-			ix := c.indexOnLocked(f.Field)
-			if ix == nil {
-				continue
-			}
-			ids = ix.lookup(f.Value)
-		}
-		if !found || len(ids) < len(best) {
+		ids, ok := c.filterCandidatesLocked(f)
+		if ok && (!found || len(ids) < len(best)) {
 			best, found = ids, true
 		}
 	}
-	if found {
-		return best, nil
+	return best, found
+}
+
+// filterCandidatesLocked returns the sorted ids that may match f through
+// the primary key or a secondary index, or false if f cannot use one.
+// Callers hold mu.
+func (c *Collection) filterCandidatesLocked(f QueryFilter) ([]string, bool) {
+	if f.Field == "_id" {
+		if f.Operator != "eq" {
+			return nil, false
+		}
+		// The keydir/memtable are the primary index. A non-string value
+		// equals no id.
+		if s, ok := f.Value.(string); ok {
+			return []string{s}, true
+		}
+		return nil, true
 	}
-	return c.liveIDsLocked(), nil
+	switch f.Operator {
+	case "eq", "has", "has_any", "has_all":
+	default:
+		return nil, false
+	}
+	ix := c.indexOnLocked(f.Field)
+	if ix == nil {
+		return nil, false
+	}
+	switch f.Operator {
+	case "has_any":
+		vals, ok := listValues(f.Value)
+		if !ok {
+			return nil, true // matches nothing
+		}
+		return ix.lookupAny(vals)
+	case "has_all":
+		vals, ok := listValues(f.Value)
+		if !ok {
+			return nil, true // matches nothing
+		}
+		return ix.lookupAll(vals)
+	default: // eq, has
+		if _, ok := indexKey(f.Value); !ok {
+			return nil, false // objects/arrays/NaN: not indexed, scan
+		}
+		return ix.lookup(f.Value), true
+	}
 }
 
 // indexOnLocked returns an index on field (the one with the smallest name

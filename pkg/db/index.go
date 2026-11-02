@@ -45,9 +45,12 @@ func indexKey(v any) (string, bool) {
 }
 
 // index is a multi-value secondary index on one field: each canonical key
-// maps to the set of ids of the documents holding that value. Documents
-// whose field is missing or not indexable have no entry. An index is not
-// safe for concurrent use; the owning collection serializes access.
+// maps to the set of ids of the documents holding that value. A field
+// whose value is an array is indexed under the key of each indexable
+// element (plan 004 §2.3; objects and arrays nested in it are skipped), so
+// one document may appear under several keys. Documents whose field is
+// missing or not indexable have no entry. An index is not safe for
+// concurrent use; the owning collection serializes access.
 type index struct {
 	name, field string
 	keys        map[string]map[string]struct{} // key -> set of ids
@@ -65,33 +68,29 @@ func newIndex(name, field string) *index {
 // add records doc under id. When replacing a document, the caller removes
 // the previous version first.
 func (ix *index) add(id string, doc *Document) {
-	key, ok := ix.docKey(doc)
-	if !ok {
-		return
+	for _, key := range ix.docKeys(doc) {
+		ids, ok := ix.keys[key]
+		if !ok {
+			ids = make(map[string]struct{})
+			ix.keys[key] = ids
+		}
+		ids[id] = struct{}{}
 	}
-	ids, ok := ix.keys[key]
-	if !ok {
-		ids = make(map[string]struct{})
-		ix.keys[key] = ids
-	}
-	ids[id] = struct{}{}
 }
 
-// remove deletes id from the entry for doc's value, leaving other
+// remove deletes id from the entries for doc's value, leaving other
 // documents with the same value in place. doc must be the version that was
 // added.
 func (ix *index) remove(id string, doc *Document) {
-	key, ok := ix.docKey(doc)
-	if !ok {
-		return
-	}
-	ids, ok := ix.keys[key]
-	if !ok {
-		return
-	}
-	delete(ids, id)
-	if len(ids) == 0 {
-		delete(ix.keys, key)
+	for _, key := range ix.docKeys(doc) {
+		ids, ok := ix.keys[key]
+		if !ok {
+			continue
+		}
+		delete(ids, id)
+		if len(ids) == 0 {
+			delete(ix.keys, key)
+		}
 	}
 }
 
@@ -135,16 +134,90 @@ func indexFromSnapshot(s *segment.IndexSnapshot) *index {
 	return ix
 }
 
-// docKey returns the index key of doc's indexed field.
-func (ix *index) docKey(doc *Document) (string, bool) {
+// docKeys returns the index keys of doc's indexed field: the key of a
+// scalar value, or the keys of the indexable elements of an array (each
+// once). It returns nil when the field is missing or not indexable.
+func (ix *index) docKeys(doc *Document) []string {
 	if doc == nil {
-		return "", false
+		return nil
 	}
 	v, ok := doc.GetValue(ix.field)
 	if !ok {
-		return "", false
+		return nil
 	}
-	return indexKey(v)
+	return valueKeys(v)
+}
+
+// valueKeys returns the index keys of a field value (see docKeys).
+func valueKeys(v any) []string {
+	if key, ok := indexKey(v); ok {
+		return []string{key}
+	}
+	elems, ok := listValues(v)
+	if !ok {
+		return nil
+	}
+	var keys []string
+	for _, e := range elems {
+		if key, ok := indexKey(e); ok && !slices.Contains(keys, key) {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+// lookupSet returns the set of ids under the key of v (shared with the
+// index; not to be modified) and whether v is indexable.
+func (ix *index) lookupSet(v any) (map[string]struct{}, bool) {
+	key, ok := indexKey(v)
+	if !ok {
+		return nil, false
+	}
+	return ix.keys[key], true
+}
+
+// lookupAny returns the sorted ids of the documents holding any of vals
+// (as the value or an array element), and false if some value is not
+// indexable (such a value could match unindexed elements).
+func (ix *index) lookupAny(vals []any) ([]string, bool) {
+	union := make(map[string]struct{})
+	for _, v := range vals {
+		set, ok := ix.lookupSet(v)
+		if !ok {
+			return nil, false
+		}
+		for id := range set {
+			union[id] = struct{}{}
+		}
+	}
+	return sortedIDs(union), true
+}
+
+// lookupAll returns the sorted ids of the documents holding every
+// indexable value of vals, a superset of the documents holding all of
+// vals, and false if no value is indexable.
+func (ix *index) lookupAll(vals []any) ([]string, bool) {
+	var sets []map[string]struct{}
+	for _, v := range vals {
+		if set, ok := ix.lookupSet(v); ok {
+			sets = append(sets, set)
+		}
+	}
+	if len(sets) == 0 {
+		return nil, false
+	}
+	slices.SortFunc(sets, func(a, b map[string]struct{}) int { return len(a) - len(b) })
+	out := make(map[string]struct{}, len(sets[0]))
+outer:
+	for id := range sets[0] {
+		for _, set := range sets[1:] {
+			if _, ok := set[id]; !ok {
+				continue outer
+			}
+		}
+		out[id] = struct{}{}
+	}
+	return sortedIDs(out), true
 }
 
 // sortedIDs returns the members of set in ascending order, or nil if the

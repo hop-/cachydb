@@ -271,7 +271,7 @@ func TestReadHintStructurallyInvalid(t *testing.T) {
 			return b
 		}},
 		{"wrong version", func(b []byte) []byte {
-			binary.LittleEndian.PutUint16(b[sidecarMagicLen:], sidecarVersion+1)
+			binary.LittleEndian.PutUint16(b[sidecarMagicLen:], hintVersion+1)
 			return b
 		}},
 		{"index snapshot magic", func(b []byte) []byte {
@@ -475,6 +475,14 @@ func TestReadIndexSnapshotStructurallyInvalid(t *testing.T) {
 		}},
 		{"hint magic", func(b []byte) []byte {
 			copy(b, hintMagic)
+			return b
+		}},
+		{"version 1 (whole-array keys, before plan 004)", func(b []byte) []byte {
+			binary.LittleEndian.PutUint16(b[sidecarMagicLen:], 1)
+			return b
+		}},
+		{"newer version", func(b []byte) []byte {
+			binary.LittleEndian.PutUint16(b[sidecarMagicLen:], snapshotVersion+1)
 			return b
 		}},
 	}
