@@ -50,6 +50,19 @@ type Query struct {
 	Skip    int           `json:"skip"`
 }
 
+// Condition is the "if" of a conditional write: filters, with the same
+// shape and operators as Query.Filters, that the stored document must all
+// match for the write to happen (plan 004 §1.2).
+type Condition = []QueryFilter
+
+// UpdateSpec describes an update for Collection.UpdateWith.
+type UpdateSpec struct {
+	Set    map[string]any // top-level fields to replace or add
+	Unset  []string       // top-level fields to remove (after Set)
+	If     Condition      // the stored version must match all of these
+	Upsert bool           // create {_id: id} + Set if the document is missing
+}
+
 // MarshalJSON customizes JSON marshaling for Document
 func (d *Document) MarshalJSON() ([]byte, error) {
 	combined := make(map[string]any)

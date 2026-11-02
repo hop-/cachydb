@@ -123,15 +123,55 @@ func (c *Collection) Get(ctx context.Context, id string) (*Document, error) {
 // Update merges set into the document id (top-level fields are replaced
 // or added) and returns a copy of the new version. It fails with
 // ErrNotFound if the document is absent and with ErrSchemaValidation if
-// set contains "_id" or the result does not satisfy the schema.
+// set contains "_id" or the result does not satisfy the schema. It is
+// UpdateWith with only Set.
 func (c *Collection) Update(ctx context.Context, id string, set map[string]any) (*Document, error) {
-	if _, ok := set["_id"]; ok {
-		return nil, fmt.Errorf("%w: updating document %q: field \"_id\" cannot be changed", ErrSchemaValidation, id)
+	doc, _, err := c.UpdateWith(ctx, id, UpdateSpec{Set: set})
+	return doc, err
+}
+
+// UpdateWith applies u to the document id and returns a copy of the new
+// version (plan 004 §1.2–§1.4): the fields of u.Set are replaced or
+// added, then the fields of u.Unset are removed. When u.If is not empty
+// the stored version must match all of its filters, checked under the
+// document's write lock right before the WAL append; otherwise it fails
+// with ErrConditionFailed and writes nothing. A missing document fails
+// with ErrConditionFailed if u.If is not empty, is created as {_id: id} +
+// u.Set if u.Upsert (upserted is then true), and fails with ErrNotFound
+// otherwise. $now values in u.Set and u.If are resolved once. It fails
+// with ErrSchemaValidation if u.Set or u.Unset names "_id", a field is in
+// both, or the result does not satisfy the schema.
+func (c *Collection) UpdateWith(ctx context.Context, id string, u UpdateSpec) (doc *Document, upserted bool, err error) {
+	if _, ok := u.Set["_id"]; ok {
+		return nil, false, fmt.Errorf("%w: updating document %q: field \"_id\" cannot be changed", ErrSchemaValidation, id)
 	}
-	set = resolveNowData(set, nowString(time.Now()))
+	for _, f := range u.Unset {
+		if f == "_id" {
+			return nil, false, fmt.Errorf("%w: updating document %q: field \"_id\" cannot be unset", ErrSchemaValidation, id)
+		}
+		if _, ok := u.Set[f]; ok {
+			return nil, false, fmt.Errorf("%w: updating document %q: field %q in both updates and unset", ErrSchemaValidation, id, f)
+		}
+	}
+	if u.Upsert {
+		if err := checkDocID(id); err != nil {
+			return nil, false, fmt.Errorf("upserting document: %w", err)
+		}
+	}
+	ts := nowString(time.Now())
+	set := resolveNowData(u.Set, ts)
+	cond := resolveNowFilters(u.If, ts)
 	next, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
+		upserted = false
+		if err := c.checkCondition(id, cur, cond); err != nil {
+			return nil, err
+		}
 		if cur == nil {
-			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
+			if !u.Upsert {
+				return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
+			}
+			upserted = true
+			return &Document{ID: id, Data: set}, nil
 		}
 		// A new top-level map: cur is shared (memtable) and must not
 		// change. Nested values are only read; write re-encodes the
@@ -143,6 +183,44 @@ func (c *Collection) Update(ctx context.Context, id string, set map[string]any) 
 		for k, v := range set {
 			data[k] = v
 		}
+		for _, k := range u.Unset {
+			delete(data, k)
+		}
+		return &Document{ID: id, Data: data}, nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return next.Clone(), upserted, nil
+}
+
+// Replace atomically replaces the whole document id with doc and returns
+// a copy of the new version (plan 004 §1.3). doc.ID must be empty or id,
+// and doc.Data must not contain "_id" (ErrSchemaValidation). The document
+// must exist: ErrNotFound if it does not (ErrConditionFailed if cond is
+// not empty). When cond is not empty the stored version must match all of
+// its filters (ErrConditionFailed otherwise). $now values are resolved;
+// the result must satisfy the schema. doc is not modified or retained.
+func (c *Collection) Replace(ctx context.Context, id string, doc *Document, cond Condition) (*Document, error) {
+	if doc == nil {
+		return nil, errors.New("replacing document: document is nil")
+	}
+	if doc.ID != "" && doc.ID != id {
+		return nil, fmt.Errorf("%w: replacing document %q: the document has a different _id %q", ErrSchemaValidation, id, doc.ID)
+	}
+	if _, ok := doc.Data["_id"]; ok {
+		return nil, fmt.Errorf("%w: replacing document %q: field \"_id\" in data is reserved; set Document.ID", ErrSchemaValidation, id)
+	}
+	ts := nowString(time.Now())
+	data := resolveNowData(doc.Data, ts)
+	cond = resolveNowFilters(cond, ts)
+	next, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
+		if err := c.checkCondition(id, cur, cond); err != nil {
+			return nil, err
+		}
+		if cur == nil {
+			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
+		}
 		return &Document{ID: id, Data: data}, nil
 	})
 	if err != nil {
@@ -151,15 +229,48 @@ func (c *Collection) Update(ctx context.Context, id string, set map[string]any) 
 	return next.Clone(), nil
 }
 
-// Delete removes the document id (ErrNotFound if absent).
+// Delete removes the document id (ErrNotFound if absent). It is
+// DeleteWith without a condition.
 func (c *Collection) Delete(ctx context.Context, id string) error {
+	return c.DeleteWith(ctx, id, nil)
+}
+
+// DeleteWith removes the document id if it matches every filter of cond
+// (plan 004 §1.2). It fails with ErrConditionFailed if cond is not empty
+// and the document does not match it or is absent, and with ErrNotFound
+// if cond is empty and the document is absent.
+func (c *Collection) DeleteWith(ctx context.Context, id string, cond Condition) error {
+	cond = resolveNowFilters(cond, nowString(time.Now()))
 	_, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
+		if err := c.checkCondition(id, cur, cond); err != nil {
+			return nil, err
+		}
 		if cur == nil {
 			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
 		}
 		return nil, nil
 	})
 	return err
+}
+
+// checkCondition returns ErrConditionFailed if cond is not empty and cur
+// (the stored version of id, nil if absent) does not match all of it.
+func (c *Collection) checkCondition(id string, cur *Document, cond Condition) error {
+	if len(cond) == 0 || (cur != nil && matchesAll(cur, cond)) {
+		return nil
+	}
+	return fmt.Errorf("%w: document %s no longer matches if", ErrConditionFailed, id)
+}
+
+// checkDocID checks that id can be stored.
+func checkDocID(id string) error {
+	if id == "" {
+		return errors.New("document id must not be empty")
+	}
+	if len(id) > maxIDLen {
+		return fmt.Errorf("id is %d bytes, max %d", len(id), maxIDLen)
+	}
+	return nil
 }
 
 // Count returns the number of live documents in O(1).
