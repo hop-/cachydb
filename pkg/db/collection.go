@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -36,7 +37,13 @@ type Collection struct {
 	db     *Database
 	name   string
 	dir    string
-	schema *Schema // immutable after creation
+	schema *Schema // replaced only while Database.mu is held exclusively (UpdateSchema)
+	// pendingRename is set, during recovery only, on a collection whose
+	// directory a rename already moved to this name while its coll.meta
+	// still has the old one (a crash between the two, plan 004 §3.4). The
+	// collection is registered under the old name until the rename
+	// record is replayed.
+	pendingRename string
 
 	// mu guards the in-memory structure below; it is held only for
 	// memory-only critical sections, never across I/O (§11). Fields also
@@ -135,6 +142,133 @@ func newCollection(d *Database, name string, s *Schema, created, metaOffset uint
 
 // Name returns the collection name.
 func (c *Collection) Name() string { return c.name }
+
+// IndexInfo describes a secondary index.
+type IndexInfo struct {
+	Name  string `json:"name"`
+	Field string `json:"field"`
+}
+
+// Schema returns a copy of the collection's schema, or nil for a
+// schemaless collection.
+func (c *Collection) Schema() *Schema {
+	c.db.mu.RLock()
+	defer c.db.mu.RUnlock()
+	return cloneSchema(c.schema)
+}
+
+// Indexes returns the collection's secondary indexes sorted by name.
+func (c *Collection) Indexes() []IndexInfo {
+	c.db.mu.RLock()
+	defer c.db.mu.RUnlock()
+	defs := sortedIndexDefs(c.indexDefs())
+	out := make([]IndexInfo, len(defs))
+	for i, d := range defs {
+		out[i] = IndexInfo(d)
+	}
+	return out
+}
+
+// maxSchemaFailures is how many failing documents an UpdateSchema error
+// lists.
+const maxSchemaFailures = 10
+
+// UpdateSchema replaces the collection's schema with s (nil removes it;
+// plan 004 §3.3). Every existing document is validated against s first;
+// if any fails, it returns an error wrapping ErrSchemaValidation that
+// lists up to 10 failing ids with their first violation and the total,
+// and nothing changes. It holds the database's metadata lock while it
+// validates and commits, so writes to the database wait (no write can
+// slip in between). Later writes are validated against s.
+func (c *Collection) UpdateSchema(ctx context.Context, s *Schema) error {
+	if err := s.Validate(); err != nil {
+		return fmt.Errorf("%w: updating schema of collection %q: %w", ErrSchemaValidation, c.name, err)
+	}
+	s = cloneSchema(s)
+	d, e := c.db, c.db.e
+	if err := e.enter(); err != nil {
+		return err
+	}
+	defer e.exit()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if c.dropped {
+		return c.errDropped()
+	}
+	if err := c.validateAll(ctx, s); err != nil {
+		return err
+	}
+
+	payload, err := json.Marshal(updateSchemaPayload{Schema: s})
+	if err != nil {
+		return fmt.Errorf("updating schema of collection %q: encoding payload: %w", c.name, err)
+	}
+	off, done, err := e.appendMetaWAL(ctx, wal.Record{Op: wal.OpUpdateSchema, DB: d.name, Coll: c.name, Payload: payload})
+	if err != nil {
+		return fmt.Errorf("updating schema of collection %q: %w", c.name, err)
+	}
+	if err := e.hook(hookMetaWrite); err != nil {
+		return err
+	}
+	if err := c.writeMetaWith(s, c.indexDefs(), off); err != nil {
+		return fmt.Errorf("updating schema of collection %q: %w", c.name, err)
+	}
+	done()
+
+	c.mu.Lock()
+	c.schema = s
+	c.metaOffset = off
+	c.mu.Unlock()
+	return nil
+}
+
+// validateAll checks every live document against s. Callers hold
+// Database.mu exclusively, so no document write runs.
+func (c *Collection) validateAll(ctx context.Context, s *Schema) error {
+	if s == nil {
+		return nil
+	}
+	c.mu.RLock()
+	ids := c.liveIDsLocked()
+	c.mu.RUnlock()
+	var (
+		failed []string
+		total  int
+	)
+	for i, id := range ids {
+		if i%findCtxCheckEvery == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		doc, _, err := c.current(id)
+		if err != nil {
+			return err
+		}
+		if doc == nil {
+			continue
+		}
+		err = s.ValidateDocument(doc)
+		var se *SchemaError
+		if !errors.As(err, &se) {
+			continue
+		}
+		total++
+		if len(failed) < maxSchemaFailures {
+			failed = append(failed, fmt.Sprintf("%s (%s)", id, se.Violations[0]))
+		}
+	}
+	if total == 0 {
+		return nil
+	}
+	more := ""
+	if total > len(failed) {
+		more = fmt.Sprintf(", and %d more", total-len(failed))
+	}
+	return fmt.Errorf("%w: updating schema of collection %q: %d existing document(s) do not match the new schema: %s%s",
+		ErrSchemaValidation, c.name, total, strings.Join(failed, ", "), more)
+}
 
 // markDropped flags the collection as dropped so background work and
 // late callers stop using it, closes its active segment and segment
@@ -324,11 +458,74 @@ func (c *Collection) DropIndex(ctx context.Context, name string) error {
 // writeMeta atomically rewrites coll.meta with the given index definitions
 // and WAL offset. Callers hold Database.mu exclusively.
 func (c *Collection) writeMeta(defs map[string]indexDef, off uint64) error {
+	return c.writeMetaWith(c.schema, defs, off)
+}
+
+// writeMetaWith is writeMeta with schema s.
+func (c *Collection) writeMetaWith(s *Schema, defs map[string]indexDef, off uint64) error {
 	return writeCollMeta(c.dir, collMeta{
 		Name:          c.name,
-		Schema:        c.schema,
+		Schema:        s,
 		Indexes:       sortedIndexDefs(defs),
 		WALOffset:     off,
 		CreatedOffset: c.created,
 	})
+}
+
+// detach makes the collection unusable under its current name before its
+// directory is renamed (plan 004 §3.4): it flags it dropped, closes its
+// active segment and segment readers, and evicts its documents from the
+// cache. Unlike markDropped it keeps the in-memory state, which
+// moveState hands to the renamed collection. Callers hold Database.mu
+// exclusively and flushMu, or run during recovery.
+func (c *Collection) detach() error {
+	c.mu.Lock()
+	c.dropped = true
+	readers := c.readers
+	c.readers = make(map[uint32]*segment.Reader)
+	c.mu.Unlock()
+	var errs []error
+	if c.active != nil {
+		if err := c.active.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		c.active = nil
+	}
+	for _, r := range readers {
+		// A reader still in use closes on its last Release.
+		if err := r.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	c.db.e.cache.InvalidateCollection(c.db.name, c.name)
+	return errors.Join(errs...)
+}
+
+// moveState returns a new collection called name, in directory dir, that
+// takes over c's in-memory state (keydir, memtable, indexes, segment
+// bookkeeping, count); c keeps empty structures. The active segment is
+// reopened lazily by the next flush. Callers hold Database.mu exclusively
+// and c's flushMu (or run during recovery), and have detached c.
+func (c *Collection) moveState(name, dir string, metaOffset uint64) *Collection {
+	nc := newCollection(c.db, name, c.schema, c.created, metaOffset)
+	nc.dir = dir
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nc.keydir, c.keydir = c.keydir, make(map[string]keyEntry)
+	nc.memtable, c.memtable = c.memtable, make(map[string]memEntry)
+	nc.flushing, c.flushing = c.flushing, nil
+	nc.indexes, c.indexes = c.indexes, make(map[string]*index)
+	nc.inflight, c.inflight = c.inflight, nil
+	nc.retired, c.retired = c.retired, make(map[uint32]struct{})
+	nc.replayTombs, c.replayTombs = c.replayTombs, nil
+	nc.memBytes, nc.flushingBytes = c.memBytes, c.flushingBytes
+	c.memBytes, c.flushingBytes = 0, 0
+	nc.memMin, nc.flushingMin, nc.checkpoint = c.memMin, c.flushingMin, c.checkpoint
+	nc.deadBytes, c.deadBytes = c.deadBytes, make(map[uint32]int64)
+	nc.segBytes, c.segBytes = c.segBytes, make(map[uint32]int64)
+	nc.activeSeg, nc.activeSealed, nc.activeHint = c.activeSeg, c.activeSealed, c.activeHint
+	nc.nextSeg, nc.markerSeg = c.nextSeg, c.markerSeg
+	nc.count.Store(c.count.Load())
+	c.count.Store(0)
+	return nc
 }

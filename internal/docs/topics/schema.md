@@ -1,13 +1,14 @@
 ---
 name: schema
 title: Collection schemas
-summary: Field types, required fields, when validation runs, _id rules, and how numbers come back
+summary: Field types, required fields, when validation runs, changing a schema (update_schema), describe_collection, _id rules, and how numbers come back
 ---
 # Collection schemas
 
-A collection can have an optional schema, given once to
-`create_collection`. It cannot be changed afterwards. Without a schema a
-collection accepts any JSON object.
+A collection can have an optional schema, given to `create_collection`
+and changed later with `update_schema`. Without a schema a collection
+accepts any JSON object. `describe_collection` returns a collection's
+schema (or `null`), its indexes, and its document count.
 
 ```json
 create_collection {
@@ -41,11 +42,30 @@ create_collection {
 - `required: true` means the field must be present. A field that is
   present must have the declared type; `null` does not match any type.
 - Fields that are not in the schema are allowed, with any value.
-- Validation runs on every `insert_document`, and on the **merged result**
-  of every `update_document`.
+- Validation runs on every `insert_document` and `replace_document`, and
+  on the **result** of every `update_document` (after `updates` and
+  `unset`; unsetting a required field fails) and upsert.
+- `{"$now": true}` values are replaced by the server time (a string)
+  before validation, so a `date` field accepts them.
 - A failed validation returns an error containing "schema validation
-  failed" and names the field, for example `required field 'name' is
-  missing` or `field 'age' has invalid type, expected number`.
+  failed" that lists **every** violation: missing required fields, then
+  wrong types, for example `schema validation failed: required field(s)
+  missing: name, title; wrong type: age (expected number, got string)`.
+
+## Changing a schema
+
+- `update_schema {collection, schema}` replaces the schema; `"schema":
+  null` removes it.
+- Every existing document is checked against the new schema first. If any
+  fails, nothing changes and the error lists up to 10 failing ids with
+  their first violation and the total, for example `2 existing
+  document(s) do not match the new schema: n1 (required field missing:
+  owner), n2 (...)`. Fix those documents (or the schema) and retry.
+- Writes to the database wait while it checks; later writes use the new
+  schema.
+- To restructure a collection otherwise, `copy_collection` it (schema,
+  indexes, documents), change the copy, then `delete_collection` the old
+  one and `rename_collection` the copy.
 
 ## Document ids
 
@@ -53,7 +73,9 @@ create_collection {
   to choose it; otherwise cachydb generates a UUID and returns it as `id`.
 - A non-string `_id` is rejected. Inserting an `_id` that already exists
   fails with "already exists".
-- `_id` cannot be changed by `update_document`.
+- `_id` cannot be changed by `update_document` (in `updates` or `unset`)
+  or `replace_document` (a different `_id` in the new document is an
+  error).
 
 ## Values come back as JSON
 

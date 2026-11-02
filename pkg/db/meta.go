@@ -60,6 +60,14 @@ type dropIndexPayload struct {
 	Name string `json:"name"`
 }
 
+type updateSchemaPayload struct {
+	Schema *Schema `json:"schema"`
+}
+
+type renameCollPayload struct {
+	NewName string `json:"new_name"`
+}
+
 func dbDir(root, db string) string         { return filepath.Join(root, db) }
 func collDir(root, db, coll string) string { return filepath.Join(root, db, coll) }
 

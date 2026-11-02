@@ -24,15 +24,17 @@ go test -race ./...                       # all tests
 | Path | Purpose | When to modify |
 |------|---------|----------------|
 | `main.go` | Entry point | Almost never |
-| `internal/cmd/` | Commands, flags, lifecycle (`signal.NotifyContext`, `RunE`) | New commands or flags |
+| `internal/cmd/` | Commands, flags, lifecycle (`signal.NotifyContext`, `RunE`); `client.go` (MCP client), `export.go`/`import.go`/`find.go` (offline data) | New commands or flags |
+| `internal/exportfmt/` | JSONL export format, `Export`/`Import` over `Source`/`Target`, engine adapter | Export format changes (bump `Version`) |
 | `internal/config/` | Env-var settings, `ByteSize` | New settings |
 | `internal/app/` | `Builder` → `db.Options`, `App.Start/Stop` | Startup/shutdown, new engine options |
 | `internal/mcp/server.go` | Handlers, sessions, transports | Exposing engine operations to AI clients |
 | `internal/mcp/tools.go`, `docs.go` | Tool definitions (typed schemas, annotations, examples); instructions, docs resources, generated tools topic | New tools, tool descriptions |
 | `internal/docs/` | Embedded agent docs topics (`topics/*.md`) | Documentation an agent needs |
 | `pkg/db/engine.go`, `database.go`, `collection.go` | Public API, metadata operations | API changes |
-| `pkg/db/document.go` | Write path, read path, `Find` | Document operations, query execution |
-| `pkg/db/compare.go`, `index.go` | Comparison and index semantics | New operators, index behavior |
+| `pkg/db/document.go` | Write path (`UpdateWith`, `Replace`, `DeleteWith`, conditions), read path, candidate selection | Document operations |
+| `pkg/db/query.go` | `Find` (OR groups, sort heap, projection), `CountDocuments`, `Distinct` | Query execution |
+| `pkg/db/compare.go`, `index.go` | Comparison, operators, `$now`; index keys (per element, marker keys) | New operators, index behavior |
 | `pkg/db/types.go`, `schema.go` | Public types, schema validation | New field types |
 | `pkg/db/flush.go`, `recovery.go`, `compact.go` | Flush, recovery, compaction | Durability logic (read [STORAGE.md](STORAGE.md) first) |
 | `pkg/db/backpressure.go`, `metacp.go` | `MaxPendingBytes` write backpressure; `cachydb.metacp` metadata checkpoint | Durability logic |
@@ -92,9 +94,12 @@ Follow the Go conventions used throughout the code:
 
 1. Add a case to `matchesFilter` in `pkg/db/compare.go`, using `compare` /
    `valuesEqual` for type-aware semantics.
-2. Only `eq` uses indexes (`candidates` in `document.go`); decide whether
-   the new operator can.
-3. Add cases to `compare_test.go` / `document_test.go`.
+2. Index use is decided in `filterCandidatesLocked` (`document.go`): `eq`,
+   `has`, `has_any`, `has_all` can; candidates are always re-checked, so
+   they only need to be a superset. Decide whether the new operator can.
+3. Add it to `Operators` in `internal/mcp/tools.go` (the schema enum) and
+   to the `query` docs topic.
+4. Add cases to `compare_test.go` / `query_test.go`.
 
 ### Adding a field type
 
@@ -109,8 +114,10 @@ The WAL, data segment, hint, and snapshot headers carry a version; the data
 directory has `cachydb.format` (`FormatVersion` in `pkg/db/format.go`).
 Bump the relevant version and decide how old files are handled: old data
 directories currently fail fast with `ErrIncompatibleDataDir` rather than
-being converted. Never change the numeric values of WAL ops or record
-types.
+being converted. Sidecars that can be rebuilt (index snapshots, plan 004:
+version 2) are simply rejected and rebuilt. Never change the numeric
+values of WAL ops (1–10) or record types; new metadata ops need a replay
+case in `replayRecord` and crash tests at `hookMetaWrite`.
 
 ### Adding a migration
 
@@ -146,7 +153,7 @@ Tests use the stdlib `testing` package: table-driven with `t.Run`, data in
 ```bash
 go test -race ./...                                          # everything
 go test -race ./pkg/db/...                                   # engine only
-go test -race -count=1000 -run 'Crash|Recovery|Torn|Concurrent' ./pkg/db/...   # stress recovery (slow)
+go test -race -count=200 -run 'Crash|Recovery|Torn|Concurrent|Condition|Rename|Schema' ./pkg/db/...   # stress recovery (slow)
 test -z "$(gofmt -l .)" && go vet ./...
 for os in linux darwin freebsd openbsd netbsd dragonfly solaris illumos windows; do GOOS=$os go build ./... || echo "FAIL $os"; done
 GOOS=aix GOARCH=ppc64 go build ./...                         # aix exists only on ppc64
@@ -162,7 +169,16 @@ What exists:
   (including small-segment merges), recovery, the metadata checkpoint
   (`metacp_test.go`), backpressure and the parallel flusher
   (`backpressure_test.go`), the decoded cache (clone safety), query/index
-  semantics, names, options, format detection.
+  semantics, names, options, format detection; plan 004: `$now`,
+  `SchemaError`, conditional writes (incl. 16-goroutine compare-and-set),
+  unset, replace, upsert (`writes_test.go`), element operators, OR groups,
+  element index keys, the old-snapshot upgrade, sort, projection, count,
+  distinct (`query_test.go`), describe, `UpdateSchema`, rename (crash after
+  the record, crash between the directory rename and the meta write, with
+  and without earlier collections of the new name and the metadata
+  checkpoint, concurrent writers), copy (`collops_test.go`).
+- `internal/exportfmt`: exact format, round trip, conflict modes, bad
+  input.
 - `pkg/db/internal/{wal,segment,cache,fsutil}`: codec, torn-tail,
   retention, sidecar, LRU, and lock tests.
 - `internal/mcp`: tool list, per-session `use_database` (in-memory
@@ -176,7 +192,13 @@ What exists:
   behavior, utils output, flags, env-var precedence (flag > env >
   default), `docs` output (index, topics, `--all`, JSON, unknown topic),
   `version --json`, help examples, `ByteSize` parsing, `healthcheck`
-  (healthy, 503, refused, timeout, stdio, `healthcheck_test.go`).
+  (healthy, 503, refused, timeout, stdio, `healthcheck_test.go`),
+  `utils export/import/find/get` and the client hint on a locked
+  directory (`data_test.go`), `cachydb client` against a live HTTP server
+  (`client_test.go`: tools, call, export equal to `utils export`,
+  import).
+- `internal/mcp/features_test.go`: every plan-004 tool and parameter end
+  to end.
 - `/healthz` (200, 405, 503 after `Engine.Close`): `TestHealthz` in
   `internal/mcp/server_test.go`.
 - The Docker image is tested only in CI: the `docker` workflow's
@@ -273,13 +295,21 @@ tag). Keep `DOCKERHUB.md` under 25,000 bytes (Docker Hub's limit).
 1. An idle collection pins the WAL replay start at its last checkpoint
    (`cachydb.metacp` bounds only the metadata records).
 2. `create_index` blocks writes to the whole database while it builds.
-3. Only `eq` uses indexes; range filters and unindexed fields scan every
-   document (from the memtable, the decoded-document cache, or disk).
-4. No multi-document transactions; no range, unique, or nested-field
-   indexes; no dot-notation in queries.
-5. Schemas cannot be changed after collection creation.
-6. No MCP tools for dropping collections or indexes (engine supports both).
+3. Only `eq`, `has`, `has_any`, and `has_all` use indexes; `contains`,
+   range filters, `any` groups, and unindexed fields scan every document
+   (from the memtable, the decoded-document cache, or disk). Sorting by a
+   field other than `_id` reads every match.
+4. No multi-document transactions; no range, unique, full-text, or
+   nested-field indexes; no dot-notation in queries. `copy_collection` is
+   not atomic.
+5. `update_schema` and `create_index` hold the database's metadata lock
+   while they read every document. `rename_collection` flushes the
+   collection under it.
+6. The exact object `{"$now": true}` cannot be stored literally (it
+   becomes a timestamp).
 7. No authentication or TLS on the HTTP transport (`/mcp` and `/healthz`).
+   `utils export` and `client export` hold a whole collection's documents
+   in memory at once (offline) or page with `skip` (client).
 8. Single node only. The data-directory lock needs `flock` (Linux, macOS,
    the BSDs); elsewhere (Windows, Solaris, illumos, AIX) it is a no-op with
    a logged warning, and Windows is unsupported at runtime.

@@ -128,9 +128,15 @@ func TestListToolsUnchanged(t *testing.T) {
 	}
 	slices.Sort(got)
 	want := []string{
-		"create_collection", "create_database", "create_index", "current_database",
-		"delete_database", "delete_document", "find_documents", "insert_document",
-		"list_collections", "list_databases", "update_document", "use_database",
+		"copy_collection", "count_documents", "create_collection", "create_database",
+		"create_index", "current_database", "delete_collection", "delete_database",
+		"delete_document", "describe_collection", "distinct", "drop_index",
+		"find_documents", "insert_document", "list_collections", "list_databases",
+		"rename_collection", "replace_document", "update_document", "update_schema",
+		"use_database",
+	}
+	if len(want) != 21 {
+		t.Fatalf("want lists %d tools", len(want))
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("tools = %v, want %v", got, want)

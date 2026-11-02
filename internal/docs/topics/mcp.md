@@ -1,7 +1,7 @@
 ---
 name: mcp
 title: Using cachydb as an MCP server
-summary: stdio vs Streamable HTTP, client configuration examples (incl. Docker), health checks, per-session databases, and the data-directory lock
+summary: stdio vs Streamable HTTP, client configuration examples (incl. Docker), health checks, per-session databases, the data-directory lock, cachydb client, and the 21 tools by task
 ---
 <!--
 Client config formats checked on 2026-11-01 against the official docs:
@@ -184,10 +184,39 @@ in use by another cachydb process". To share data between several agents,
 run one HTTP server and connect them all to it, or give each stdio server
 its own `-R` directory.
 
+While an HTTP server runs, shell scripts and agents without MCP support
+reach it with `cachydb client` (`--url` or `CACHYDB_URL`, default
+`http://127.0.0.1:7601/mcp`):
+
+```bash
+cachydb client tools
+cachydb client call find_documents '{"database":"kb","collection":"notes","query":{"limit":5}}'
+cachydb client export -d kb -o kb.jsonl        # same format as cachydb utils export
+```
+
+Agents sharing documents can update safely with `if` conditions
+(compare-and-set): keep a `version` field, update with
+`"if": [{"field": "version", "operator": "eq", "value": 3}]` and
+`"updates": {"version": 4, ...}`, and on "condition failed" re-read and
+retry.
+
+## Tools by task
+
+| Task | Tools |
+| --- | --- |
+| Databases | `list_databases`, `create_database`, `delete_database`, `use_database`, `current_database` |
+| Collections | `create_collection`, `list_collections`, `describe_collection`, `update_schema`, `rename_collection`, `copy_collection`, `delete_collection` |
+| Indexes | `create_index`, `drop_index` |
+| Writing | `insert_document`, `update_document` (`updates`, `unset`, `if`, `upsert`), `replace_document`, `delete_document` (`if`) |
+| Reading | `find_documents` (`filters`, `any`, `sort`, `fields`, `limit`, `skip`), `count_documents`, `distinct` |
+
+`cachydb docs tools` has every schema and an example call.
+
 ## Self-description
 
 - `tools/list` returns typed input and output JSON Schemas, with enums for
-  query operators and schema field types, plus read-only, destructive, and
+  query operators (including `contains`, `has`, `has_any`, `has_all`),
+  sort orders, and schema field types, plus read-only, destructive, and
   idempotent annotations.
 - The `initialize` result carries short usage instructions.
 - Every docs topic is a resource: `cachydb://docs/<topic>` (markdown),

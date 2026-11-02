@@ -8,6 +8,7 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -83,11 +84,12 @@ func (c *Collection) Insert(ctx context.Context, doc *Document) (string, error) 
 	if len(id) > maxIDLen {
 		return "", fmt.Errorf("inserting document: id is %d bytes, max %d", len(id), maxIDLen)
 	}
+	data := resolveNowData(doc.Data, nowString(time.Now()))
 	_, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
 		if cur != nil {
 			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrExists)
 		}
-		return &Document{ID: id, Data: doc.Data}, nil
+		return &Document{ID: id, Data: data}, nil
 	})
 	if err != nil {
 		return "", err
@@ -121,14 +123,55 @@ func (c *Collection) Get(ctx context.Context, id string) (*Document, error) {
 // Update merges set into the document id (top-level fields are replaced
 // or added) and returns a copy of the new version. It fails with
 // ErrNotFound if the document is absent and with ErrSchemaValidation if
-// set contains "_id" or the result does not satisfy the schema.
+// set contains "_id" or the result does not satisfy the schema. It is
+// UpdateWith with only Set.
 func (c *Collection) Update(ctx context.Context, id string, set map[string]any) (*Document, error) {
-	if _, ok := set["_id"]; ok {
-		return nil, fmt.Errorf("%w: updating document %q: field \"_id\" cannot be changed", ErrSchemaValidation, id)
+	doc, _, err := c.UpdateWith(ctx, id, UpdateSpec{Set: set})
+	return doc, err
+}
+
+// UpdateWith applies u to the document id and returns a copy of the new
+// version (plan 004 §1.2–§1.4): the fields of u.Set are replaced or
+// added, then the fields of u.Unset are removed. When u.If is not empty
+// the stored version must match all of its filters, checked under the
+// document's write lock right before the WAL append; otherwise it fails
+// with ErrConditionFailed and writes nothing. A missing document fails
+// with ErrConditionFailed if u.If is not empty, is created as {_id: id} +
+// u.Set if u.Upsert (upserted is then true), and fails with ErrNotFound
+// otherwise. $now values in u.Set and u.If are resolved once. It fails
+// with ErrSchemaValidation if u.Set or u.Unset names "_id", a field is in
+// both, or the result does not satisfy the schema.
+func (c *Collection) UpdateWith(ctx context.Context, id string, u UpdateSpec) (doc *Document, upserted bool, err error) {
+	if _, ok := u.Set["_id"]; ok {
+		return nil, false, fmt.Errorf("%w: updating document %q: field \"_id\" cannot be changed", ErrSchemaValidation, id)
 	}
+	for _, f := range u.Unset {
+		if f == "_id" {
+			return nil, false, fmt.Errorf("%w: updating document %q: field \"_id\" cannot be unset", ErrSchemaValidation, id)
+		}
+		if _, ok := u.Set[f]; ok {
+			return nil, false, fmt.Errorf("%w: updating document %q: field %q in both updates and unset", ErrSchemaValidation, id, f)
+		}
+	}
+	if u.Upsert {
+		if err := checkDocID(id); err != nil {
+			return nil, false, fmt.Errorf("upserting document: %w", err)
+		}
+	}
+	ts := nowString(time.Now())
+	set := resolveNowData(u.Set, ts)
+	cond := resolveNowFilters(u.If, ts)
 	next, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
+		upserted = false
+		if err := c.checkCondition(id, cur, cond); err != nil {
+			return nil, err
+		}
 		if cur == nil {
-			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
+			if !u.Upsert {
+				return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
+			}
+			upserted = true
+			return &Document{ID: id, Data: set}, nil
 		}
 		// A new top-level map: cur is shared (memtable) and must not
 		// change. Nested values are only read; write re-encodes the
@@ -140,6 +183,44 @@ func (c *Collection) Update(ctx context.Context, id string, set map[string]any) 
 		for k, v := range set {
 			data[k] = v
 		}
+		for _, k := range u.Unset {
+			delete(data, k)
+		}
+		return &Document{ID: id, Data: data}, nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return next.Clone(), upserted, nil
+}
+
+// Replace atomically replaces the whole document id with doc and returns
+// a copy of the new version (plan 004 §1.3). doc.ID must be empty or id,
+// and doc.Data must not contain "_id" (ErrSchemaValidation). The document
+// must exist: ErrNotFound if it does not (ErrConditionFailed if cond is
+// not empty). When cond is not empty the stored version must match all of
+// its filters (ErrConditionFailed otherwise). $now values are resolved;
+// the result must satisfy the schema. doc is not modified or retained.
+func (c *Collection) Replace(ctx context.Context, id string, doc *Document, cond Condition) (*Document, error) {
+	if doc == nil {
+		return nil, errors.New("replacing document: document is nil")
+	}
+	if doc.ID != "" && doc.ID != id {
+		return nil, fmt.Errorf("%w: replacing document %q: the document has a different _id %q", ErrSchemaValidation, id, doc.ID)
+	}
+	if _, ok := doc.Data["_id"]; ok {
+		return nil, fmt.Errorf("%w: replacing document %q: field \"_id\" in data is reserved; set Document.ID", ErrSchemaValidation, id)
+	}
+	ts := nowString(time.Now())
+	data := resolveNowData(doc.Data, ts)
+	cond = resolveNowFilters(cond, ts)
+	next, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
+		if err := c.checkCondition(id, cur, cond); err != nil {
+			return nil, err
+		}
+		if cur == nil {
+			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
+		}
 		return &Document{ID: id, Data: data}, nil
 	})
 	if err != nil {
@@ -148,15 +229,48 @@ func (c *Collection) Update(ctx context.Context, id string, set map[string]any) 
 	return next.Clone(), nil
 }
 
-// Delete removes the document id (ErrNotFound if absent).
+// Delete removes the document id (ErrNotFound if absent). It is
+// DeleteWith without a condition.
 func (c *Collection) Delete(ctx context.Context, id string) error {
+	return c.DeleteWith(ctx, id, nil)
+}
+
+// DeleteWith removes the document id if it matches every filter of cond
+// (plan 004 §1.2). It fails with ErrConditionFailed if cond is not empty
+// and the document does not match it or is absent, and with ErrNotFound
+// if cond is empty and the document is absent.
+func (c *Collection) DeleteWith(ctx context.Context, id string, cond Condition) error {
+	cond = resolveNowFilters(cond, nowString(time.Now()))
 	_, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
+		if err := c.checkCondition(id, cur, cond); err != nil {
+			return nil, err
+		}
 		if cur == nil {
 			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
 		}
 		return nil, nil
 	})
 	return err
+}
+
+// checkCondition returns ErrConditionFailed if cond is not empty and cur
+// (the stored version of id, nil if absent) does not match all of it.
+func (c *Collection) checkCondition(id string, cur *Document, cond Condition) error {
+	if len(cond) == 0 || (cur != nil && matchesAll(cur, cond)) {
+		return nil
+	}
+	return fmt.Errorf("%w: document %s no longer matches if", ErrConditionFailed, id)
+}
+
+// checkDocID checks that id can be stored.
+func checkDocID(id string) error {
+	if id == "" {
+		return errors.New("document id must not be empty")
+	}
+	if len(id) > maxIDLen {
+		return fmt.Errorf("id is %d bytes, max %d", len(id), maxIDLen)
+	}
+	return nil
 }
 
 // Count returns the number of live documents in O(1).
@@ -220,7 +334,8 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 			return nil, err
 		}
 		if err := c.schema.ValidateDocument(next); err != nil {
-			return nil, fmt.Errorf("%w: document %q in collection %q: %w", ErrSchemaValidation, id, c.name, err)
+			// A *SchemaError, which wraps ErrSchemaValidation.
+			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, err)
 		}
 		rec.Op, rec.Payload = wal.OpPutDoc, payload
 	}
@@ -479,118 +594,82 @@ func decodeDocument(id string, data []byte) (*Document, error) {
 	return doc, nil
 }
 
-// Find returns copies of the documents matching every filter of q, in
-// ascending _id order, after skipping q.Skip matches and returning at most
-// q.Limit (0 or negative = no limit). A nil q matches everything.
-//
-// Candidates come from the smallest set among the eq filters on indexed
-// fields (or on _id); without one, every live document is scanned. Each
-// candidate is checked against all filters, and the scan stops as soon as
-// skip+limit matches are found, so paging is deterministic.
-func (c *Collection) Find(ctx context.Context, q *Query) ([]*Document, error) {
-	docs, _, err := c.find(ctx, q)
-	return docs, err
-}
-
-// find implements Find and also reports how many candidates it examined.
-func (c *Collection) find(ctx context.Context, q *Query) ([]*Document, int, error) {
-	e := c.db.e
-	if err := e.enter(); err != nil {
-		return nil, 0, err
-	}
-	defer e.exit()
-	if q == nil {
-		q = &Query{}
-	}
-	skip := max(q.Skip, 0)
-	limit := max(q.Limit, 0)
-
-	ids, err := c.candidates(q.Filters)
-	if err != nil {
-		return nil, 0, err
-	}
-	out := make([]*Document, 0)
-	matched, examined := 0, 0
-	for _, id := range ids {
-		if examined%findCtxCheckEvery == 0 {
-			if err := ctx.Err(); err != nil {
-				return nil, examined, err
-			}
-		}
-		examined++
-		doc, owned, err := c.current(id)
-		if err != nil {
-			return nil, examined, err
-		}
-		if doc == nil || !matchesAll(doc, q.Filters) {
-			continue // deleted since the candidates were taken, or no match
-		}
-		matched++
-		if matched <= skip {
-			continue
-		}
-		if !owned {
-			doc = doc.Clone()
-		}
-		out = append(out, doc)
-		if limit > 0 && len(out) == limit {
-			break
-		}
-	}
-	return out, examined, nil
-}
-
-// matchesAll reports whether doc satisfies every filter.
-func matchesAll(doc *Document, filters []QueryFilter) bool {
-	for _, f := range filters {
-		if !matchesFilter(doc, f) {
-			return false
-		}
-	}
-	return true
-}
-
 // candidates returns, sorted, the ids Find must examine for filters: the
-// smallest candidate set among eq filters on _id or on an indexed field
-// with an indexable value, otherwise every live id.
+// smallest candidate set among eq filters on _id and the index-backed
+// filters on an indexed field (eq and has with an indexable value; has_any,
+// the union of its values' sets; has_all, their intersection), otherwise
+// every live id. Candidates are a superset of the matches: Find re-checks
+// every filter.
 func (c *Collection) candidates(filters []QueryFilter) ([]string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.dropped {
 		return nil, c.errDropped()
 	}
+	if ids, ok := c.indexedCandidatesLocked(filters); ok {
+		return ids, nil
+	}
+	return c.liveIDsLocked(), nil
+}
+
+// indexedCandidatesLocked returns the smallest index-backed candidate set
+// for filters (see candidates), or false if no filter can use an index.
+// Callers hold mu.
+func (c *Collection) indexedCandidatesLocked(filters []QueryFilter) ([]string, bool) {
 	var best []string
 	found := false
 	for _, f := range filters {
-		if f.Operator != "eq" {
-			continue
-		}
-		var ids []string
-		switch {
-		case f.Field == "_id":
-			// The keydir/memtable are the primary index. A non-string
-			// value equals no id.
-			if s, ok := f.Value.(string); ok {
-				ids = []string{s}
-			}
-		default:
-			if _, ok := indexKey(f.Value); !ok {
-				continue // objects/arrays/NaN: not indexed, scan
-			}
-			ix := c.indexOnLocked(f.Field)
-			if ix == nil {
-				continue
-			}
-			ids = ix.lookup(f.Value)
-		}
-		if !found || len(ids) < len(best) {
+		ids, ok := c.filterCandidatesLocked(f)
+		if ok && (!found || len(ids) < len(best)) {
 			best, found = ids, true
 		}
 	}
-	if found {
-		return best, nil
+	return best, found
+}
+
+// filterCandidatesLocked returns the sorted ids that may match f through
+// the primary key or a secondary index, or false if f cannot use one.
+// Callers hold mu.
+func (c *Collection) filterCandidatesLocked(f QueryFilter) ([]string, bool) {
+	if f.Field == "_id" {
+		if f.Operator != "eq" {
+			return nil, false
+		}
+		// The keydir/memtable are the primary index. A non-string value
+		// equals no id.
+		if s, ok := f.Value.(string); ok {
+			return []string{s}, true
+		}
+		return nil, true
 	}
-	return c.liveIDsLocked(), nil
+	switch f.Operator {
+	case "eq", "has", "has_any", "has_all":
+	default:
+		return nil, false
+	}
+	ix := c.indexOnLocked(f.Field)
+	if ix == nil {
+		return nil, false
+	}
+	switch f.Operator {
+	case "has_any":
+		vals, ok := listValues(f.Value)
+		if !ok {
+			return nil, true // matches nothing
+		}
+		return ix.lookupAny(vals)
+	case "has_all":
+		vals, ok := listValues(f.Value)
+		if !ok {
+			return nil, true // matches nothing
+		}
+		return ix.lookupAll(vals)
+	default: // eq, has
+		if _, ok := indexKey(f.Value); !ok {
+			return nil, false // objects/arrays/NaN: not indexed, scan
+		}
+		return ix.lookup(f.Value), true
+	}
 }
 
 // indexOnLocked returns an index on field (the one with the smallest name

@@ -17,6 +17,7 @@ const (
 	hookAfterSegSync      hookPoint = "after-segment-fsync-before-keydir" // flush (task 10)
 	hookCompactBeforeSwap hookPoint = "compaction-before-swap"            // compaction (task 12)
 	hookMetaWrite         hookPoint = "during-meta-write"                 // metadata ops: after the WAL append, before the meta file change
+	hookRenameDir         hookPoint = "rename-after-dir-before-meta"      // rename_collection: after the directory rename, before coll.meta (plan 004)
 )
 
 // errSimulatedCrash is returned (possibly wrapped) by hook when the test

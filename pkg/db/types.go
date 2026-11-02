@@ -38,16 +38,42 @@ type Schema struct {
 
 // QueryFilter represents a query filter
 type QueryFilter struct {
-	Field    string `json:"field"`
-	Operator string `json:"operator"` // "eq", "ne", "gt", "lt", "gte", "lte", "in"
+	Field string `json:"field"`
+	// Operator is one of "eq", "ne", "gt", "gte", "lt", "lte", "in",
+	// "contains", "has", "has_any", "has_all".
+	Operator string `json:"operator"`
 	Value    any    `json:"value"`
 }
 
-// Query represents a query
+// Query represents a query. A document matches when it matches every
+// filter of Filters and, if Any is not empty, every filter of at least one
+// of its groups.
 type Query struct {
-	Filters []QueryFilter `json:"filters"`
-	Limit   int           `json:"limit"`
-	Skip    int           `json:"skip"`
+	Filters []QueryFilter   `json:"filters"`
+	Any     [][]QueryFilter `json:"any,omitempty"`    // OR of AND groups; empty = no constraint
+	Fields  []string        `json:"fields,omitempty"` // projection: top-level fields to return (_id always); empty = all
+	Sort    []SortKey       `json:"sort,omitempty"`   // sort keys in order, then _id ascending; empty = _id ascending
+	Limit   int             `json:"limit"`
+	Skip    int             `json:"skip"`
+}
+
+// SortKey is one sort key of a Query.
+type SortKey struct {
+	Field string `json:"field"`
+	Order string `json:"order,omitempty"` // "asc" (default) or "desc"
+}
+
+// Condition is the "if" of a conditional write: filters, with the same
+// shape and operators as Query.Filters, that the stored document must all
+// match for the write to happen (plan 004 §1.2).
+type Condition = []QueryFilter
+
+// UpdateSpec describes an update for Collection.UpdateWith.
+type UpdateSpec struct {
+	Set    map[string]any // top-level fields to replace or add
+	Unset  []string       // top-level fields to remove (after Set)
+	If     Condition      // the stored version must match all of these
+	Upsert bool           // create {_id: id} + Set if the document is missing
 }
 
 // MarshalJSON customizes JSON marshaling for Document

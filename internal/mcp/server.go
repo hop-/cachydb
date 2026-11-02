@@ -257,6 +257,11 @@ func (s *Server) httpHandler() http.Handler {
 	return mux
 }
 
+// HTTPHandler returns the HTTP handler the http transport serves: the
+// Streamable HTTP transport at /mcp and the health endpoint at /healthz.
+// It lets callers (and tests) serve the server on their own listener.
+func (s *Server) HTTPHandler() http.Handler { return s.httpHandler() }
+
 // healthResponse is the body of GET /healthz.
 type healthResponse struct {
 	Status  string `json:"status"`
@@ -356,6 +361,8 @@ func toolError(action string, err error) error {
 		return fmt.Errorf("%s: %w (hint: list_databases and list_collections show what exists; current_database shows the database used when none is given)", action, err)
 	case errors.Is(err, db.ErrSchemaValidation):
 		return fmt.Errorf("%s: %w (hint: see resource cachydb://docs/schema)", action, err)
+	case errors.Is(err, db.ErrConditionFailed):
+		return fmt.Errorf("%s: %w; re-read it and retry", action, err)
 	case errors.Is(err, db.ErrExists), errors.Is(err, db.ErrInvalidName):
 		// The engine message names the object and the rule.
 		return fmt.Errorf("%s: %w", action, err)
@@ -508,17 +515,65 @@ func (s *Server) insertDocumentTool(ctx context.Context, req *mcp.CallToolReques
 	return nil, InsertDocumentOutput{Success: true, ID: id, Message: fmt.Sprintf("Document inserted with ID: %s", id)}, nil
 }
 
+// toDBFilters converts filters to engine filters.
+func toDBFilters(in []Filter) []db.QueryFilter {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]db.QueryFilter, len(in))
+	for i, f := range in {
+		out[i] = db.QueryFilter{Field: f.Field, Operator: string(f.Operator), Value: f.Value}
+	}
+	return out
+}
+
+// toDBGroups converts OR groups to engine filter groups.
+func toDBGroups(in [][]Filter) [][]db.QueryFilter {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([][]db.QueryFilter, len(in))
+	for i, g := range in {
+		out[i] = toDBFilters(g)
+		if out[i] == nil {
+			out[i] = []db.QueryFilter{}
+		}
+	}
+	return out
+}
+
 // toDBQuery converts the find_documents query argument to a *db.Query.
 func toDBQuery(in *Query) *db.Query {
 	q := &db.Query{}
 	if in == nil {
 		return q
 	}
-	for _, f := range in.Filters {
-		q.Filters = append(q.Filters, db.QueryFilter{Field: f.Field, Operator: string(f.Operator), Value: f.Value})
+	q.Filters = toDBFilters(in.Filters)
+	q.Any = toDBGroups(in.Any)
+	q.Fields = in.Fields
+	for _, k := range in.Sort {
+		q.Sort = append(q.Sort, db.SortKey{Field: k.Field, Order: string(k.Order)})
 	}
 	q.Limit, q.Skip = in.Limit, in.Skip
 	return q
+}
+
+// toDBMatchQuery converts a count_documents or distinct query.
+func toDBMatchQuery(in *MatchQuery) *db.Query {
+	if in == nil {
+		return &db.Query{}
+	}
+	return &db.Query{Filters: toDBFilters(in.Filters), Any: toDBGroups(in.Any)}
+}
+
+// docMap returns doc as a flat object with its _id.
+func docMap(doc *db.Document) map[string]any {
+	m := make(map[string]any, len(doc.Data)+1)
+	for k, v := range doc.Data {
+		m[k] = v
+	}
+	m["_id"] = doc.ID
+	return m
 }
 
 func (s *Server) findDocumentsTool(ctx context.Context, req *mcp.CallToolRequest, in FindDocumentsInput) (*mcp.CallToolResult, FindDocumentsOutput, error) {
@@ -533,25 +588,79 @@ func (s *Server) findDocumentsTool(ctx context.Context, req *mcp.CallToolRequest
 
 	out := make([]map[string]any, len(docs))
 	for i, doc := range docs {
-		m := make(map[string]any, len(doc.Data)+1)
-		for k, v := range doc.Data {
-			m[k] = v
-		}
-		m["_id"] = doc.ID
-		out[i] = m
+		out[i] = docMap(doc)
 	}
 	return nil, FindDocumentsOutput{Success: true, Count: len(docs), Documents: out}, nil
 }
 
-func (s *Server) updateDocumentTool(ctx context.Context, req *mcp.CallToolRequest, in UpdateDocumentInput) (*mcp.CallToolResult, MessageOutput, error) {
+func (s *Server) countDocumentsTool(ctx context.Context, req *mcp.CallToolRequest, in CountDocumentsInput) (*mcp.CallToolResult, CountDocumentsOutput, error) {
+	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "count documents")
+	if err != nil {
+		return nil, CountDocumentsOutput{}, err
+	}
+	n, err := coll.CountDocuments(ctx, toDBMatchQuery(in.Query))
+	if err != nil {
+		return nil, CountDocumentsOutput{}, toolError("count documents", err)
+	}
+	return nil, CountDocumentsOutput{Success: true, Count: n}, nil
+}
+
+func (s *Server) distinctTool(ctx context.Context, req *mcp.CallToolRequest, in DistinctInput) (*mcp.CallToolResult, DistinctOutput, error) {
+	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "distinct")
+	if err != nil {
+		return nil, DistinctOutput{}, err
+	}
+	vals, err := coll.Distinct(ctx, in.Field, toDBMatchQuery(in.Query))
+	if err != nil {
+		return nil, DistinctOutput{}, toolError("distinct", err)
+	}
+	if vals == nil {
+		vals = []any{}
+	}
+	return nil, DistinctOutput{Success: true, Values: vals}, nil
+}
+
+func (s *Server) updateDocumentTool(ctx context.Context, req *mcp.CallToolRequest, in UpdateDocumentInput) (*mcp.CallToolResult, UpdateDocumentOutput, error) {
 	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "update document")
+	if err != nil {
+		return nil, UpdateDocumentOutput{}, err
+	}
+	if in.Updates == nil && len(in.Unset) == 0 {
+		return nil, UpdateDocumentOutput{}, errors.New("update document: give updates, unset, or both")
+	}
+	_, upserted, err := coll.UpdateWith(ctx, in.ID, db.UpdateSpec{
+		Set: in.Updates, Unset: in.Unset, If: toDBFilters(in.If), Upsert: in.Upsert,
+	})
+	if err != nil {
+		return nil, UpdateDocumentOutput{}, toolError("update document", err)
+	}
+	msg := fmt.Sprintf("Document %s updated", in.ID)
+	if upserted {
+		msg = fmt.Sprintf("Document %s created (upsert)", in.ID)
+	}
+	return nil, UpdateDocumentOutput{Success: true, Message: msg, Upserted: upserted}, nil
+}
+
+func (s *Server) replaceDocumentTool(ctx context.Context, req *mcp.CallToolRequest, in ReplaceDocumentInput) (*mcp.CallToolResult, MessageOutput, error) {
+	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "replace document")
 	if err != nil {
 		return nil, MessageOutput{}, err
 	}
-	if _, err := coll.Update(ctx, in.ID, in.Updates); err != nil {
-		return nil, MessageOutput{}, toolError("update document", err)
+	doc := &db.Document{ID: in.ID, Data: make(map[string]any, len(in.Document))}
+	for k, v := range in.Document {
+		if k == "_id" {
+			if id, ok := v.(string); !ok || id != in.ID {
+				return nil, MessageOutput{}, toolError("replace document",
+					fmt.Errorf("%w: document _id %v differs from id %q", db.ErrSchemaValidation, v, in.ID))
+			}
+			continue
+		}
+		doc.Data[k] = v
 	}
-	return nil, MessageOutput{Success: true, Message: fmt.Sprintf("Document %s updated", in.ID)}, nil
+	if _, err := coll.Replace(ctx, in.ID, doc, toDBFilters(in.If)); err != nil {
+		return nil, MessageOutput{}, toolError("replace document", err)
+	}
+	return nil, MessageOutput{Success: true, Message: fmt.Sprintf("Document %s replaced", in.ID)}, nil
 }
 
 func (s *Server) deleteDocumentTool(ctx context.Context, req *mcp.CallToolRequest, in DeleteDocumentInput) (*mcp.CallToolResult, MessageOutput, error) {
@@ -559,10 +668,108 @@ func (s *Server) deleteDocumentTool(ctx context.Context, req *mcp.CallToolReques
 	if err != nil {
 		return nil, MessageOutput{}, err
 	}
-	if err := coll.Delete(ctx, in.ID); err != nil {
+	if err := coll.DeleteWith(ctx, in.ID, toDBFilters(in.If)); err != nil {
 		return nil, MessageOutput{}, toolError("delete document", err)
 	}
 	return nil, MessageOutput{Success: true, Message: fmt.Sprintf("Document %s deleted", in.ID)}, nil
+}
+
+// fromDBSchema converts a *db.Schema to the tool schema type (nil for a
+// schemaless collection).
+func fromDBSchema(in *db.Schema) *SchemaDef {
+	if in == nil {
+		return nil
+	}
+	out := &SchemaDef{Fields: make(map[string]FieldDef, len(in.Fields))}
+	for name, f := range in.Fields {
+		out.Fields[name] = FieldDef{Type: FieldType(f.Type), Required: f.Required}
+	}
+	return out
+}
+
+func (s *Server) describeCollectionTool(_ context.Context, req *mcp.CallToolRequest, in DescribeCollectionInput) (*mcp.CallToolResult, DescribeCollectionOutput, error) {
+	dbName := s.databaseName(req.Session, in.Database)
+	coll, err := s.getCollection(req.Session, dbName, in.Collection, "describe collection")
+	if err != nil {
+		return nil, DescribeCollectionOutput{}, err
+	}
+	indexes := make([]IndexDesc, 0)
+	for _, ix := range coll.Indexes() {
+		indexes = append(indexes, IndexDesc{Name: ix.Name, Field: ix.Field})
+	}
+	return nil, DescribeCollectionOutput{
+		Success:  true,
+		Database: dbName,
+		Name:     coll.Name(),
+		Schema:   fromDBSchema(coll.Schema()),
+		Indexes:  indexes,
+		Count:    coll.Count(),
+	}, nil
+}
+
+func (s *Server) updateSchemaTool(ctx context.Context, req *mcp.CallToolRequest, in UpdateSchemaInput) (*mcp.CallToolResult, MessageOutput, error) {
+	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "update schema")
+	if err != nil {
+		return nil, MessageOutput{}, err
+	}
+	if err := coll.UpdateSchema(ctx, toDBSchema(in.Schema)); err != nil {
+		return nil, MessageOutput{}, toolError("update schema", err)
+	}
+	msg := fmt.Sprintf("Schema of collection '%s' updated", in.Collection)
+	if in.Schema == nil {
+		msg = fmt.Sprintf("Schema of collection '%s' removed", in.Collection)
+	}
+	return nil, MessageOutput{Success: true, Message: msg}, nil
+}
+
+func (s *Server) renameCollectionTool(ctx context.Context, req *mcp.CallToolRequest, in RenameCollectionInput) (*mcp.CallToolResult, MessageOutput, error) {
+	database, err := s.engine.Database(s.databaseName(req.Session, in.Database))
+	if err != nil {
+		return nil, MessageOutput{}, toolError("rename collection", err)
+	}
+	if err := database.RenameCollection(ctx, in.Collection, in.NewName); err != nil {
+		return nil, MessageOutput{}, toolError("rename collection", err)
+	}
+	return nil, MessageOutput{
+		Success: true,
+		Message: fmt.Sprintf("Collection '%s' renamed to '%s' in database '%s'", in.Collection, in.NewName, database.Name()),
+	}, nil
+}
+
+func (s *Server) copyCollectionTool(ctx context.Context, req *mcp.CallToolRequest, in CopyCollectionInput) (*mcp.CallToolResult, CopyCollectionOutput, error) {
+	database, err := s.engine.Database(s.databaseName(req.Session, in.Database))
+	if err != nil {
+		return nil, CopyCollectionOutput{}, toolError("copy collection", err)
+	}
+	target := database
+	if in.TargetDatabase != "" {
+		if target, err = s.engine.Database(in.TargetDatabase); err != nil {
+			return nil, CopyCollectionOutput{}, toolError("copy collection", err)
+		}
+	}
+	n, err := database.CopyCollection(ctx, in.Collection, in.NewName, target)
+	if err != nil {
+		return nil, CopyCollectionOutput{}, toolError("copy collection", err)
+	}
+	return nil, CopyCollectionOutput{
+		Success: true,
+		Message: fmt.Sprintf("Copied %d documents from '%s/%s' to '%s/%s'", n, database.Name(), in.Collection, target.Name(), in.NewName),
+		Copied:  n,
+	}, nil
+}
+
+func (s *Server) deleteCollectionTool(ctx context.Context, req *mcp.CallToolRequest, in DeleteCollectionInput) (*mcp.CallToolResult, MessageOutput, error) {
+	database, err := s.engine.Database(s.databaseName(req.Session, in.Database))
+	if err != nil {
+		return nil, MessageOutput{}, toolError("delete collection", err)
+	}
+	if err := database.DropCollection(ctx, in.Collection); err != nil {
+		return nil, MessageOutput{}, toolError("delete collection", err)
+	}
+	return nil, MessageOutput{
+		Success: true,
+		Message: fmt.Sprintf("Collection '%s' deleted from database '%s'", in.Collection, database.Name()),
+	}, nil
 }
 
 func (s *Server) createIndexTool(ctx context.Context, req *mcp.CallToolRequest, in CreateIndexInput) (*mcp.CallToolResult, MessageOutput, error) {
@@ -577,4 +784,15 @@ func (s *Server) createIndexTool(ctx context.Context, req *mcp.CallToolRequest, 
 		Success: true,
 		Message: fmt.Sprintf("Index '%s' created on field '%s'", in.IndexName, in.FieldName),
 	}, nil
+}
+
+func (s *Server) dropIndexTool(ctx context.Context, req *mcp.CallToolRequest, in DropIndexInput) (*mcp.CallToolResult, MessageOutput, error) {
+	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "drop index")
+	if err != nil {
+		return nil, MessageOutput{}, err
+	}
+	if err := coll.DropIndex(ctx, in.IndexName); err != nil {
+		return nil, MessageOutput{}, toolError("drop index", err)
+	}
+	return nil, MessageOutput{Success: true, Message: fmt.Sprintf("Index '%s' dropped", in.IndexName)}, nil
 }

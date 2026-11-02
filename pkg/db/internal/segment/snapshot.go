@@ -13,7 +13,9 @@ import (
 )
 
 // Index snapshot layout (§8), inside the sidecar framing (sidecar.go) with
-// magic "CDBI":
+// magic "CDBI" and version snapshotVersion. Keys are the engine's canonical
+// index keys; since version 2 an array value contributes one key per
+// indexable element.
 //
 //	u16 len · name      index name, must match the file name
 //	u16 len · field     indexed field
@@ -100,7 +102,7 @@ func WriteIndexSnapshot(dir string, s *IndexSnapshot) error {
 	}
 	slices.Sort(keys)
 
-	buf := newSidecar(snapshotMagic, size)
+	buf := newSidecar(snapshotMagic, snapshotVersion, size)
 	buf = appendString(buf, s.Name)
 	buf = appendString(buf, s.Field)
 	buf = binary.LittleEndian.AppendUint32(buf, s.CoversSeg)
@@ -131,7 +133,7 @@ func ReadIndexSnapshot(dir, name string) (*IndexSnapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	body, err := readSidecar(path, snapshotMagic)
+	body, err := readSidecar(path, snapshotMagic, snapshotVersion)
 	if err != nil {
 		return nil, err
 	}

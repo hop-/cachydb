@@ -289,6 +289,14 @@ func TestReadFromSurvivesConcurrentRetention(t *testing.T) {
 	env, clock, _ := retentionEnv(t, 0, 1)
 	l := env.mustOpen(t, nil)
 	appendHourly(t, l, clock, 1, 11) // segments 1,3,5,7,9 sealed, 11 active
+	// The rotations left a signal pending; drop it so the background pass
+	// it would trigger cannot run before or between the reads below and
+	// delete what they are about to read (only the explicit passes inside
+	// the reads are under test). Without this the test failed under load.
+	select {
+	case <-l.rotated:
+	default:
+	}
 	l.StartRetention(l.NextOffset)
 
 	// A pass started while ReadFrom(1) runs deletes nothing it still needs.

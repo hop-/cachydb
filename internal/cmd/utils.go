@@ -15,13 +15,19 @@ import (
 var utilsCmd = &cobra.Command{
 	Use:   "utils",
 	Short: "Utility commands for database maintenance and management",
-	Long: `Utility commands for database maintenance: listing databases and
-running schema migrations.
+	Long: `Utility commands for offline work on a data directory: listing
+databases, schema migrations, JSON Lines export and import, and reading
+documents (find, get).
 
 Utility commands open the database engine and take the data-directory
-lock, so they fail while a cachydb server is running on the same directory.`,
+lock, so they fail while a cachydb server is running on the same
+directory. Use "cachydb client" to do the same through a running HTTP
+server.`,
 	Example: `  cachydb utils list -c -R /path/to/data
-  cachydb utils migrate --list`,
+  cachydb utils migrate --list
+  cachydb utils export -d kb -o kb.jsonl
+  cachydb utils import -i kb.jsonl -R /new/data
+  cachydb utils find -d kb -c notes --query '{"filters":[{"field":"tags","operator":"has","value":"wal"}]}'`,
 }
 
 func init() {

@@ -13,8 +13,8 @@ import (
 // Metadata checkpoint (plan 002, C4).
 //
 // The root file cachydb.metacp holds {"offset": N}: every metadata WAL
-// record (create/drop database, create/drop collection, create/drop
-// index) at or below N is reflected in the meta files and directories.
+// record (create/drop database, create/drop/rename collection,
+// create/drop index, update schema) at or below N is reflected in the meta files and directories.
 // Replay then starts at min(N+1, every collection's replay floor + 1)
 // instead of one past the oldest meta file's wal_offset, so Open does not
 // re-read the whole kept WAL since the oldest database was created.

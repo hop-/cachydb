@@ -3,9 +3,12 @@ package db
 import (
 	"cmp"
 	"encoding/json"
+	"maps"
 	"math"
 	"reflect"
+	"slices"
 	"strings"
+	"time"
 )
 
 // Query semantics (R5). Values are compared by type, never through their
@@ -137,7 +140,17 @@ func normalize(v any) any {
 // matchesFilter reports whether doc satisfies f. A document that lacks the
 // filtered field matches no operator. Unknown operators match nothing. For
 // "in", f.Value must be a slice or array; the document matches when its
-// value equals any element.
+// value equals any element. The element operators (plan 004 §2.2) are:
+//
+//   - contains: a string field contains f.Value (a string),
+//     case-insensitively; an array field has a string element that does;
+//   - has: an array field has an element equal to f.Value;
+//   - has_any: an array field has an element equal to some value of the
+//     array f.Value;
+//   - has_all: every value of the array f.Value equals some element of
+//     an array field.
+//
+// eq, ne, and in compare arrays as whole values.
 func matchesFilter(doc *Document, f QueryFilter) bool {
 	value, exists := doc.GetValue(f.Field)
 	if !exists {
@@ -162,19 +175,264 @@ func matchesFilter(doc *Document, f QueryFilter) bool {
 		c, ok := compare(value, f.Value)
 		return ok && c <= 0
 	case "in":
-		if f.Value == nil {
+		vals, ok := listValues(f.Value)
+		if !ok {
 			return false
 		}
-		rv := reflect.ValueOf(f.Value)
-		if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
-			return false
-		}
-		for i := range rv.Len() {
-			if valuesEqual(value, rv.Index(i).Interface()) {
+		for _, v := range vals {
+			if valuesEqual(value, v) {
 				return true
 			}
 		}
 		return false
+	case "contains":
+		return matchContains(value, f.Value)
+	case "has":
+		elems, ok := listValues(value)
+		return ok && containsEqual(elems, f.Value)
+	case "has_any":
+		elems, ok := listValues(value)
+		want, wok := listValues(f.Value)
+		if !ok || !wok {
+			return false
+		}
+		for _, w := range want {
+			if containsEqual(elems, w) {
+				return true
+			}
+		}
+		return false
+	case "has_all":
+		elems, ok := listValues(value)
+		want, wok := listValues(f.Value)
+		if !ok || !wok {
+			return false
+		}
+		for _, w := range want {
+			if !containsEqual(elems, w) {
+				return false
+			}
+		}
+		return true
 	}
 	return false
+}
+
+// matchContains implements "contains": value is a string containing sub
+// case-insensitively, or an array with such a string element. sub must be
+// a string; the empty string matches every string and array field.
+func matchContains(value, sub any) bool {
+	s, ok := sub.(string)
+	if !ok {
+		return false
+	}
+	s = strings.ToLower(s)
+	if v, ok := value.(string); ok {
+		return strings.Contains(strings.ToLower(v), s)
+	}
+	elems, ok := listValues(value)
+	if !ok {
+		return false
+	}
+	if s == "" {
+		return true
+	}
+	for _, e := range elems {
+		if v, ok := e.(string); ok && strings.Contains(strings.ToLower(v), s) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsEqual reports whether some element of elems equals v.
+func containsEqual(elems []any, v any) bool {
+	for _, e := range elems {
+		if valuesEqual(e, v) {
+			return true
+		}
+	}
+	return false
+}
+
+// listValues returns the elements of v if it is a slice or array (but not
+// a byte string), or false.
+func listValues(v any) ([]any, bool) {
+	switch t := v.(type) {
+	case nil:
+		return nil, false
+	case []any:
+		return t, true
+	case []byte:
+		return nil, false
+	}
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
+		return nil, false
+	}
+	out := make([]any, rv.Len())
+	for i := range out {
+		out[i] = rv.Index(i).Interface()
+	}
+	return out, true
+}
+
+// matchesAll reports whether doc satisfies every filter.
+func matchesAll(doc *Document, filters []QueryFilter) bool {
+	for _, f := range filters {
+		if !matchesFilter(doc, f) {
+			return false
+		}
+	}
+	return true
+}
+
+// matchesQuery reports whether doc matches every filter of filters and,
+// when anyOf is not empty, every filter of at least one of its groups
+// (plan 004 §2.1).
+func matchesQuery(doc *Document, filters []QueryFilter, anyOf [][]QueryFilter) bool {
+	if !matchesAll(doc, filters) {
+		return false
+	}
+	if len(anyOf) == 0 {
+		return true
+	}
+	for _, g := range anyOf {
+		if matchesAll(doc, g) {
+			return true
+		}
+	}
+	return false
+}
+
+// $now values (plan 004 §1.1). In document data and in filter values, a
+// value that is exactly the object {"$now": true} stands for the server's
+// current time, as an RFC 3339 UTC string with nanoseconds. Any other
+// object with a "$now" key is ordinary data.
+
+// nowKey is the only key of a $now value.
+const nowKey = "$now"
+
+// isNowValue reports whether v is exactly {"$now": true}.
+func isNowValue(v any) bool {
+	m, ok := v.(map[string]any)
+	if !ok || len(m) != 1 {
+		return false
+	}
+	b, ok := m[nowKey].(bool)
+	return ok && b
+}
+
+// nowString formats now the way $now values are stored.
+func nowString(now time.Time) string { return now.UTC().Format(time.RFC3339Nano) }
+
+// ResolveNow returns v with every {"$now": true} value, at any depth in
+// objects ([map[string]any]) and arrays ([]any), replaced by now formatted
+// as an RFC 3339 UTC string with nanoseconds. v is not modified: the parts
+// that change are copied, the rest is shared. The engine applies it to
+// document data and filter values itself; callers use it to resolve
+// values the same way.
+func ResolveNow(v any, now time.Time) any {
+	out, _ := resolveNow(v, nowString(now))
+	return out
+}
+
+// resolveNow replaces $now values in v with ts and reports whether it
+// replaced any. Unchanged subtrees are returned as they are.
+func resolveNow(v any, ts string) (any, bool) {
+	switch t := v.(type) {
+	case map[string]any:
+		if isNowValue(t) {
+			return ts, true
+		}
+		var out map[string]any
+		for k, x := range t {
+			nx, changed := resolveNow(x, ts)
+			if !changed {
+				continue
+			}
+			if out == nil {
+				out = maps.Clone(t)
+			}
+			out[k] = nx
+		}
+		if out == nil {
+			return v, false
+		}
+		return out, true
+	case []any:
+		var out []any
+		for i, x := range t {
+			nx, changed := resolveNow(x, ts)
+			if !changed {
+				continue
+			}
+			if out == nil {
+				out = slices.Clone(t)
+			}
+			out[i] = nx
+		}
+		if out == nil {
+			return v, false
+		}
+		return out, true
+	}
+	return v, false
+}
+
+// resolveNowData returns data with its $now values replaced by ts (data
+// itself when it has none).
+func resolveNowData(data map[string]any, ts string) map[string]any {
+	if data == nil {
+		return nil
+	}
+	out, _ := resolveNow(data, ts)
+	return out.(map[string]any)
+}
+
+// resolveNowFilters returns filters with $now filter values replaced by
+// ts (filters itself when there are none).
+func resolveNowFilters(filters []QueryFilter, ts string) []QueryFilter {
+	out, _ := resolveNowFiltersChanged(filters, ts)
+	return out
+}
+
+// resolveNowFiltersChanged is resolveNowFilters that also reports whether
+// it replaced anything.
+func resolveNowFiltersChanged(filters []QueryFilter, ts string) ([]QueryFilter, bool) {
+	var out []QueryFilter
+	for i, f := range filters {
+		v, changed := resolveNow(f.Value, ts)
+		if !changed {
+			continue
+		}
+		if out == nil {
+			out = slices.Clone(filters)
+		}
+		out[i].Value = v
+	}
+	if out == nil {
+		return filters, false
+	}
+	return out, true
+}
+
+// resolveNowGroups returns groups with their $now filter values replaced
+// by ts (groups itself when there are none).
+func resolveNowGroups(groups [][]QueryFilter, ts string) [][]QueryFilter {
+	var out [][]QueryFilter
+	for i, g := range groups {
+		r, changed := resolveNowFiltersChanged(g, ts)
+		if !changed {
+			continue
+		}
+		if out == nil {
+			out = slices.Clone(groups)
+		}
+		out[i] = r
+	}
+	if out == nil {
+		return groups
+	}
+	return out
 }

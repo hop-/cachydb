@@ -72,7 +72,7 @@ transport has no health endpoint.
 
 1. `app.Builder.Build` opens the engine (`db.Open`: lock, recovery).
 2. `NewServer(ctx, engine, defaultDBName, transport, httpAddr, version)`
-   creates the default database if missing, registers the 12 tools and the
+   creates the default database if missing, registers the 21 tools and the
    8 docs resources, and sets the server instructions and the
    implementation version (the build version, from `cmd.getVersion`).
 3. `Server.Start(ctx)` runs the transport until `ctx` is cancelled
@@ -94,27 +94,29 @@ resolves its database in this order:
 2. the session's `use_database` choice;
 3. the server default (`main`).
 
-## Tools (12)
+## Tools (21)
 
 Tools are defined once in `internal/mcp/tools.go` (`toolSpecs`): name,
 description, annotations, typed input and output structs, and an example
 call. `registerTools` registers exactly these, and `ToolDefinitions()`
 returns them without an engine for the generated docs. The input and
 output schemas are generated with `jsonschema.For` from the structs' `json`
-and `jsonschema` tags; `Operator` and `FieldType` map to string enums
-(`Operators`, `FieldTypes`). The SDK validates arguments against the input
-schema, returns the typed output as structured content and as JSON text
-content, and validates it against the output schema. Every successful
-result has `"success": true`.
+and `jsonschema` tags; `Operator`, `FieldType`, and `SortOrder` map to
+string enums (`Operators`, `FieldTypes`, `SortOrders`). The SDK validates
+arguments against the input schema, returns the typed output as structured
+content and as JSON text content, and validates it against the output
+schema. Every successful result has `"success": true`. Plan 004 added nine
+tools and optional parameters; every change is additive (existing calls
+and outputs are unchanged, outputs only gained keys).
 
 Annotations (all tools also set `openWorldHint: false` and a title):
 
 | Tool(s) | readOnly | destructive | idempotent |
 |---------|----------|-------------|------------|
-| `list_databases`, `list_collections`, `find_documents`, `current_database` | true | — | true |
-| `create_database`, `use_database` | false | false | true |
-| `create_collection`, `insert_document`, `create_index`, `update_document` | false | false | false |
-| `delete_document`, `delete_database` | false | true | true |
+| `list_databases`, `list_collections`, `find_documents`, `current_database`, `count_documents`, `distinct`, `describe_collection` | true | — | true |
+| `create_database`, `use_database`, `replace_document`, `update_schema` | false | false | true |
+| `create_collection`, `insert_document`, `create_index`, `update_document`, `rename_collection`, `copy_collection` | false | false | false |
+| `delete_document`, `delete_database`, `delete_collection`, `drop_index` | false | true | true |
 
 | Tool | Arguments | Result fields |
 |------|-----------|---------------|
@@ -125,15 +127,26 @@ Annotations (all tools also set `openWorldHint: false` and a title):
 | `current_database` | — | `current_database` (session choice or default) |
 | `create_collection` | `name`, `database`?, `schema`? | `message` |
 | `list_collections` | `database`? | `collections` (sorted; `[]` when empty), `database` |
+| `describe_collection` | `collection`, `database`? | `database`, `name`, `schema` (or null), `indexes` [`{name, field}`, sorted], `count` |
+| `update_schema` | `collection`, `schema` (object or null), `database`? | `message` |
+| `rename_collection` | `collection`, `new_name`, `database`? | `message` |
+| `copy_collection` | `collection`, `new_name`, `target_database`?, `database`? | `message`, `copied` |
+| `delete_collection` | `collection`, `database`? | `message` (`ErrNotFound` if missing) |
 | `insert_document` | `collection`, `document`, `database`? | `id`, `message` |
 | `find_documents` | `collection`, `query`?, `database`? | `count`, `documents` |
-| `update_document` | `collection`, `id`, `updates`, `database`? | `message` |
-| `delete_document` | `collection`, `id`, `database`? | `message` |
+| `count_documents` | `collection`, `query`? (`filters`, `any`), `database`? | `count` |
+| `distinct` | `collection`, `field`, `query`? (`filters`, `any`), `database`? | `values` |
+| `update_document` | `collection`, `id`, `updates`?, `unset`?, `if`?, `upsert`?, `database`? | `message`, `upserted` |
+| `replace_document` | `collection`, `id`, `document`, `if`?, `database`? | `message` |
+| `delete_document` | `collection`, `id`, `if`?, `database`? | `message` |
 | `create_index` | `collection`, `index_name`, `field_name`, `database`? | `message` |
+| `drop_index` | `collection`, `index_name`, `database`? | `message` (`ErrNotFound` if missing) |
 
-`?` = optional. There are no tools to drop a collection or an index; the
-engine supports both (`DropCollection`, `DropIndex`) but they are not
-exposed.
+`?` = optional. Handlers are thin: each resolves the database (see
+above) and calls one engine method (`UpdateWith`, `Replace`,
+`DeleteWith`, `CountDocuments`, `Distinct`, `Schema`/`Indexes`/`Count`,
+`UpdateSchema`, `RenameCollection`, `CopyCollection`, `DropCollection`,
+`DropIndex`).
 
 ### `create_collection` schema
 
@@ -151,7 +164,8 @@ exposed.
 
 Types: `string`, `number`, `boolean`, `object`, `array`, `date`. Omit
 `schema` for a schemaless collection. Names (databases, collections,
-indexes) must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.
+indexes) must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`. `update_schema`
+changes it later (every document is checked first).
 
 ### `insert_document`
 
@@ -159,47 +173,62 @@ indexes) must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.
 document id; without one a UUID is generated. A non-string `_id` is
 rejected (schema validation error). Numbers are stored as JSON numbers:
 clients read `28` back as `28`, while Go library callers get `float64`.
+`{"$now": true}` values (any depth) become the server time.
 
 ### `find_documents`
 
-Filters, limit, and skip are nested under `query`:
+Filters, OR groups, projection, sort, limit, and skip are nested under
+`query`:
 
 ```json
 {
-  "collection": "users",
+  "collection": "notes",
   "query": {
-    "filters": [
-      { "field": "age",    "operator": "gte", "value": 18 },
-      { "field": "status", "operator": "in",  "value": ["active", "trial"] }
-    ],
+    "filters": [ { "field": "tags", "operator": "has", "value": "wal" } ],
+    "any": [ [ { "field": "type", "operator": "eq", "value": "decision" } ],
+             [ { "field": "prio", "operator": "gte", "value": 3 } ] ],
+    "sort": [ { "field": "updated", "order": "desc" } ],
+    "fields": [ "title" ],
     "limit": 10,
     "skip": 0
   }
 }
 ```
 
-- Operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`. All filters must
-  match. Fields are top-level names or `_id` (no dot-notation).
+- Operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `contains`,
+  `has`, `has_any`, `has_all`. All `filters` must match, and with `any`
+  also every filter of at least one group. Fields are top-level names or
+  `_id` (no dot-notation).
 - Type-aware comparison: numbers compare numerically, strings lexically;
   values of different types never match `eq/gt/gte/lt/lte`.
 - A document **missing the field matches no operator, including `ne`**
   (unlike MongoDB's `$ne`).
-- Results are sorted by `_id`; `skip`/`limit` page deterministically.
-  An omitted or empty `query` returns every document.
-- Each document is returned as a flat object with `_id`.
+- Results are sorted by `sort`, then `_id`; `skip`/`limit` page
+  deterministically. An omitted or empty `query` returns every document.
+- Each document is returned as a flat object with `_id` (only the
+  `fields` listed, plus `_id`, when `fields` is set).
 
 Full semantics: [DATABASE_ENGINE.md — Queries](DATABASE_ENGINE.md#queries).
 
-### `update_document`
+### `update_document`, `replace_document`, `delete_document`
 
-`updates` is merged into the document: top-level fields are replaced or
-added, others are kept. `_id` cannot be updated. The schema is validated on
-the merged result.
+`updates` is merged into the document (top-level fields are replaced or
+added), then the `unset` fields are removed; at least one of the two is
+required, and a field in both is an error. `_id` cannot be updated or
+unset. `upsert: true` creates a missing document as `{_id: id} + updates`
+(`upserted: true` in the result). `replace_document` replaces the whole
+document atomically (its `_id`, if given, must equal `id`). The schema is
+validated on the result. `if` (on all three) is a list of filters the
+stored document must match, checked under the document lock just before
+the commit; a mismatch (or a missing document) fails with
+`condition failed: document <id> no longer matches if; re-read it and
+retry` and writes nothing.
 
-### `create_index`
+### `create_index`, `drop_index`
 
-Builds a multi-value index from the existing documents. Writes to the whole
-database wait while it builds. Only `eq` filters use indexes.
+Builds a multi-value index from the existing documents (array fields are
+indexed per element). Writes to the whole database wait while it builds.
+`eq`, `has`, `has_any`, and `has_all` filters use indexes.
 
 ## Self-description
 
@@ -213,13 +242,16 @@ database wait while it builds. Only `eq` filters use indexes.
   the `tools` topic is rendered from the tool definitions
   (`DocsTopics`/`ToolDocs`).
 - **Implementation info**: name `cachydb`, the real build version.
+- **HTTP handler**: `(*Server).HTTPHandler()` returns the `/mcp` +
+  `/healthz` handler, so callers and tests (`internal/cmd/client_test.go`)
+  can serve it on their own listener.
 
 ## Errors
 
 Invalid arguments are rejected by the SDK before the handler runs, as a
 tool error starting `validating "arguments":` that names the property and,
 for enums, lists the valid values (for example `enum: like does not equal
-any of: [eq ne gt gte lt lte in]`). Unknown properties are rejected too
+any of: [eq ne gt gte lt lte in contains has has_any has_all]`). Unknown properties are rejected too
 (`additionalProperties: false`), which catches `filter` instead of
 `query.filters`.
 
@@ -230,6 +262,7 @@ whose text names the action and the cause (`toolError` in `server.go`):
 |--------------|---------------|
 | `ErrNotFound` | `<action>: <engine message> (hint: list_databases and list_collections show what exists; …)` |
 | `ErrSchemaValidation` | `<action>: <engine message> (hint: see resource cachydb://docs/schema)` |
+| `ErrConditionFailed` | `<action>: condition failed: document <id> no longer matches if; re-read it and retry` |
 | `ErrExists`, `ErrInvalidName` | `<action>: <engine message>` |
 | `ErrClosed` | `<action>: the database engine is shut down: …` |
 | `ErrWALFailed`, `ErrWALCorrupt` | `<action>: write-ahead log failure, restart the server: …` |

@@ -73,7 +73,9 @@ on-disk format versions this build reads and writes.
 | `CreateCollection(ctx, name, *Schema) error` | `nil` schema = schemaless; `ErrExists`, `ErrSchemaValidation` (invalid schema) |
 | `Collection(name) (*Collection, error)` | `ErrNotFound` if missing |
 | `ListCollections() []string` | Sorted; nil when empty |
-| `DropCollection(ctx, name) error` | Not exposed as an MCP tool |
+| `DropCollection(ctx, name) error` | MCP `delete_collection` |
+| `RenameCollection(ctx, old, new) error` | Same database; flushes the collection, then WAL op 10 (`rename_coll`) + directory rename + `coll.meta` rewrite; `ErrNotFound`, `ErrExists`; old handles return `ErrNotFound` afterwards |
+| `CopyCollection(ctx, name, newName, target *Database) (int, error)` | `target` nil = same database; creates the target with the schema and indexes, then inserts every document (same ids) through the write path, 32 at a time; **not atomic** (drop the partial target on error); `ErrExists` |
 
 ### Collection (`document.go`, `collection.go`)
 
@@ -82,12 +84,34 @@ on-disk format versions this build reads and writes.
 | `Insert(ctx, *Document) (string, error)` | Empty `doc.ID` gets a UUID; `ErrExists`; `ErrSchemaValidation` (schema, or `"_id"` key in `Data`) |
 | `Get(ctx, id) (*Document, error)` | Deep copy; `ErrNotFound` |
 | `Find(ctx, *Query) ([]*Document, error)` | See [Queries](#queries) |
-| `Update(ctx, id, set map[string]any) (*Document, error)` | Merges top-level fields; returns the new version; `ErrNotFound`; `"_id"` in `set` → `ErrSchemaValidation` |
-| `Delete(ctx, id) error` | `ErrNotFound` |
+| `CountDocuments(ctx, *Query) (int, error)` | Filters and `Any` only; fast paths below |
+| `Distinct(ctx, field, *Query) ([]any, error)` | Arrays contribute each element; deduplicated like `eq`, sorted by the sort order |
+| `Update(ctx, id, set map[string]any) (*Document, error)` | `UpdateWith` with only `Set` |
+| `UpdateWith(ctx, id, UpdateSpec) (*Document, bool, error)` | `Set`, then remove `Unset`; `If` condition; `Upsert` creates `{_id}+Set` (returns `upserted`); `ErrNotFound`, `ErrConditionFailed`; `"_id"` in `Set`/`Unset` or a field in both → `ErrSchemaValidation` |
+| `Replace(ctx, id, *Document, Condition) (*Document, error)` | Whole-document replace; `doc.ID` empty or `id`; `ErrNotFound` (missing), `ErrConditionFailed` |
+| `Delete(ctx, id) error` | `DeleteWith(ctx, id, nil)` |
+| `DeleteWith(ctx, id, Condition) error` | `ErrNotFound`, `ErrConditionFailed` |
 | `CreateIndex(ctx, name, field) error` | Builds from existing documents; blocks writes to the whole database while it runs; `ErrExists` |
-| `DropIndex(ctx, name) error` | Not exposed as an MCP tool |
+| `DropIndex(ctx, name) error` | MCP `drop_index`; `ErrNotFound` |
+| `Schema() *Schema`, `Indexes() []IndexInfo` | Copies; indexes sorted by name (MCP `describe_collection`) |
+| `UpdateSchema(ctx, *Schema) error` | `nil` removes the schema. Validates every document first (all or nothing; the error lists up to 10 failing ids and the total), then WAL op 9 (`update_schema`) + `coll.meta`; holds `Database.mu` exclusively throughout |
 | `Count() int` | O(1) |
 | `Name() string` | |
+
+### Conditional writes and `$now`
+
+- `type Condition = []QueryFilter`: the stored document must match every
+  filter. It is checked in the write's `build` callback, i.e. under the
+  per-document lock right before the WAL append, so check and write are
+  atomic against other writers of that document. A missing document with
+  a non-empty condition fails with `ErrConditionFailed` too. Error text:
+  `condition failed: document <id> no longer matches if`.
+- `ResolveNow(v, now)` replaces every exact `{"$now": true}` (at any
+  depth) with `now` as an RFC 3339 UTC string with nanoseconds. `Insert`,
+  `UpdateWith`, `Replace`, conditions, and query filters resolve it
+  themselves, once per call, before schema validation.
+- Every write still logs one `put_doc`/`delete_doc` after-image; the WAL
+  record format is unchanged.
 
 Every acknowledged write is fsynced to the WAL before the call returns.
 Returned documents are deep copies: mutating them never changes stored data.
@@ -101,7 +125,8 @@ Errors are wrapped with context; test them with `errors.Is`.
 | `ErrNotFound` | Database, collection, document, or index missing (also after a drop) |
 | `ErrExists` | Collection, document id, or index name already exists |
 | `ErrInvalidName` | Name fails `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` (`names.go`, `ValidateName`) |
-| `ErrSchemaValidation` | Invalid schema, document violates the schema, or a reserved `_id` misuse |
+| `ErrSchemaValidation` | Invalid schema, document violates the schema (a `*SchemaError` listing every violation wraps it), a reserved `_id` misuse, or `UpdateSchema` found non-matching documents |
+| `ErrConditionFailed` | An `if` condition did not match the stored document (or it is missing); nothing was written |
 | `ErrClosed` | Engine closed |
 | `ErrDataDirInUse` | Another process (or engine) holds `cachydb.lock` |
 | `ErrIncompatibleDataDir` | Old-format or newer-format data directory |
@@ -146,24 +171,41 @@ type Field  struct { Type FieldType `json:"type"`; Required bool `json:"required
 
 - A schema needs at least one field; field names cannot be empty or `_id`;
   types must be one of the above.
-- Validation runs on every insert and on the merged result of every update.
-  A required field must be present; a present field must have the declared
-  type. Fields not in the schema are allowed.
-- Schemas are fixed at collection creation. There is no API to change them.
+- Validation runs on every insert, replace, and upsert and on the result of
+  every update. A required field must be present; a present field must
+  have the declared type. Fields not in the schema are allowed.
+- `ValidateDocument` returns a `*SchemaError{Violations}` listing every
+  missing required field, then every wrong type, each in field order:
+  `schema validation failed: required field(s) missing: a, b; wrong type:
+  c (expected string, got number)`. It wraps `ErrSchemaValidation`.
+- `UpdateSchema` changes the schema (see above); `c.schema` is replaced
+  only under `Database.mu` held exclusively, which writes hold shared.
 
 ## Queries
 
 ```go
 type QueryFilter struct { Field, Operator string; Value any }
-type Query struct { Filters []QueryFilter; Limit, Skip int }
+type Query struct {
+    Filters []QueryFilter   // AND
+    Any     [][]QueryFilter // OR of AND groups; empty = no constraint
+    Fields  []string        // projection (plus _id); empty = all
+    Sort    []SortKey       // then _id asc; empty = _id asc
+    Limit, Skip int
+}
+type SortKey struct { Field, Order string } // "asc" (default) | "desc"
 ```
 
-Semantics (`compare.go`, `document.go`):
+Semantics (`compare.go`, `query.go`, `document.go`):
 
-- All filters must match (AND). `Field` is a **top-level** field name or
-  `_id`; there is no dot-notation for nested fields.
-- Operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`. Unknown operators
-  match nothing.
+- All `Filters` must match (AND), and when `Any` is set every filter of at
+  least one group. `Field` is a **top-level** field name or `_id`; there
+  is no dot-notation for nested fields.
+- Operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `contains`
+  (case-insensitive substring of a string or of a string array element;
+  `""` matches any string or array), `has` (an array element equals the
+  value), `has_any`, `has_all` (some / every value of the array value is
+  an element). Unknown operators match nothing. `eq`/`ne`/`in` compare
+  arrays as whole values.
 - Comparison is type-aware: every numeric kind (and `json.Number`) compares
   as `float64`; strings compare lexically with strings; bools and `null`
   support equality only; objects and arrays support equality (deep, with
@@ -172,13 +214,29 @@ Semantics (`compare.go`, `document.go`):
 - **A document missing the filtered field matches no operator, including
   `ne`.** This differs from MongoDB's `$ne` and is intentional.
 - `in` takes an array; it matches when the field equals any element.
-- Results are sorted by `_id` ascending. `Skip` matches are skipped, then
-  at most `Limit` are returned (0 or negative = no limit). Paging is
-  deterministic.
-- Candidates: the smallest id set among `eq` filters on `_id` or on an
-  indexed field with an indexable value. Without one, every live document
-  is scanned (read from the memtable, cache, or disk). The scan stops once
-  `Skip+Limit` matches are found.
+- Order: `Sort` keys, then `_id` ascending. Without `Sort` (or with exactly
+  `_id asc`), ids are walked in order and the scan stops once `Skip+Limit`
+  matches are found (`_id desc` walks them backwards). Any other sort
+  reads every match and keeps the best `Skip+Limit` in a bounded heap
+  (`sortHeap`), using a total order: missing < null < false < true <
+  numbers < strings < arrays < objects (arrays and objects by canonical
+  JSON); `desc` reverses it. `Skip` matches are skipped, then at most
+  `Limit` are returned (0 or negative = no limit). Paging is
+  deterministic. An invalid order or empty sort field is an error.
+- `Fields` is applied after filtering and sorting; `_id` is always kept.
+- Candidates: the smallest id set among `eq` on `_id`, and `eq`/`has`
+  (one key), `has_any` (union), `has_all` (intersection of its indexable
+  values) on an indexed field. Without one, every live document is
+  scanned (read from the memtable, cache, or disk). Candidates are always
+  re-checked against every filter. `contains`, ranges, and `Any` groups
+  never use an index.
+- `CountDocuments`: no filter → `Count()`; exactly one `eq` or `has` on an
+  indexed field (or `eq` on `_id`) and no `Any` → answered from the index
+  without reading documents (exact, through the marker keys below);
+  otherwise like `Find` without materializing results.
+- `Distinct`: without filters on `_id` or an indexed field, decoded from
+  the index keys (unless the unindexable marker is non-empty); otherwise
+  scanned.
 
 ## Indexes (`index.go`)
 
@@ -187,10 +245,16 @@ Semantics (`compare.go`, `document.go`):
 - Keys are type-tagged: `n:<float>` (numbers, `-0` folded into `0`),
   `s:<string>`, `b:t`/`b:f`, `z:` (null). So the number `1` and the string
   `"1"` are different keys.
-- Objects, arrays, and NaN are not indexed. A document whose field is
-  missing or holds one has no entry, and `eq` filters on such values scan.
-- Only `eq` uses an index. The `_id` lookup uses the keydir (no separate
-  `_id` index exists).
+- An array value is indexed under the key of **each** scalar element
+  (plan 004). Objects, nested arrays, and NaN are not indexed; `eq`
+  filters on such values scan.
+- Two marker keys make counts and distinct values exact: `a:` holds the
+  ids whose field is an array, `u:` those whose value (or an element) is
+  not indexable. `countEq` = |key set| − |key set ∩ `a:`|; `countHas` =
+  |key set ∩ `a:`|.
+- `eq`, `has`, `has_any`, and `has_all` use an index; per-element keys
+  can make `eq` candidates a superset, which the re-check removes. The
+  `_id` lookup uses the keydir (no separate `_id` index exists).
 - Indexes are kept in memory, persisted as snapshots, and rebuilt when a
   snapshot is missing or invalid (see [STORAGE.md](STORAGE.md)).
 
