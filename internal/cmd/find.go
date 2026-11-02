@@ -61,7 +61,7 @@ cachydb server is running on the same data directory; use
 instead.`,
 	Example: `  cachydb utils get -d kb -c notes --id wal-design
   cachydb utils get -d kb -c notes --id wal-design -R /path/to/data`,
-	Args:    cobra.NoArgs,
+	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if findDatabase == "" || findCollection == "" || getID == "" {
 			return errors.New("-d/--database, -c/--collection, and --id are required")
