@@ -257,6 +257,11 @@ func (s *Server) httpHandler() http.Handler {
 	return mux
 }
 
+// HTTPHandler returns the HTTP handler the http transport serves: the
+// Streamable HTTP transport at /mcp and the health endpoint at /healthz.
+// It lets callers (and tests) serve the server on their own listener.
+func (s *Server) HTTPHandler() http.Handler { return s.httpHandler() }
+
 // healthResponse is the body of GET /healthz.
 type healthResponse struct {
 	Status  string `json:"status"`
