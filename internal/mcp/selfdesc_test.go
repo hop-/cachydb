@@ -75,10 +75,32 @@ func toolNamed(t *testing.T, tools []*mcp.Tool, name string) *mcp.Tool {
 func TestToolSchemaEnums(t *testing.T) {
 	tools := listTools(t, connect(t, newTestServer(t)))
 
-	op := schemaAt(t, toolNamed(t, tools, "find_documents").InputSchema,
-		"properties", "query", "properties", "filters", "items", "properties", "operator")
-	if got := enumOf(t, op); !slices.Equal(got, Operators) {
-		t.Errorf("operator enum = %v, want %v", got, Operators)
+	for _, want := range []string{"contains", "has", "has_any", "has_all"} {
+		if !slices.Contains(Operators, want) {
+			t.Errorf("Operators lacks %s", want)
+		}
+	}
+	for _, path := range []struct {
+		tool string
+		at   []string
+	}{
+		{"find_documents", []string{"properties", "query", "properties", "filters", "items", "properties", "operator"}},
+		{"find_documents", []string{"properties", "query", "properties", "any", "items", "items", "properties", "operator"}},
+		{"count_documents", []string{"properties", "query", "properties", "filters", "items", "properties", "operator"}},
+		{"distinct", []string{"properties", "query", "properties", "any", "items", "items", "properties", "operator"}},
+		{"update_document", []string{"properties", "if", "items", "properties", "operator"}},
+		{"replace_document", []string{"properties", "if", "items", "properties", "operator"}},
+		{"delete_document", []string{"properties", "if", "items", "properties", "operator"}},
+	} {
+		op := schemaAt(t, toolNamed(t, tools, path.tool).InputSchema, path.at...)
+		if got := enumOf(t, op); !slices.Equal(got, Operators) {
+			t.Errorf("%s %v: operator enum = %v, want %v", path.tool, path.at, got, Operators)
+		}
+	}
+	order := schemaAt(t, toolNamed(t, tools, "find_documents").InputSchema,
+		"properties", "query", "properties", "sort", "items", "properties", "order")
+	if got := enumOf(t, order); !slices.Equal(got, SortOrders) {
+		t.Errorf("sort order enum = %v, want %v", got, SortOrders)
 	}
 	ft := schemaAt(t, toolNamed(t, tools, "create_collection").InputSchema,
 		"properties", "schema", "properties", "fields", "additionalProperties", "properties", "type")
@@ -102,6 +124,16 @@ func TestToolAnnotationsAndOutputSchemas(t *testing.T) {
 		"update_document":   {},
 		"delete_document":   {destructive: true, idempotent: true},
 		"delete_database":   {destructive: true, idempotent: true},
+		// plan 004 (approach-semantics §5)
+		"replace_document":    {idempotent: true},
+		"count_documents":     {readOnly: true, idempotent: true},
+		"distinct":            {readOnly: true, idempotent: true},
+		"describe_collection": {readOnly: true, idempotent: true},
+		"update_schema":       {idempotent: true},
+		"rename_collection":   {},
+		"copy_collection":     {},
+		"delete_collection":   {destructive: true, idempotent: true},
+		"drop_index":          {destructive: true, idempotent: true},
 	}
 	tools := listTools(t, connect(t, newTestServer(t)))
 	if len(tools) != len(want) {
@@ -190,7 +222,13 @@ func TestToolExamplesAreValid(t *testing.T) {
 	order := []string{
 		"list_databases", "create_database", "use_database", "current_database",
 		"create_collection", "list_collections", "insert_document", "find_documents",
-		"update_document", "create_index", "delete_document", "delete_database",
+		"count_documents", "distinct", "update_document", "replace_document",
+		"create_index", "describe_collection", "update_schema", "copy_collection",
+		"rename_collection", "delete_collection", "drop_index", "delete_document",
+		"delete_database",
+	}
+	if len(order) != len(examples) {
+		t.Fatalf("order lists %d tools, %d have examples", len(order), len(examples))
 	}
 	for _, name := range order {
 		res := call(t, cs, name, examples[name])

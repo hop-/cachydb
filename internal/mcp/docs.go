@@ -121,16 +121,19 @@ func Instructions() string {
 	var b strings.Builder
 	b.WriteString(`cachydb is a document database: databases hold collections, collections hold JSON documents with a string _id.
 
-Typical workflow:
-1. list_databases; pick one with use_database (this session only) or pass "database" to each call. Without either, the server default is used (current_database tells which).
-2. create_collection, optionally with a schema: {"fields": {"name": {"type": "string", "required": true}}}.
-3. insert_document with {"collection", "document"}; a string _id is optional (a UUID is generated).
-4. find_documents with filters inside "query": {"query": {"filters": [{"field": "age", "operator": "gte", "value": 18}], "limit": 10}}. Operators: eq ne gt gte lt lte in. All filters must match. A document missing the field matches nothing, not even ne.
-5. update_document merges top-level fields; delete_document removes by id; create_index speeds up eq filters.
+Workflow:
+1. list_databases; use_database (this session) or pass "database"; else the server default (current_database).
+2. create_collection, optionally with a schema; describe_collection shows schema, indexes, count.
+3. insert_document {"collection", "document"}; _id optional (UUID).
+4. find_documents {"query": {"filters": [{"field": "age", "operator": "gte", "value": 18}], "any": [[...], [...]], "sort": [{"field": "age", "order": "desc"}], "fields": ["name"], "limit": 10}}. Operators: eq ne gt gte lt lte in, contains (case-insensitive substring), has has_any has_all (array elements; indexed). Filters AND; "any" groups OR. A missing field matches nothing, not even ne. count_documents and distinct take the same filters.
+5. update_document: "updates" set fields, "unset" removes them, "upsert" creates; replace_document swaps a whole document. "if": [filters] on update/replace/delete writes only if the stored document still matches (compare-and-set; on "condition failed" re-read and retry).
+6. {"$now": true} as a value is the server time (RFC 3339 UTC).
+7. update_schema (checks every document), rename_collection, copy_collection, delete_collection, create_index, drop_index.
 
-Ids are strings. Results are sorted by _id. Numbers are JSON numbers; Go callers get integers back as floats. Every successful write is durable.
+Results sort by _id unless "sort" is given. Numbers are JSON numbers. Every successful write is durable.
 
-Full documentation (read as resources):
+`)
+	b.WriteString(`Full documentation (read as resources):
 `)
 	for _, name := range docs.Names {
 		fmt.Fprintf(&b, "- %s%s\n", DocsURIPrefix, name)
