@@ -106,6 +106,8 @@ u16 db_len · db · u16 coll_len · coll · u16 id_len · id · u32 payload_len 
 | 6 | `drop_coll` | none |
 | 7 | `create_index` | `{"name", "field"}` |
 | 8 | `drop_index` | `{"name"}` |
+| 9 | `update_schema` | `{"schema": <Schema or null>}` (plan 004) |
+| 10 | `rename_coll` | `{"new_name"}`; `coll` is the old name (plan 004) |
 
 Offsets start at 1 and increase by exactly 1 across the whole log. The
 format is self-describing so a future WAL reader / change feed needs no
@@ -162,14 +164,18 @@ u32 raw_len · u8 codec · body
   type, WAL offset, position, size) so a sealed segment loads without
   reading the data. A missing or invalid hint means the segment is scanned
   and the hint rewritten.
-- **Index snapshot** (`idx-<name>.snap`, magic `CDBI`): the index's keys and
-  id sets plus the data position `(seg, pos)` and WAL offset it covers.
+- **Index snapshot** (`idx-<name>.snap`, magic `CDBI`, version 2): the
+  index's keys and id sets plus the data position `(seg, pos)` and WAL
+  offset it covers. Version 2 (plan 004) holds one key per array element
+  plus the marker keys `a:` (array values) and `u:` (unindexable values);
+  version-1 snapshots are rejected as corrupt, so their indexes are
+  rebuilt on the first open after an upgrade.
   Written when a segment is sealed, after compaction, and on `Close` (if
   the final flush succeeded). On open, a snapshot whose field matches
   `coll.meta` and whose CRC checks is loaded and caught up from the records
   after its position; otherwise the index is rebuilt from the documents.
-- Hint and snapshot files share a framing: magic · `u16` version · body ·
-  CRC32C over everything before it (`sidecar.go`).
+- Hint and snapshot files share a framing: magic · `u16` version (hint 1,
+  snapshot 2) · body · CRC32C over everything before it (`sidecar.go`).
 
 ## In-memory state per collection (`pkg/db/collection.go`)
 
@@ -200,8 +206,10 @@ returns. A cached `Get` is ~8.5× faster than an uncached one
 1. Database.mu (shared, held to the end; blocks drops/index changes)
 2. docLock(id): 256 striped mutexes, FNV-1a of the id
 3. read current version: memtable → flushing → cache → keydir + segment
-4. build after-image (insert: ErrExists if present; update: merge top-level
-   fields; delete: ErrNotFound if absent), JSON round-trip, validate schema
+4. check the `if` condition against the current version (ErrConditionFailed),
+   build after-image (insert: ErrExists if present; update: merge top-level
+   fields then unset, or upsert; replace: whole document; delete: ErrNotFound
+   if absent), JSON round-trip, validate schema
 5. register inflight; WAL append + fsync            ← commit point
 6. under Collection.mu: memtable[id] = after-image@offset, update indexes,
    invalidate cache, count; remove from inflight
@@ -214,6 +222,23 @@ updates cannot be lost. Metadata operations append their WAL record, then
 write the meta file(s) and directories, then update memory. Drops rename
 the directory to `.deleted-<offset>` (atomic) and remove it in the
 background; `Open` removes leftovers.
+
+`update_schema` (op 9) validates every document under `Database.mu`
+(exclusive), appends the record, rewrites `coll.meta`, then swaps the
+schema in memory.
+
+`rename_coll` (op 10), under `Database.mu` exclusive and the collection's
+`compactMu` and `flushMu`: flush the collection first (no write can run,
+so afterwards every change is in its data segments and replay never needs
+a record under the old name), append the record (commit point;
+`hookMetaWrite`), detach the collection (flag it dropped, close its
+active segment and readers, evict its cache entries), `os.Rename` the
+directory and fsync the database directory (`hookRenameDir`), rewrite
+`coll.meta` with the new name and `wal_offset` (keeping
+`created_offset`), and register a new `*Collection` that takes over the
+in-memory state (`moveState`); its active segment reopens lazily. If a
+step after the commit fails, the collection is unavailable until a
+restart replays the record.
 
 ## Flush, checkpoint markers, low-water mark (`pkg/db/flush.go`)
 
@@ -278,8 +303,19 @@ deleted by retention.
    checkpoint. Each record is applied only if its effect is missing: document
    records iff their offset beats the current version's; create/drop
    records iff the meta file's `wal_offset` (and `created_offset`) is
-   older. Replay never fails on "already exists" or "not found". Replayed
-   changes land in memtables and are flushed normally.
+   older; `update_schema` likewise. Replay never fails on "already exists"
+   or "not found". Replayed changes land in memtables and are flushed
+   normally.
+   `rename_coll` (`replayRename`) handles, in order: a directory already
+   renamed whose `coll.meta` still has the old name (a crash between the
+   two: step 2 loads it under the old name with `pendingRename` set, and
+   records about the new name before the rename are skipped as earlier,
+   dropped collections of that name) → rewrite `coll.meta` and re-key; the
+   new name already holding the renamed (or a later) collection → the
+   rename is applied, and an old-name collection replay re-created from
+   older records (`created_offset` below the record) is removed like a
+   drop; the old collection predating the record with the new name free →
+   rename the directory, rewrite `coll.meta`, re-key; otherwise skip.
 6. Write `cachydb.metacp`, then start the flusher, compactor, and WAL
    retention.
 
@@ -319,7 +355,7 @@ Engine.metaMu → Database.mu → compactMu → flushMu → Collection.mu
 |------------------|---------------|
 | `Engine.mu` | databases map only; never held during I/O |
 | `Engine.metaMu` | create/drop database, including I/O |
-| `Database.mu` | collections map; exclusive for metadata ops (incl. the whole `CreateIndex` build); shared by document writes |
+| `Database.mu` | collections map, collection schemas; exclusive for metadata ops (incl. the whole `CreateIndex` build, `UpdateSchema` validation, and the flush inside `RenameCollection`); shared by document writes |
 | `docLocks[256]` | one document's read-modify-write; held across the WAL append |
 | `Collection.mu` | keydir, memtables, indexes, inflight; memory-only sections |
 | `flushMu`, `compactMu` | serialize flush / compaction per collection, and against drops |
@@ -337,5 +373,6 @@ releases the lock. Public calls after `Close` return `ErrClosed`.
 The engine calls it at the points in `pkg/db/hooks.go` (after the WAL fsync
 before apply, after the segment write before fsync, after the segment fsync
 before the keydir update, before the compaction swap, during metadata
-writes). A hook can simulate a crash; the test then reopens the directory
+writes, and between a rename's directory rename and its `coll.meta`
+write). A hook can simulate a crash; the test then reopens the directory
 (`pkg/db/crash_test.go`). It is always nil outside tests.

@@ -1,7 +1,7 @@
 ---
 name: config
 title: Configuration
-summary: Every flag and environment variable, defaults, precedence (flag > env > default), and value formats
+summary: Every flag and environment variable, defaults, precedence (flag > env > default), value formats, cachydb client (CACHYDB_URL), and the export format
 ---
 # Configuration
 
@@ -26,6 +26,57 @@ environment variable, which wins over the default.**
 | `--wal-retention-size` | `WAL_RETENTION_SIZE` | `1GiB` | Keep at most this much processed WAL; `0` = no size limit |
 
 `cachydb utils` takes `-R/--root` and the engine tuning flags too.
+
+## Offline data commands (`cachydb utils`)
+
+They open the data directory (taking its lock), so they fail while a
+server runs on it; the error suggests the `cachydb client` command to use
+instead.
+
+| Command | Flags | Output |
+| --- | --- | --- |
+| `utils export` | `-d` database, `-c` collection (needs `-d`), `-o` file (default stdout) | The export format below |
+| `utils import` | `-i` file (`-` = stdin), `--on-conflict fail\|skip\|replace` (default `fail`) | A summary on stderr |
+| `utils find` | `-d`, `-c` (required), `--query` JSON (the `find_documents` `query`), `--format jsonl\|json` (default `jsonl`) | Documents |
+| `utils get` | `-d`, `-c`, `--id` (required) | One document; exit 1 if not found |
+
+`--on-conflict`: `fail` stops at the first existing `_id` (and reports how
+many lines were applied); `skip` keeps existing documents; `replace`
+replaces them, and also updates a differing collection schema (checked
+against the documents) and adds missing indexes. With `fail` or `skip`, an
+existing collection whose schema or index set differs is an error.
+
+## Client (`cachydb client`)
+
+| Flag | Env var | Default | Meaning |
+| --- | --- | --- | --- |
+| `--url` | `CACHYDB_URL` | `http://127.0.0.1:7601/mcp` | MCP endpoint of a running `cachydb -t http` server |
+
+- `cachydb client tools [--format json]` lists the server's tools.
+- `cachydb client call <tool> [json-args | -]` calls any tool with a JSON
+  object (`-` reads stdin) and prints its structured result as JSON; a
+  tool error goes to stderr with exit status 1.
+- `cachydb client export [-d] [-c] [-o]` and `cachydb client import -i
+  file [--on-conflict]` use the same format and rules as `utils`. A client
+  export reads pages of 500 documents, so it is not a point-in-time
+  snapshot.
+
+## Export format
+
+JSON Lines (UTF-8), one object per line: a header, then each database
+(sorted) with its collections (sorted), each followed by its documents
+sorted by `_id`:
+
+```text
+{"type":"cachydb-export","version":1,"cachydb":"v0.0.5","created":"2026-11-02T10:00:00Z"}
+{"type":"database","name":"kb","schema_version":1}
+{"type":"collection","database":"kb","name":"notes","schema":null,"indexes":[{"name":"by_tags","field":"tags"}]}
+{"type":"document","database":"kb","collection":"notes","doc":{"_id":"n1","tags":["wal"],"title":"WAL design"}}
+```
+
+Importing an export into an empty directory and exporting again gives
+the same file except the header's `created`. A header with another
+`version` is rejected.
 
 ## Health check (`cachydb healthcheck`)
 
@@ -78,5 +129,7 @@ cachydb -t http -p 8080 --cache-size 256MiB    # HTTP on port 8080 with a bigger
 - Errors are printed to stderr as `Error: <message>`; the exit status is 1.
 - In stdio mode, stdout carries only MCP messages.
 - `cachydb docs`, `cachydb version`, and `--help` print to stdout and exit 0.
+- Data commands (`utils export/find/get`, `client call/export/tools`)
+  write data to stdout and diagnostics to stderr.
 - `cachydb healthcheck` prints nothing on success (exit 0); on failure it
   prints `Error: healthcheck: ...` to stderr and exits 1.

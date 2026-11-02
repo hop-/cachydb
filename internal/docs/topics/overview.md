@@ -17,9 +17,14 @@ engine (`github.com/hop-/cachydb/pkg/db`) directly.
 - Every document has a string id, `_id`. Insert one with your own string
   `_id`, or let cachydb generate a UUID.
 - A collection may have an optional **schema** (field types and required
-  fields), checked on every insert and update. See `cachydb docs schema`.
-- A collection may have **hash indexes** on top-level fields. Only `eq`
+  fields), checked on every write and changeable with `update_schema`.
+  See `cachydb docs schema`.
+- A collection may have **hash indexes** on top-level fields; array
+  fields are indexed per element. `eq`, `has`, `has_any`, and `has_all`
   filters use them. See `cachydb docs query`.
+- Queries support AND filters, OR groups (`any`), substring search
+  (`contains`), array-element matching, sorting by any field, projection,
+  `count_documents`, and `distinct`.
 - Names of databases, collections, and indexes must match
   `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.
 - The server has a default database (`main` unless `-d/--db` says
@@ -36,8 +41,9 @@ engine (`github.com/hop-/cachydb/pkg/db`) directly.
   the number of writers. A single write costs about one fsync.
 - A background flusher moves changes into compressed data segments;
   recovery replays any WAL records that were not flushed yet.
-- There are no multi-document transactions. Each insert, update, or
-  delete is atomic on its own.
+- There are no multi-document transactions. Each insert, update,
+  replace, or delete is atomic on its own; an `if` condition makes it a
+  compare-and-set against the stored document.
 
 ## Where data lives
 
@@ -47,7 +53,9 @@ engine (`github.com/hop-/cachydb/pkg/db`) directly.
   server, or a `cachydb utils` command, fails with "data directory is in
   use by another cachydb process" while a server runs on it.
 - The files are binary; do not edit them by hand. To start over, stop the
-  server and delete the directory.
+  server and delete the directory. For backups and moves, export to JSON
+  Lines (`cachydb utils export`, or `cachydb client export` while a server
+  runs) and import it back.
 
 ## Learn more
 

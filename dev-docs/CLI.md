@@ -117,7 +117,9 @@ every subcommand: `-R/--root`, `--wal-retention-age`,
 `utils` commands **open the engine**: they take the data-directory lock and
 run recovery (WAL replay), then close the engine with a flush. They
 therefore **fail while a server is running** on the same directory. Stop
-the server first.
+the server first, or use `cachydb client` against it: the data commands
+(`export`, `import`, `find`, `get`) add a hint naming the `cachydb client`
+command to the data-directory-in-use error (`clientHint` in `export.go`).
 
 ### `cachydb utils list`
 
@@ -165,6 +167,49 @@ Rules: exactly one of `--database` / `--all`; `--target` must be ≥ 1, and
 a target above the current version needs a registered migration for every
 step. Downgrades fail. No migrations are registered in this build.
 
+### `cachydb utils export` / `import` (`export.go`, `import.go`)
+
+```
+cachydb utils export [-d DB [-c COLL]] [-o FILE]
+cachydb utils import -i FILE|- [--on-conflict fail|skip|replace]
+```
+
+JSON Lines in the format of `internal/exportfmt` (header with `version`
+1, then database, collection, and document lines, all sorted; see `cachydb
+docs config`). `-c` requires `-d`; export writes to stdout without `-o`.
+Import creates missing databases and collections (schema and indexes);
+`fail` (default) stops at the first existing `_id` and reports how many
+lines were applied, `skip` keeps existing documents, `replace` replaces
+them and also updates a differing schema (via `UpdateSchema`) and adds
+missing indexes. With `fail`/`skip` a collection whose schema or index set
+differs is an error. A summary goes to stderr. Export → import into an
+empty directory → export gives identical output apart from `created`.
+
+### `cachydb utils find` / `get` (`find.go`)
+
+```
+cachydb utils find -d DB -c COLL [--query JSON] [--format jsonl|json]
+cachydb utils get -d DB -c COLL --id ID
+```
+
+`--query` is a `db.Query` in JSON (the `find_documents` `query` shape;
+unknown keys are rejected). Output is one document per line (default) or
+a JSON array. `get` exits 1 when the document does not exist.
+
+### `cachydb client` (`client.go`)
+
+An MCP client (go-sdk `mcp.NewClient` + `StreamableClientTransport`, no
+standalone SSE, no retries) for a running `cachydb -t http` server.
+`--url` (persistent), else `CACHYDB_URL`, else
+`http://127.0.0.1:7601/mcp`.
+
+| Subcommand | Behavior |
+|------------|----------|
+| `client tools [--format text\|json]` | Tool names and descriptions, or the full definitions |
+| `client call <tool> [json-args \| -]` | Calls any tool with a JSON object (`-` = stdin; omitted = `{}`), prints `structuredContent` as indented JSON; a tool error is returned as an error (stderr, exit 1) |
+| `client export [-d] [-c] [-o]` | `exportfmt.Export` over `clientStore` (`list_databases`, `list_collections`, `describe_collection`, `find_documents` paged by `skip`/`limit` 500 in `_id` order); not a point-in-time snapshot; `schema_version` is `db.CurrentSchemaVersion` |
+| `client import -i FILE [--on-conflict]` | `exportfmt.Import` over `clientStore` (`create_database`, `create_collection`, `update_schema`, `create_index`, `drop_index`, `insert_document`, `replace_document`); an "already exists" tool error marks a conflict |
+
 ## Configuration
 
 Settings come from environment variables (`internal/config/config.go`,
@@ -181,6 +226,7 @@ by flags: the flag defaults are the configured values. A malformed value
 | `WAL_RETENTION_AGE` | `24h` | `--wal-retention-age` |
 | `WAL_RETENTION_SIZE` | `1GiB` | `--wal-retention-size` |
 | `CACHE_SIZE` | `64MiB` | `--cache-size` |
+| `CACHYDB_URL` | `http://127.0.0.1:7601/mcp` | `cachydb client --url` (read by `client` only) |
 
 Precedence: flag > environment variable > default.
 
@@ -217,6 +263,8 @@ main.go → cmd.Execute()
       App.Start(ctx)                    # until signal / stdin EOF (exit 0) / error
       App.Stop(WithoutCancel(ctx))      # 10s: sessions, Engine.Close
     runList / runMigrate                # utils: withEngine(Open … Close)
+    utils export/import/find/get        # withEngine; exportfmt.Engine adapter
+    client tools/call/export/import     # withClient: MCP over Streamable HTTP; never opens the engine
     runDocs / version                   # print to stdout; never open the engine
     runHealthcheck                      # GET /healthz (3s); never opens the engine
   cobra.CheckErr(err)                   # print + exit 1

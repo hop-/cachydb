@@ -7,8 +7,11 @@ A lightweight document-based database with Model Context Protocol (MCP) support,
 - **Document-based storage**: Store JSON documents in collections
 - **Multiple databases**: Create and manage multiple databases within a single instance
 - **Schema validation**: Define and enforce schemas for your collections
-- **Indexing**: Multi-value hash indexes on any top-level field (duplicate values supported)
-- **Query operations**: Find documents with type-aware filters (eq, ne, gt, gte, lt, lte, in), sorted by `_id` with deterministic skip/limit
+- **Indexing**: Multi-value hash indexes on any top-level field (duplicate values supported; array fields indexed per element)
+- **Query operations**: Type-aware filters (eq, ne, gt, gte, lt, lte, in), case-insensitive `contains`, array matching (`has`, `has_any`, `has_all`), OR groups, sort by any field, projection, deterministic skip/limit, `count_documents`, `distinct`
+- **Safe writes**: Conditional writes (`if`, compare-and-set), `unset`, upsert, atomic `replace_document`, and `{"$now": true}` server timestamps
+- **Schema evolution**: Every violation reported at once; `describe_collection`, `update_schema`, `rename_collection`, `copy_collection`, `delete_collection`, `drop_index`
+- **Export and client**: JSON Lines export/import (`cachydb utils export|import`), offline `utils find|get`, and `cachydb client` to call any tool of a running HTTP server from the shell
 - **MCP integration**: Built-in MCP server supporting stdio and Streamable HTTP transports, with `use_database` per session
 - **Durable writes**: Every acknowledged write is fsynced to a write-ahead log; concurrent writes share fsyncs (group commit)
 - **Append-only storage**: zstd-compressed, append-only data segments with background compaction; only keys and indexes are kept in RAM
@@ -112,6 +115,24 @@ Sizes accept `B`, `KiB`, `MiB`, `GiB`, `TiB` (powers of 1024) and `KB`, `MB`, `G
 Run `cachydb docs config` for every setting, or `cachydb --help`.
 
 Only one process can use a data directory at a time: the server holds an exclusive lock on `<data dir>/cachydb.lock`, and a second server or a `cachydb utils` command on the same directory fails with "data directory is in use by another cachydb process".
+
+### Export, import, and the shell client
+
+```bash
+# Offline (no server running on the directory)
+cachydb utils export -d kb -o kb.jsonl                 # JSON Lines: header, databases, collections, documents
+cachydb utils import -i kb.jsonl --on-conflict skip -R /new/data
+cachydb utils find -d kb -c notes --query '{"filters":[{"field":"tags","operator":"has","value":"wal"}]}'
+cachydb utils get -d kb -c notes --id wal-design
+
+# Through a running HTTP server (--url or CACHYDB_URL, default http://127.0.0.1:7601/mcp)
+cachydb client tools
+cachydb client call find_documents '{"database":"kb","collection":"notes","query":{"limit":5}}'
+cachydb client export -d kb -o kb.jsonl
+cachydb client import -i kb.jsonl
+```
+
+`client call` works for every tool, so scripts and agents without MCP support can use cachydb too. See `cachydb docs config` for the export format and flags.
 
 Logs go to stderr; in stdio mode stdout carries only MCP messages. SIGINT/SIGTERM, or the client closing stdin, shut the server down gracefully (final flush, exit status 0). Errors exit with status 1.
 
@@ -316,6 +337,32 @@ List all collections in a database.
 }
 ```
 
+#### describe_collection
+
+Return a collection's schema (or `null`), its indexes, and its document count.
+
+```json
+{"collection": "users"}
+```
+
+#### update_schema
+
+Replace a collection's schema (`null` removes it). Every existing document is checked first; if any fails, nothing changes and the error lists up to 10 failing ids.
+
+```json
+{"collection": "users", "schema": {"fields": {"name": {"type": "string", "required": true}}}}
+```
+
+#### rename_collection / copy_collection / delete_collection
+
+```json
+{"collection": "users", "new_name": "people"}
+{"collection": "people", "new_name": "people_backup", "target_database": "backups"}
+{"collection": "people_backup", "database": "backups"}
+```
+
+Rename keeps documents, schema, and indexes (crash-safe). Copy creates the target with the same schema and indexes and copies every document; it is **not atomic** (delete a partial copy and retry). Delete removes a collection with its documents and indexes.
+
 ### Document Management
 
 #### insert_document
@@ -334,7 +381,7 @@ Insert a document into a collection.
 }
 ```
 
-If `_id` is not provided, a UUID is generated. A provided `_id` must be a string. Integer values are stored as JSON numbers (Go library callers get them back as `float64`).
+If `_id` is not provided, a UUID is generated. A provided `_id` must be a string. Integer values are stored as JSON numbers (Go library callers get them back as `float64`). A value `{"$now": true}`, at any depth, is replaced by the server time (RFC 3339 UTC); it also works as a filter value.
 
 #### find_documents
 
@@ -352,22 +399,37 @@ Query documents in a collection.
         "value": 25
       }
     ],
+    "any": [
+      [{"field": "tags", "operator": "has", "value": "admin"}],
+      [{"field": "name", "operator": "contains", "value": "doe"}]
+    ],
+    "sort": [{"field": "age", "order": "desc"}],
+    "fields": ["name", "email"],
     "limit": 10,
     "skip": 0
   }
 }
 ```
 
-**Operators**: `eq`, `ne`, `gt`, `lt`, `gte`, `lte`, `in` (`in` takes an array of values)
+**Operators**: `eq`, `ne`, `gt`, `lt`, `gte`, `lte`, `in` (`in` takes an array of values), `contains` (case-insensitive substring of a string, or of a string element of an array), `has` (an array element equals the value), `has_any` / `has_all` (some / every value of an array is an element)
 
-- All filters must match. `field` is a top-level field name or `_id` (nested paths are not supported).
-- Comparison is type-aware: numbers compare numerically, strings lexically. Values of different types never match `eq`, `gt`, `gte`, `lt`, or `lte`.
+- All `filters` must match; with `any`, at least one group must match too (OR of ANDs). `field` is a top-level field name or `_id` (nested paths are not supported).
+- Comparison is type-aware: numbers compare numerically, strings lexically. Values of different types never match `eq`, `gt`, `gte`, `lt`, or `lte`. `eq`/`in` compare arrays as whole values; use `has` for elements.
 - A document that lacks the filtered field matches no operator, including `ne` (unlike MongoDB's `$ne`).
-- Results are sorted by `_id`; `skip` and `limit` page deterministically. An omitted or empty `query` returns all documents.
+- Results are sorted by `sort` (any fields, `asc`/`desc`; missing < null < booleans < numbers < strings < arrays < objects), then `_id`; `skip` and `limit` page deterministically. `fields` returns only the listed fields plus `_id`. An omitted or empty `query` returns all documents.
+
+#### count_documents / distinct
+
+```json
+{"collection": "users", "query": {"filters": [{"field": "tags", "operator": "has", "value": "admin"}]}}
+{"collection": "users", "field": "tags"}
+```
+
+`count_documents` returns `{"count": n}`; `distinct` returns the distinct values of a field (array elements counted individually), sorted.
 
 #### update_document
 
-Update a document by ID. Top-level fields in `updates` are replaced or added; other fields are kept. `_id` cannot be updated.
+Update a document by ID. Top-level fields in `updates` are replaced or added, fields in `unset` are removed, other fields are kept. `_id` cannot be updated. `if` makes the write conditional on the stored document (compare-and-set); `upsert: true` creates a missing document.
 
 ```json
 {
@@ -376,14 +438,27 @@ Update a document by ID. Top-level fields in `updates` are replaced or added; ot
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "updates": {
     "age": 31,
-    "city": "New York"
-  }
+    "version": 4,
+    "updated": {"$now": true}
+  },
+  "unset": ["nickname"],
+  "if": [{"field": "version", "operator": "eq", "value": 3}]
 }
+```
+
+If the condition no longer matches, nothing is written and the error says `condition failed: … re-read it and retry`.
+
+#### replace_document
+
+Atomically replace a whole document (fields not in `document` are removed). Takes the same optional `if`.
+
+```json
+{"collection": "users", "id": "u1", "document": {"name": "Jane", "email": "jane@example.com"}}
 ```
 
 #### delete_document
 
-Delete a document by ID.
+Delete a document by ID, optionally only `if` it matches filters.
 
 ```json
 {
@@ -397,7 +472,7 @@ Delete a document by ID.
 
 #### create_index
 
-Create an index on a collection field for faster `eq` queries. Indexes support duplicate values. Building an index blocks writes to that database until it finishes.
+Create an index on a collection field for faster `eq` queries, and `has` / `has_any` / `has_all` on array fields (each element is indexed). Indexes support duplicate values. Building an index blocks writes to that database until it finishes. `drop_index` (`{"collection", "index_name"}`) removes one.
 
 ```json
 {

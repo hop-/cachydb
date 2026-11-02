@@ -20,7 +20,10 @@ starting `validating "arguments":`.
 | `document "x" in collection "y": not found` | No document has that `_id` | Check the id; `find_documents` lists ids |
 | `already exists` | A collection, index, or document id is already taken | Use another name or id; `create_database` on an existing name succeeds |
 | `invalid name` | A name does not match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` | Use letters, digits, `_` and `-`; start with a letter or digit; at most 64 characters |
-| `schema validation failed` | The document breaks the collection schema, or the schema itself is invalid | Read the field named in the message; see `cachydb docs schema` |
+| `schema validation failed` | The document breaks the collection schema (every violation is listed), the schema itself is invalid, or `update_schema` found documents that do not match (their ids are listed) | Fix the fields named in the message; see `cachydb docs schema` |
+| `condition failed: document x no longer matches if; re-read it and retry` | An `if` condition (update, replace, delete) did not match the stored document, or the document does not exist; nothing was written | Read the document again, recompute, and retry with the new values in `if` |
+| `in both updates and unset` | `update_document` named a field in both | Use one of them per field |
+| `give updates, unset, or both` | `update_document` had nothing to change | Pass `updates` and/or `unset` |
 | `field "_id" in data is reserved` / `field "_id" cannot be changed` | `_id` was not a string on insert, or was in `updates` | Pass a string `_id` on insert only |
 | `validating "arguments"` | The arguments do not match the tool's input schema (missing field, wrong type, unknown operator or field type) | Fix the arguments; the message names the property; see `cachydb docs tools` |
 | `the database engine is shut down` | The server is stopping | Reconnect after it restarts |
@@ -31,7 +34,12 @@ starting `validating "arguments":`.
 
 | Message | Meaning | What to do |
 | --- | --- | --- |
-| `data directory is in use by another cachydb process` | Another server or utils command holds the directory lock | Stop it, use another `-R` directory, or connect to the running server over HTTP |
+| `data directory is in use by another cachydb process` | Another server or utils command holds the directory lock | Stop it, use another `-R` directory, or go through the running HTTP server with `cachydb client` (the message suggests the command) |
+| `connecting to the cachydb server at …` | `cachydb client` found no server at `--url` / `CACHYDB_URL` | Start one with `cachydb -t http -p 7601`, or fix the URL |
+| `tool error: …` | `cachydb client call` ran a tool that failed (exit status 1) | Read the tool's message after the prefix |
+| `already exists (use --on-conflict skip or replace)` | `utils import` / `client import` found an existing `_id`; the message says how many lines were applied | Rerun with `--on-conflict skip` or `replace` |
+| `exists with a different schema` / `different index set` | An import target collection differs from the file | Use `--on-conflict replace`, or import into another directory |
+| `unsupported export format version` | The file was written by a newer cachydb | Upgrade cachydb |
 | `incompatible data directory` | The directory was written by an older, incompatible cachydb | Use a new directory; the old data is not converted |
 | `database schema version is newer than supported` | The data was migrated by a newer cachydb | Upgrade cachydb |
 | `invalid transport` | `-t`/`TRANSPORT` is not `stdio` or `http` | Use `stdio` or `http` |

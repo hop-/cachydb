@@ -21,7 +21,7 @@ server instructions, and `cachydb://docs/<topic>` resources.
 
 - [DATABASE_ENGINE.md](DATABASE_ENGINE.md) — `pkg/db` public API, documents, schemas, query and index semantics, migrations
 - [STORAGE.md](STORAGE.md) — on-disk layout and formats, WAL, data segments, flush, recovery, compaction, lock order
-- [MCP_SERVER.md](MCP_SERVER.md) — the 12 MCP tools, transports, sessions, errors
+- [MCP_SERVER.md](MCP_SERVER.md) — the 21 MCP tools, transports, sessions, errors
 - [CLI.md](CLI.md) — commands (incl. `docs`, `version --json`), flags, environment variables, known issues
 - [DEVELOPMENT.md](DEVELOPMENT.md) — coding patterns, testing, benchmarks, known limitations
 
@@ -39,7 +39,7 @@ server instructions, and `cachydb://docs/<topic>` resources.
 │ opens Engine, Start / Stop      │             │
 └───────────────┬─────────────────┘             │
 ┌───────────────▼─────────────────┐             │
-│ internal/mcp (12 tools)         │             │
+│ internal/mcp (21 tools)         │             │
 │ stdio | Streamable HTTP (/mcp)  │             │
 │ per-session use_database        │             │
 └───────────────┬─────────────────┘             │
@@ -67,22 +67,24 @@ cachydb/
 ├── go.mod                   # github.com/hop-/cachydb, Go 1.25.5
 ├── internal/
 │   ├── app/                 # Builder (options → Engine + MCP server), App Start/Stop
-│   ├── cmd/                 # cobra commands: root/app, docs, version, healthcheck, utils list/migrate, flags
+│   ├── cmd/                 # cobra commands: root/app, docs, version, healthcheck, utils list/migrate/export/import/find/get, client, flags
+│   ├── exportfmt/           # JSONL export format, Export/Import over Source/Target (engine adapter)
 │   ├── config/              # envconfig settings, ByteSize parser, Windows root dir name
 │   ├── docs/                # embedded agent docs topics (cachydb docs, MCP resources)
 │   └── mcp/                 # server.go: handlers, sessions, transports;
 │                            # tools.go: tool definitions; docs.go: instructions, resources
 ├── pkg/db/
 │   ├── engine.go            # Engine, Open/Close, database create/drop
-│   ├── database.go          # Database, collection create/drop
-│   ├── collection.go        # Collection state, CreateIndex/DropIndex
-│   ├── document.go          # write path, read path, Find
+│   ├── database.go          # Database, collection create/drop/rename/copy
+│   ├── collection.go        # Collection state, CreateIndex/DropIndex, Schema/Indexes, UpdateSchema
+│   ├── document.go          # write path (UpdateWith, Replace, DeleteWith, conditions), read path, candidates
+│   ├── query.go             # Find (OR groups, sort, projection), CountDocuments, Distinct
 │   ├── flush.go             # parallel flusher, checkpoint markers, low-water mark
 │   ├── backpressure.go      # MaxPendingBytes write backpressure
 │   ├── metacp.go            # cachydb.metacp metadata checkpoint
 │   ├── recovery.go          # load at Open, idempotent WAL replay
 │   ├── compact.go           # background compaction
-│   ├── compare.go index.go  # query comparison, multi-value index
+│   ├── compare.go index.go  # operators, $now, multi-value index with per-element keys
 │   ├── types.go schema.go   # Document, Schema, Query; validation
 │   ├── meta.go format.go    # db.meta / coll.meta, cachydb.format
 │   ├── migration.go         # schema-version migrations
@@ -126,7 +128,7 @@ cachydb/
 MCP handler → Collection.Insert(ctx, doc)
   0. wait while unflushed bytes >= MaxPendingBytes (ctx-aware, no lock held)
   1. Database.mu (shared) → docLock(id) → read current version
-  2. build after-image, JSON round-trip, schema validation
+  2. check the "if" condition, build after-image, JSON round-trip, schema validation
   3. WAL append; group commit fsync                 ← commit point
   4. apply under Collection.mu: memtable, indexes, cache invalidation, count
   5. return id
@@ -139,9 +141,10 @@ up to FlushWorkers collections in parallel):
 
 ```
 Collection.Find(ctx, query)
-  candidates: smallest indexed-eq id set, else all live ids; sorted by _id
+  candidates: smallest index-backed set (eq, has, has_any, has_all), else all live ids; sorted by _id
   per id: memtable → flushing → LRU cache (decoded) → keydir → ReadAt + zstd + JSON
-  filter, skip, stop at skip+limit; return deep copies
+  filter (AND + OR groups); _id order: skip, stop at skip+limit;
+  other sort: bounded heap of skip+limit; project fields; return deep copies
 ```
 
 ### Startup
