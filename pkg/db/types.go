@@ -38,16 +38,21 @@ type Schema struct {
 
 // QueryFilter represents a query filter
 type QueryFilter struct {
-	Field    string `json:"field"`
-	Operator string `json:"operator"` // "eq", "ne", "gt", "lt", "gte", "lte", "in"
+	Field string `json:"field"`
+	// Operator is one of "eq", "ne", "gt", "gte", "lt", "lte", "in",
+	// "contains", "has", "has_any", "has_all".
+	Operator string `json:"operator"`
 	Value    any    `json:"value"`
 }
 
-// Query represents a query
+// Query represents a query. A document matches when it matches every
+// filter of Filters and, if Any is not empty, every filter of at least one
+// of its groups.
 type Query struct {
-	Filters []QueryFilter `json:"filters"`
-	Limit   int           `json:"limit"`
-	Skip    int           `json:"skip"`
+	Filters []QueryFilter   `json:"filters"`
+	Any     [][]QueryFilter `json:"any,omitempty"` // OR of AND groups; empty = no constraint
+	Limit   int             `json:"limit"`
+	Skip    int             `json:"skip"`
 }
 
 // Condition is the "if" of a conditional write: filters, with the same

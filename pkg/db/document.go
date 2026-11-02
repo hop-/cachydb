@@ -619,7 +619,9 @@ func (c *Collection) find(ctx context.Context, q *Query) ([]*Document, int, erro
 	}
 	skip := max(q.Skip, 0)
 	limit := max(q.Limit, 0)
-	filters := resolveNowFilters(q.Filters, nowString(time.Now()))
+	ts := nowString(time.Now())
+	filters := resolveNowFilters(q.Filters, ts)
+	anyOf := resolveNowGroups(q.Any, ts)
 
 	ids, err := c.candidates(filters)
 	if err != nil {
@@ -638,7 +640,7 @@ func (c *Collection) find(ctx context.Context, q *Query) ([]*Document, int, erro
 		if err != nil {
 			return nil, examined, err
 		}
-		if doc == nil || !matchesAll(doc, filters) {
+		if doc == nil || !matchesQuery(doc, filters, anyOf) {
 			continue // deleted since the candidates were taken, or no match
 		}
 		matched++
@@ -654,16 +656,6 @@ func (c *Collection) find(ctx context.Context, q *Query) ([]*Document, int, erro
 		}
 	}
 	return out, examined, nil
-}
-
-// matchesAll reports whether doc satisfies every filter.
-func matchesAll(doc *Document, filters []QueryFilter) bool {
-	for _, f := range filters {
-		if !matchesFilter(doc, f) {
-			return false
-		}
-	}
-	return true
 }
 
 // candidates returns, sorted, the ids Find must examine for filters: the
