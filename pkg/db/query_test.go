@@ -263,3 +263,104 @@ func TestRecoveryOldIndexSnapshotRebuilds(t *testing.T) {
 		t.Errorf("snapshots loaded after a clean close = %d, want 1", got)
 	}
 }
+
+func TestFindSort(t *testing.T) {
+	ctx := context.Background()
+	_, c := newTestColl(t, nil, nil)
+	values := map[string]any{
+		"m1": nil, "n1": 2.0, "n2": 10.0, "n3": 2.0, "s1": "b", "s2": "a",
+		"t1": true, "f1": false, "a1": []any{1.0}, "o1": map[string]any{"k": 1.0},
+	}
+	group := func(id string) int {
+		if slices.Contains([]string{"n1", "s1", "t1", "x1"}, id) {
+			return 1
+		}
+		return 0
+	}
+	for id, v := range values {
+		mustInsert(t, c, id, map[string]any{"v": v, "g": group(id)})
+	}
+	mustInsert(t, c, "x1", map[string]any{"g": 1}) // v missing
+
+	tests := []struct {
+		name string
+		sort []SortKey
+		want []string
+	}{
+		{"total order asc", []SortKey{{Field: "v"}}, []string{"x1", "m1", "f1", "t1", "n1", "n3", "n2", "s2", "s1", "a1", "o1"}},
+		{"total order desc", []SortKey{{Field: "v", Order: "desc"}}, []string{"o1", "a1", "s1", "s2", "n2", "n1", "n3", "t1", "f1", "m1", "x1"}},
+		{"_id asc", []SortKey{{Field: "_id", Order: "asc"}}, []string{"a1", "f1", "m1", "n1", "n2", "n3", "o1", "s1", "s2", "t1", "x1"}},
+		{"_id desc", []SortKey{{Field: "_id", Order: "desc"}}, []string{"x1", "t1", "s2", "s1", "o1", "n3", "n2", "n1", "m1", "f1", "a1"}},
+		{"multiple keys", []SortKey{{Field: "g", Order: "desc"}, {Field: "v", Order: "asc"}}, []string{"x1", "t1", "n1", "s1", "m1", "f1", "n3", "n2", "s2", "a1", "o1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := c.Find(ctx, &Query{Sort: tt.sort})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ids := docIDs(got); !slices.Equal(ids, tt.want) {
+				t.Fatalf("Find = %v, want %v", ids, tt.want)
+			}
+			// Deterministic paging: pages of 3 concatenate to the full order.
+			var paged []string
+			for skip := 0; skip < len(tt.want); skip += 3 {
+				page, err := c.Find(ctx, &Query{Sort: tt.sort, Skip: skip, Limit: 3})
+				if err != nil {
+					t.Fatal(err)
+				}
+				paged = append(paged, docIDs(page)...)
+			}
+			if !slices.Equal(paged, tt.want) {
+				t.Errorf("paged = %v, want %v", paged, tt.want)
+			}
+		})
+	}
+
+	t.Run("filters and sort", func(t *testing.T) {
+		got, err := c.Find(ctx, &Query{Filters: []QueryFilter{{"v", "gte", 2}}, Sort: []SortKey{{Field: "v", Order: "desc"}}, Limit: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ids := docIDs(got); !slices.Equal(ids, []string{"n2", "n1"}) {
+			t.Errorf("Find = %v, want [n2 n1]", ids)
+		}
+	})
+	t.Run("invalid order", func(t *testing.T) {
+		if _, err := c.Find(ctx, &Query{Sort: []SortKey{{Field: "v", Order: "up"}}}); err == nil {
+			t.Error("order up accepted")
+		}
+		if _, err := c.Find(ctx, &Query{Sort: []SortKey{{Order: "asc"}}}); err == nil {
+			t.Error("empty sort field accepted")
+		}
+	})
+}
+
+func TestFindProjection(t *testing.T) {
+	ctx := context.Background()
+	_, c := newTestColl(t, nil, nil)
+	seedKB(t, c)
+	got, err := c.Find(ctx, &Query{
+		Filters: []QueryFilter{{"type", "eq", "note"}}, // filter on a field that is not returned
+		Sort:    []SortKey{{Field: "prio", Order: "desc"}},
+		Fields:  []string{"title", "tags", "nope", "_id"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []*Document{
+		{ID: "k3", Data: map[string]any{"title": "MCP tools", "tags": []any{"mcp"}}},
+		{ID: "k1", Data: map[string]any{"title": "WAL internals", "tags": []any{"wal", "storage"}}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Find = %v, want %v", got, want)
+	}
+	got[0].Data["tags"].([]any)[0] = "mutated"
+	if again := mustGet(t, c, "k3"); again.Data["tags"].([]any)[0] != "mcp" {
+		t.Error("projected value shares memory with the stored document")
+	}
+	all, err := c.Find(ctx, &Query{Fields: []string{}, Limit: 1})
+	if err != nil || len(all) != 1 || len(all[0].Data) != 4 {
+		t.Errorf("empty field list = %v, %v; want whole documents", all, err)
+	}
+}

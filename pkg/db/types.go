@@ -50,9 +50,17 @@ type QueryFilter struct {
 // of its groups.
 type Query struct {
 	Filters []QueryFilter   `json:"filters"`
-	Any     [][]QueryFilter `json:"any,omitempty"` // OR of AND groups; empty = no constraint
+	Any     [][]QueryFilter `json:"any,omitempty"`    // OR of AND groups; empty = no constraint
+	Fields  []string        `json:"fields,omitempty"` // projection: top-level fields to return (_id always); empty = all
+	Sort    []SortKey       `json:"sort,omitempty"`   // sort keys in order, then _id ascending; empty = _id ascending
 	Limit   int             `json:"limit"`
 	Skip    int             `json:"skip"`
+}
+
+// SortKey is one sort key of a Query.
+type SortKey struct {
+	Field string `json:"field"`
+	Order string `json:"order,omitempty"` // "asc" (default) or "desc"
 }
 
 // Condition is the "if" of a conditional write: filters, with the same
