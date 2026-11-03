@@ -59,6 +59,10 @@ const (
 	codecZstd byte = 1
 )
 
+// maxZstdExpansion bounds the decompressed size of one compressed byte: a
+// zstd block holds at most 128 KiB and needs at least a 3-byte header.
+const maxZstdExpansion = 128 << 10
+
 // minCompressSize is the document size below which documents are stored
 // uncompressed (codec 0): zstd framing overhead outweighs any gain.
 const minCompressSize = 64
@@ -89,8 +93,11 @@ var (
 	zstdEncoder = sync.OnceValues(func() (*zstd.Encoder, error) {
 		return zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
 	})
+	// DecodeAll is capped at the capacity of the destination, which
+	// decodeBody sizes to the record's raw length, so a damaged frame
+	// header cannot make the decoder allocate more.
 	zstdDecoder = sync.OnceValues(func() (*zstd.Decoder, error) {
-		return zstd.NewReader(nil, zstd.WithDecoderConcurrency(0))
+		return zstd.NewReader(nil, zstd.WithDecoderConcurrency(0), zstd.WithDecodeAllCapLimit(true))
 	})
 )
 
@@ -203,6 +210,12 @@ func decodeBody(body []byte) (Record, error) {
 		}
 		r.Doc = append([]byte(nil), payload...)
 	case codecZstd:
+		// rawLen sizes the output buffer, so check it against the most
+		// the payload can expand to before allocating: a zstd block
+		// decodes to at most 128 KiB and takes at least 3 bytes.
+		if uint64(rawLen) > uint64(len(payload))*maxZstdExpansion {
+			return Record{}, fmt.Errorf("%w: raw length %d impossible for %d compressed bytes", errBadBody, rawLen, len(payload))
+		}
 		dec, err := zstdDecoder()
 		if err != nil {
 			return Record{}, fmt.Errorf("segment: creating zstd decoder: %w", err)
