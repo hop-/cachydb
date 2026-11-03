@@ -1,0 +1,155 @@
+# Nightly heavy tests (see TESTING.md):
+#
+# - stress: the full 200-run stress loop under the race detector;
+# - e2e: the real-process kill test (build tag e2e), 100 rounds;
+# - model: the model-based test, 20 seeds x 5000 operations;
+# - fuzz: every fuzz target for 60s.
+#
+# A failing job uploads what is needed to reproduce it (the e2e data
+# directory and server logs, the model log with its seeds, new fuzz
+# corpus entries) and fails the run; GitHub notifies the owner.
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # 03:17 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash # -eo pipefail
+
+env:
+  STRESS_PATTERN: "Crash|Recovery|Torn|Concurrent|Condition|Rename|Schema|Model|Compat"
+  STRESS_COUNT: "200"
+  E2E_ROUNDS: "100"
+  MODEL_SEEDS: "20"
+  MODEL_OPS: "5000"
+  FUZZ_TIME: "60s"
+
+jobs:
+  stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (stable)
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+
+      - name: Stress loop
+        run: go test -race -count="$STRESS_COUNT" -timeout 140m -run "$STRESS_PATTERN" ./pkg/db/...
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (stable)
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+
+      - name: Kill test
+        env:
+          # The runner's temp directory is on a real disk, so fsync is real.
+          TMPDIR: ${{ runner.temp }}
+          CACHYDB_E2E_ARTIFACTS: ${{ runner.temp }}/e2e-artifacts
+        run: |
+          mkdir -p "$CACHYDB_E2E_ARTIFACTS"
+          CACHYDB_E2E_ROUNDS="$E2E_ROUNDS" go test -tags e2e -count=1 -v -timeout 55m -run TestKill ./test/e2e/
+
+      - name: Upload the data directory and server logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-artifacts
+          path: ${{ runner.temp }}/e2e-artifacts
+          if-no-files-found: warn
+          retention-days: 14
+
+  model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (stable)
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+
+      - name: Long model run
+        run: |
+          CACHYDB_MODEL_SEEDS="$MODEL_SEEDS" CACHYDB_MODEL_OPS="$MODEL_OPS" \
+            go test -count=1 -v -timeout 55m -run TestModel ./pkg/db/ 2>&1 | tee model.log
+
+      - name: Upload the model log (seeds)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: model-log
+          path: model.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (stable)
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+
+      - name: Fuzz every target
+        run: |
+          fail=0
+          for pkg in ./pkg/db ./pkg/db/internal/wal ./pkg/db/internal/segment ./internal/exportfmt; do
+            for target in $(go test -list '^Fuzz' "$pkg" | grep '^Fuzz'); do
+              echo "::group::$pkg $target"
+              if ! go test -run '^$' -fuzz "^${target}\$" -fuzztime "$FUZZ_TIME" "$pkg"; then
+                echo "::error::$target in $pkg failed; the failing input is in the fuzz-corpus artifact"
+                fail=1
+              fi
+              echo "::endgroup::"
+            done
+          done
+          exit "$fail"
+
+      - name: Upload new fuzz corpus entries
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-corpus
+          path: "**/testdata/fuzz/**"
+          if-no-files-found: warn
+          retention-days: 14
