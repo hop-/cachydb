@@ -174,8 +174,9 @@ Heavy layers, opt-in (all run nightly in CI; details and commands in
 
 CI: `.github/workflows/test.yml` (every pull request and push to
 `master`: lint incl. `go mod tidy -diff`, `go test -race` and the quick
-stress loop on the `go.mod` minimum and stable Go on Linux plus stable on
-macOS, cross-builds, the 85.0% coverage floor) and
+stress loop on the `go.mod` minimum and stable Go, on Linux only (macOS
+runners are too slow; darwin is checked by the cross-build), cross-builds,
+the 85.0% coverage floor) and
 `.github/workflows/nightly.yml` (03:17 UTC: 200-run stress, 100 kill
 rounds, 20 × 5000 model operations, 60s per fuzz target; failure
 artifacts). Keep the default `go test -race ./...` at about a minute:

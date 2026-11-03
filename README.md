@@ -1,5 +1,15 @@
 # CachyDB
 
+[![test](https://github.com/hop-/cachydb/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/hop-/cachydb/actions/workflows/test.yml)
+[![nightly](https://github.com/hop-/cachydb/actions/workflows/nightly.yml/badge.svg?branch=master)](https://github.com/hop-/cachydb/actions/workflows/nightly.yml)
+[![docker](https://github.com/hop-/cachydb/actions/workflows/docker.yml/badge.svg)](https://github.com/hop-/cachydb/actions/workflows/docker.yml)
+[![Docker Image Version](https://img.shields.io/docker/v/hovhannespalyan/cachydb?sort=semver&label=docker%20image)](https://hub.docker.com/r/hovhannespalyan/cachydb)
+[![Docker Pulls](https://img.shields.io/docker/pulls/hovhannespalyan/cachydb)](https://hub.docker.com/r/hovhannespalyan/cachydb)
+[![Latest tag](https://img.shields.io/github/v/tag/hop-/cachydb?sort=semver&label=release)](https://github.com/hop-/cachydb/tags)
+[![Go Reference](https://pkg.go.dev/badge/github.com/hop-/cachydb.svg)](https://pkg.go.dev/github.com/hop-/cachydb/pkg/db)
+[![Go version](https://img.shields.io/github/go-mod/go-version/hop-/cachydb)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A lightweight document-based database with Model Context Protocol (MCP) support, similar to MongoDB but designed for simplicity and AI integration.
 
 ## Features

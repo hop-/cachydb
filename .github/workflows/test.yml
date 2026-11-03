@@ -2,8 +2,8 @@
 #
 # - lint: build, gofmt, vet, and go.mod/go.sum tidiness.
 # - test: go test -race and the quick stress loop on the minimum Go
-#   version (go.mod) and the current stable Go on Linux, plus stable Go on
-#   macOS.
+#   version (go.mod) and the current stable Go, on Linux only (macOS
+#   runners are too slow; darwin is covered by the cross-build).
 # - cross-build: every GOOS must compile (Linux and macOS are supported,
 #   the rest compile only).
 # - coverage: total statement coverage (-coverpkg=./...) must stay at or
@@ -66,21 +66,16 @@ jobs:
         run: go mod tidy -diff
 
   test:
-    name: test (${{ matrix.os }}, go ${{ matrix.go }})
-    runs-on: ${{ matrix.os }}
+    name: test (go ${{ matrix.go }})
+    # Linux only: macOS runners are much slower. macOS is still covered by
+    # the darwin cross-build below; run the suite there by hand when needed.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # "min" is the go directive in go.mod.
-          - os: ubuntu-latest
-            go: min
-          - os: ubuntu-latest
-            go: stable
-          # macOS on stable only, to limit cost.
-          - os: macos-latest
-            go: stable
+        # "min" is the go directive in go.mod.
+        go: [min, stable]
     steps:
       - name: Check out
         uses: actions/checkout@v7

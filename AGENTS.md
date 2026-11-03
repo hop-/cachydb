@@ -20,7 +20,7 @@ CachyDB is a lightweight document database with a built-in MCP (Model Context Pr
 - **Agent-facing docs** (for *using* cachydb): `./cachydb docs` (topics: overview, quickstart, mcp, tools, query, schema, config, errors), `./cachydb version --json`; over MCP the same topics are `cachydb://docs/<topic>` resources. The source is `internal/docs/topics/*.md`; the `tools` topic is generated from `internal/mcp/tools.go`.
 - **Stress test**: `go test -race -count=200 -run 'Crash|Recovery|Torn|Concurrent|Condition|Rename|Schema|Model|Compat' ./pkg/db/...` (slow)
 - **Heavy test layers** (opt-in, nightly in CI; see `TESTING.md`): fuzz targets (`go test -run '^$' -fuzz '^FuzzX$' -fuzztime 30s ./<pkg>`), the model test (`CACHYDB_MODEL_SEEDS`/`CACHYDB_MODEL_OPS`/`CACHYDB_MODEL_SEED`), the real-process kill test (`TMPDIR=$HOME/.cache/cachydb-e2e go test -tags e2e -run TestKill ./test/e2e/`, `CACHYDB_E2E_ROUNDS`); upgrade fixtures in `pkg/db/testdata/compat/` (one per release)
-- **CI**: `.github/workflows/test.yml` (lint, race tests on min/stable Go, Linux/macOS, cross-builds, 85% coverage floor) and `nightly.yml`
+- **CI**: `.github/workflows/test.yml` (lint, race tests on min/stable Go (Linux runners only), cross-builds, 85% coverage floor) and `nightly.yml`
 - **Client / offline data**: `./cachydb client call <tool> '<json>'` (also `tools`, `export`, `import`; `--url`/`CACHYDB_URL`) talks to a running HTTP server; `./cachydb utils export|import|find|get` work offline (they take the lock)
 
 ## Developer Documentation

@@ -47,8 +47,9 @@ to `master` (and on demand). A red check blocks a broken change:
 - **lint:** `go build ./...`, `gofmt`, `go vet ./...`, and
   `go mod tidy -diff` (`go.mod` and `go.sum` must be tidy);
 - **test:** `go test -race ./...` and the quick stress loop (below), on
-  the minimum Go version from `go.mod` and the current stable Go on
-  Linux, and on stable Go on macOS;
+  the minimum Go version from `go.mod` and the current stable Go, on
+  Linux runners only (macOS runners are too slow; macOS is checked by the
+  darwin cross-build, and you can run the suite there by hand);
 - **cross-build:** the `GOOS` builds below (Windows and the other
   platforms compile only);
 - **coverage:** `go test -coverpkg=./... ./...` must reach a total of
