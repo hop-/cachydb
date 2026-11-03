@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -134,5 +135,59 @@ func TestDecodeBodyMalformed(t *testing.T) {
 				t.Errorf("decodeBody error = %v, want errBadBody", err)
 			}
 		})
+	}
+}
+
+// TestDecodeBodyZstdRawLength checks that the raw length of a zstd record
+// (which sizes the output buffer) is checked against the payload before
+// anything is allocated, and that the decoder never writes past it. A
+// CRC-valid record with a huge raw length used to allocate that many
+// bytes (found by FuzzSegmentRecordDecode).
+func TestDecodeBodyZstdRawLength(t *testing.T) {
+	doc := largeDoc("z", 4096)
+	good, err := appendRecord(nil, &Record{Type: TypePut, WALOffset: 1, ID: "z", Doc: doc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawLenAt := 1 + 8 + 2 + len("z")
+	withRawLen := func(n uint32) []byte {
+		b := append([]byte(nil), good[recordHeaderSize:]...)
+		binary.LittleEndian.PutUint32(b[rawLenAt:], n)
+		return b
+	}
+	tests := []struct {
+		name   string
+		rawLen uint32
+	}{
+		{"huge", 0xFFFFFFF0},
+		{"beyond the payload's expansion", uint32(len(good)) * maxZstdExpansion},
+		{"one short", uint32(len(doc)) - 1},
+		{"one long", uint32(len(doc)) + 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := withRawLen(tt.rawLen)
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			_, err := decodeBody(body)
+			runtime.ReadMemStats(&after)
+			if !errors.Is(err, errBadBody) {
+				t.Fatalf("decodeBody error = %v, want errBadBody", err)
+			}
+			if n := after.TotalAlloc - before.TotalAlloc; n > 1<<20 {
+				t.Errorf("decodeBody allocated %d bytes for a %d-byte record", n, len(body))
+			}
+		})
+	}
+
+	// The tightest real compression (128 KiB RLE blocks) still decodes.
+	big := bytes.Repeat([]byte("a"), 4<<20)
+	enc, err := appendRecord(nil, &Record{Type: TypePut, WALOffset: 2, ID: "big", Doc: big})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := decodeBody(enc[recordHeaderSize:])
+	if err != nil || !bytes.Equal(rec.Doc, big) {
+		t.Fatalf("decoding a %d-byte document compressed to %d bytes: %v", len(big), len(enc), err)
 	}
 }

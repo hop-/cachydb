@@ -1,0 +1,164 @@
+# Go tests for every pull request and every push to master.
+#
+# - lint: build, gofmt, vet, and go.mod/go.sum tidiness.
+# - test: go test -race and the quick stress loop on the minimum Go
+#   version (go.mod) and the current stable Go, on Linux only (macOS
+#   runners are too slow; darwin is covered by the cross-build).
+# - cross-build: every GOOS must compile (Linux and macOS are supported,
+#   the rest compile only).
+# - coverage: total statement coverage (-coverpkg=./...) must stay at or
+#   above COVERAGE_FLOOR.
+#
+# The heavy runs (200-run stress loop, real-process kill test, long model
+# run, timed fuzzing) are in nightly.yml. See TESTING.md.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  COVERAGE_FLOOR: "85.0"
+  STRESS_PATTERN: "Crash|Recovery|Torn|Concurrent|Condition|Rename|Schema|Model|Compat"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (stable)
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+
+      - name: Build
+        run: go build ./...
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go.mod and go.sum are tidy
+        run: go mod tidy -diff
+
+  test:
+    name: test (go ${{ matrix.go }})
+    # Linux only: macOS runners are much slower. macOS is still covered by
+    # the darwin cross-build below; run the suite there by hand when needed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # "min" is the go directive in go.mod.
+        go: [min, stable]
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          # go-version takes precedence over go-version-file when set.
+          go-version: ${{ matrix.go == 'stable' && 'stable' || '' }}
+          go-version-file: ${{ matrix.go == 'min' && 'go.mod' || '' }}
+          cache-dependency-path: go.sum
+
+      - name: Go version
+        run: go version
+
+      - name: go test -race
+        run: go test -race ./...
+
+      - name: Quick stress loop
+        run: go test -race -count=20 -run "$STRESS_PATTERN" ./pkg/db/...
+
+  cross-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (stable)
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+
+      - name: Build for every GOOS
+        run: |
+          fail=0
+          for os in linux darwin freebsd openbsd netbsd dragonfly solaris illumos windows; do
+            echo "GOOS=$os"
+            GOOS=$os go build ./... || { echo "::error::build failed for GOOS=$os"; fail=1; }
+          done
+          # aix exists only on ppc64.
+          echo "GOOS=aix GOARCH=ppc64"
+          GOOS=aix GOARCH=ppc64 go build ./... || { echo "::error::build failed for GOOS=aix GOARCH=ppc64"; fail=1; }
+          exit "$fail"
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (stable)
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+
+      - name: Run the tests with coverage
+        run: go test -coverpkg=./... -coverprofile=cover.out ./...
+
+      - name: Check the coverage floor
+        run: |
+          go tool cover -func=cover.out | awk -v floor="$COVERAGE_FLOOR" '
+            /^total:/ { found = 1; pct = $NF; sub(/%/, "", pct) }
+            END {
+              if (!found) { print "::error::no total in the coverage report"; exit 1 }
+              printf "total coverage: %s%% (floor %s%%)\n", pct, floor
+              if (pct + 0 < floor + 0) { printf "::error::coverage %s%% is below the floor %s%%\n", pct, floor; exit 1 }
+            }'
+
+      - name: Upload cover.out
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cover.out
+          path: cover.out
+          if-no-files-found: warn
+          retention-days: 14

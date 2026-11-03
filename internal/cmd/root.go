@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -58,14 +59,27 @@ func init() {
 // a running server stops its transport and closes the engine. Errors are
 // printed to stderr and exit with status 1.
 func Execute() {
+	if code := execute(context.Background(), os.Stderr); code != 0 {
+		os.Exit(code)
+	}
+}
+
+// execute runs the root command with the arguments set on it (os.Args by
+// default) and returns the process exit status, printing an error to
+// stderr instead of exiting, so tests can check it.
+func execute(ctx context.Context, stderr io.Writer) int {
 	if configErr != nil {
-		fmt.Fprintln(os.Stderr, "Error:", configErr)
-		os.Exit(1)
+		fmt.Fprintln(stderr, "Error:", configErr)
+		return 1
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	err := rootCmd.ExecuteContext(ctx)
 	stop()
 
-	cobra.CheckErr(err)
+	if err != nil {
+		fmt.Fprintln(stderr, "Error:", err)
+		return 1
+	}
+	return 0
 }

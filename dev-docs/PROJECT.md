@@ -90,6 +90,8 @@ cachydb/
 │   ├── migration.go         # schema-version migrations
 │   ├── options.go errors.go names.go hooks.go
 │   ├── bench_test.go        # performance benchmarks
+│   ├── model_test.go        # randomized test against a reference model
+│   ├── testdata/compat/     # upgrade fixtures written by v0.0.4, v0.0.5, ...
 │   └── internal/{wal,segment,fsutil,cache}/
 ├── examples/
 │   ├── basic/main.go        # embed pkg/db as a library
@@ -97,7 +99,13 @@ cachydb/
 ├── Dockerfile .dockerignore # official image (distroless, non-root, /data volume)
 ├── docker-compose.yml       # example: HTTP server with a named volume
 ├── DOCKERHUB.md             # Docker Hub overview, synced on release
-└── .github/workflows/docker.yml  # PR smoke test; v* tags publish hovhannespalyan/cachydb
+├── test/
+│   ├── e2e/                 # real-process kill test (build tag e2e)
+│   └── compat/              # upgrade-fixture generator (gen/) and helpers
+└── .github/workflows/
+    ├── test.yml             # PR/master CI: lint, race tests, cross-builds, coverage floor
+    ├── nightly.yml          # stress, kill test, long model run, fuzzing
+    └── docker.yml           # PR smoke test; v* tags publish hovhannespalyan/cachydb
 ```
 
 ## Design Principles
