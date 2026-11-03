@@ -18,7 +18,9 @@ CachyDB is a lightweight document database with a built-in MCP (Model Context Pr
 - **Docker**: `docker run -d -p 7601:7601 -v cachydb-data:/data hovhannespalyan/cachydb` (HTTP; `-e TRANSPORT=stdio -i` for stdio); released by pushing a `vX.Y.Z` tag
 - **Data dir**: `~/.cachydb`; override with `-R` or `ROOT_DIR` (flag > env > default; also `-d`/`DB_NAME`, `-t`/`TRANSPORT`, `-p`/`PORT`)
 - **Agent-facing docs** (for *using* cachydb): `./cachydb docs` (topics: overview, quickstart, mcp, tools, query, schema, config, errors), `./cachydb version --json`; over MCP the same topics are `cachydb://docs/<topic>` resources. The source is `internal/docs/topics/*.md`; the `tools` topic is generated from `internal/mcp/tools.go`.
-- **Stress test**: `go test -race -count=200 -run 'Crash|Recovery|Torn|Concurrent|Condition|Rename|Schema' ./pkg/db/...` (slow)
+- **Stress test**: `go test -race -count=200 -run 'Crash|Recovery|Torn|Concurrent|Condition|Rename|Schema|Model|Compat' ./pkg/db/...` (slow)
+- **Heavy test layers** (opt-in, nightly in CI; see `TESTING.md`): fuzz targets (`go test -run '^$' -fuzz '^FuzzX$' -fuzztime 30s ./<pkg>`), the model test (`CACHYDB_MODEL_SEEDS`/`CACHYDB_MODEL_OPS`/`CACHYDB_MODEL_SEED`), the real-process kill test (`TMPDIR=$HOME/.cache/cachydb-e2e go test -tags e2e -run TestKill ./test/e2e/`, `CACHYDB_E2E_ROUNDS`); upgrade fixtures in `pkg/db/testdata/compat/` (one per release)
+- **CI**: `.github/workflows/test.yml` (lint, race tests on min/stable Go, Linux/macOS, cross-builds, 85% coverage floor) and `nightly.yml`
 - **Client / offline data**: `./cachydb client call <tool> '<json>'` (also `tools`, `export`, `import`; `--url`/`CACHYDB_URL`) talks to a running HTTP server; `./cachydb utils export|import|find|get` work offline (they take the lock)
 
 ## Developer Documentation
@@ -54,4 +56,5 @@ Start with `dev-docs/PROJECT.md`, then `dev-docs/DEVELOPMENT.md`. User-facing do
 | `internal/exportfmt/` | JSONL export format, `Export`/`Import` over a Source/Target (engine adapter here, MCP client adapter in `internal/cmd/client.go`) |
 | `internal/config/` | Environment configuration, `ByteSize` |
 | `internal/app/` | Builder and application lifecycle |
+| `test/e2e/`, `test/compat/` | Real-process kill test (build tag `e2e`); upgrade-fixture generator and helpers |
 | `Dockerfile`, `.github/workflows/docker.yml` | Official image `hovhannespalyan/cachydb`; PR smoke test, `v*` tags publish (see `dev-docs/DEVELOPMENT.md`, "Releasing") |

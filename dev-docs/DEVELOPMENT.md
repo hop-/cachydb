@@ -117,7 +117,9 @@ directories currently fail fast with `ErrIncompatibleDataDir` rather than
 being converted. Sidecars that can be rebuilt (index snapshots, plan 004:
 version 2) are simply rejected and rebuilt. Never change the numeric
 values of WAL ops (1–10) or record types; new metadata ops need a replay
-case in `replayRecord` and crash tests at `hookMetaWrite`.
+case in `replayRecord` and crash tests at `hookMetaWrite`. The upgrade
+fixtures (`TestCompatFixtures`) must keep passing; a new decoder gets a
+fuzz target next to it.
 
 ### Adding a migration
 
@@ -151,13 +153,33 @@ Tests use the stdlib `testing` package: table-driven with `t.Run`, data in
 `t.TempDir()`, no assertion libraries.
 
 ```bash
-go test -race ./...                                          # everything
+go test -race ./...                                          # everything (about a minute)
 go test -race ./pkg/db/...                                   # engine only
-go test -race -count=200 -run 'Crash|Recovery|Torn|Concurrent|Condition|Rename|Schema' ./pkg/db/...   # stress recovery (slow)
-test -z "$(gofmt -l .)" && go vet ./...
+go test -race -count=200 -run 'Crash|Recovery|Torn|Concurrent|Condition|Rename|Schema|Model|Compat' ./pkg/db/...   # stress (slow)
+test -z "$(gofmt -l .)" && go vet ./... && go mod tidy -diff
 for os in linux darwin freebsd openbsd netbsd dragonfly solaris illumos windows; do GOOS=$os go build ./... || echo "FAIL $os"; done
 GOOS=aix GOARCH=ppc64 go build ./...                         # aix exists only on ppc64
+go test -coverpkg=./... -coverprofile=cover.out ./... && go tool cover -func=cover.out | tail -1   # CI floor: 85.0%
 ```
+
+Heavy layers, opt-in (all run nightly in CI; details and commands in
+[TESTING.md](../TESTING.md)):
+
+| Layer | Where | Run | Knobs |
+| --- | --- | --- | --- |
+| Fuzzing | `fuzz_test.go` in `pkg/db`, `pkg/db/internal/{wal,segment}`, `internal/exportfmt` (11 targets) | `go test -run '^$' -fuzz '^FuzzX$' -fuzztime 30s ./<pkg>` | `-fuzztime`; crashers go to `testdata/fuzz/<Target>/` and are committed |
+| Model test | `pkg/db/model_test.go` (`TestModel`) | `go test -run TestModel ./pkg/db/` (2 seeds × 300 ops by default) | `CACHYDB_MODEL_SEEDS`, `CACHYDB_MODEL_OPS`, `CACHYDB_MODEL_SEED` (reproduce) |
+| Upgrade fixtures | `pkg/db/testdata/compat/<version>/`, `pkg/db/compat_test.go`, generator `test/compat/gen` | part of `go test ./...` | none; one fixture per release |
+| Kill test | `test/e2e/kill_test.go` (build tag `e2e`) | `TMPDIR=$HOME/.cache/cachydb-e2e go test -tags e2e -run TestKill ./test/e2e/` (real disk) | `CACHYDB_E2E_ROUNDS` (default 10), `CACHYDB_E2E_ARTIFACTS` |
+
+CI: `.github/workflows/test.yml` (every pull request and push to
+`master`: lint incl. `go mod tidy -diff`, `go test -race` and the quick
+stress loop on the `go.mod` minimum and stable Go on Linux plus stable on
+macOS, cross-builds, the 85.0% coverage floor) and
+`.github/workflows/nightly.yml` (03:17 UTC: 200-run stress, 100 kill
+rounds, 20 × 5000 model operations, 60s per fuzz target; failure
+artifacts). Keep the default `go test -race ./...` at about a minute:
+put anything heavy behind the `e2e` tag or an env knob.
 
 What exists:
 
@@ -201,6 +223,17 @@ What exists:
   to end.
 - `/healthz` (200, 405, 503 after `Engine.Close`): `TestHealthz` in
   `internal/mcp/server_test.go`.
+- Plan 005 (test hardening): fuzz targets (`fuzz_test.go`), the model
+  test (`pkg/db/model_test.go`), the upgrade fixtures
+  (`pkg/db/compat_test.go`, `test/compat/gen/main_test.go` checks the
+  generator on the current engine), compaction failure paths and
+  `mapWALErr` (`pkg/db/compact_errors_test.go`), `import --on-conflict
+  replace` with a different schema and indexes (`internal/exportfmt/replace_test.go`
+  offline, `TestClientImportReplace` through a server), every CLI command
+  run in-process through the root command including `app` over HTTP and
+  exit statuses (`internal/cmd/wrappers_test.go`; `Execute` delegates to
+  `execute`, which returns the status), and the kill test
+  (`test/e2e`).
 - The Docker image is tested only in CI: the `docker` workflow's
   pull-request run builds it and runs the smoke test (see
   [Releasing](#releasing)).
@@ -268,6 +301,22 @@ Actions): `DOCKERHUB_USERNAME` (`hovhannespalyan`) and `DOCKERHUB_TOKEN`, a
 Docker Hub personal access token with **Read, Write, Delete** scope (the
 overview sync needs Delete). A missing secret fails the run before any
 push, with the secret's name in the error.
+
+**Before tagging**: CI (`test` workflow) must be green on the release
+commit, and the latest `nightly` run too (or run its heavy tests
+locally, see [Testing](#testing)).
+
+**Upgrade fixture (every release)**: after tagging `vX.Y.Z`, generate the
+release's fixture with its own code and commit it as
+`pkg/db/testdata/compat/vX.Y.Z/`, using `test/compat/gen` in a git
+worktree of the tag (the commands are in
+[`pkg/db/testdata/compat/README.md`](../pkg/db/testdata/compat/README.md)).
+`TestCompatFixtures` then checks that every later version opens it and
+reads identical data. Never edit or regenerate an existing fixture; if a
+format change makes an old fixture unreadable, that is a compatibility
+break to handle (migration or an `ErrIncompatibleDataDir` message), not a
+fixture to update. Keep the generator on the engine API that every
+release since v0.0.4 has.
 
 **Re-publishing**: Actions > docker > Run workflow, with input `tag` (for
 example `v0.0.4`), rebuilds and pushes an existing tag. The tag must
