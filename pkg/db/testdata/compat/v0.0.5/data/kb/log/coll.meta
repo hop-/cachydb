@@ -1,0 +1,7 @@
+{
+  "name": "log",
+  "schema": null,
+  "indexes": [],
+  "wal_offset": 6,
+  "created_offset": 6
+}

@@ -1,0 +1,14 @@
+{
+  "name": "empty",
+  "schema": {
+    "fields": {
+      "name": {
+        "type": "string",
+        "required": true
+      }
+    }
+  },
+  "indexes": [],
+  "wal_offset": 9,
+  "created_offset": 9
+}
