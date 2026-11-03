@@ -1,7 +1,8 @@
 // Command basic shows how to embed CachyDB as a Go library: open an
 // engine on a data directory, create databases, collections, schemas, and
-// indexes, write and query documents, then close the engine and reopen
-// the directory to show the data is durable.
+// indexes, write and query documents (conditional updates, $now, tag
+// queries with projection and sort, count and distinct), then close the
+// engine and reopen the directory to show the data is durable.
 //
 // Usage:
 //
@@ -17,6 +18,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 
 	"github.com/hop-/cachydb/pkg/db"
 )
@@ -146,6 +148,37 @@ func run(ctx context.Context, dir string) error {
 	}
 	printDocs("Updated Alice", []*db.Document{updated})
 
+	// A conditional update (compare-and-set): it is written only if the
+	// stored document still matches If. {"$now": true} becomes the server's
+	// current time (RFC 3339, UTC).
+	onlyIfAge29 := db.Condition{{Field: "age", Operator: "eq", Value: 29}}
+	updated, _, err = users.UpdateWith(ctx, aliceID, db.UpdateSpec{
+		Set:   map[string]any{"age": 30, "updated": map[string]any{"$now": true}},
+		Unset: []string{"city"},
+		If:    onlyIfAge29,
+	})
+	if err != nil {
+		return err
+	}
+	printDocs("Alice after a conditional update (age 29 -> 30, city removed)", []*db.Document{updated})
+
+	// The same condition no longer matches, so nothing is written. Another
+	// agent that read the old version gets this error and re-reads.
+	_, _, err = users.UpdateWith(ctx, aliceID, db.UpdateSpec{
+		Set: map[string]any{"age": 99},
+		If:  onlyIfAge29,
+	})
+	if !errors.Is(err, db.ErrConditionFailed) {
+		return fmt.Errorf("expected a condition failure, got %v", err)
+	}
+	fmt.Println("\nSecond conditional update rejected:", err)
+
+	// Describe the collection: its schema and indexes.
+	fmt.Println("\nusers indexes:", users.Indexes())
+	if s := users.Schema(); s != nil {
+		fmt.Println("users required fields:", requiredFields(s))
+	}
+
 	if err := users.Delete(ctx, bobID); err != nil {
 		return err
 	}
@@ -163,16 +196,69 @@ func run(ctx context.Context, dir string) error {
 	if err != nil {
 		return err
 	}
-	laptopID, err := products.Insert(ctx, &db.Document{Data: map[string]any{
-		"name":  "Laptop",
-		"price": 999.99,
-		"stock": 50,
-		"tags":  []any{"electronics", "computers"},
+	for _, p := range []map[string]any{
+		{"name": "Laptop", "price": 999.99, "stock": 50, "tags": []any{"electronics", "computers"}},
+		{"name": "Phone", "price": 599, "stock": 120, "tags": []any{"electronics", "mobile"}},
+		{"name": "Desk", "price": 249.5, "stock": 8, "tags": []any{"furniture"}},
+	} {
+		id, err := products.Insert(ctx, &db.Document{Data: p})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Inserted product %s: %s\n", p["name"], id)
+	}
+
+	// An index on an array field indexes each element, so "has" queries on
+	// tags use it.
+	if err := products.CreateIndex(ctx, "tags_idx", "tags"); err != nil {
+		return err
+	}
+	hasElectronics := []db.QueryFilter{{Field: "tags", Operator: "has", Value: "electronics"}}
+
+	// Only the listed fields come back (plus _id), most expensive first.
+	electronics, err := products.Find(ctx, &db.Query{
+		Filters: hasElectronics,
+		Fields:  []string{"name", "price"},
+		Sort:    []db.SortKey{{Field: "price", Order: "desc"}},
+	})
+	if err != nil {
+		return err
+	}
+	printDocs("Electronics (name and price, by price descending)", electronics)
+
+	// Case-insensitive text search.
+	byName, err := products.Find(ctx, &db.Query{Filters: []db.QueryFilter{
+		{Field: "name", Operator: "contains", Value: "LAP"},
 	}})
 	if err != nil {
 		return err
 	}
-	fmt.Println("Inserted product:", laptopID)
+	printDocs(`Products whose name contains "lap"`, byName)
+
+	n, err := products.CountDocuments(ctx, &db.Query{Filters: hasElectronics})
+	if err != nil {
+		return err
+	}
+	tags, err := products.Distinct(ctx, "tags", nil)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("\nElectronics count: %d; all tags: %v\n", n, tags)
+
+	// The example doubles as a smoke test (main_test.go), so check what it
+	// printed.
+	var first *db.Document
+	if len(electronics) > 0 {
+		first = electronics[0]
+	}
+	if n != 2 || len(electronics) != 2 || first.Data["name"] != "Laptop" ||
+		len(byName) != 1 || len(tags) != 4 {
+		return fmt.Errorf("unexpected query results: count=%d electronics=%d byName=%d tags=%v",
+			n, len(electronics), len(byName), tags)
+	}
+	if _, hasStock := first.Data["stock"]; hasStock {
+		return errors.New("projection returned a field that was not requested")
+	}
 
 	closed = true
 	if err := engine.Close(ctx); err != nil {
@@ -222,6 +308,18 @@ func run(ctx context.Context, dir string) error {
 		return fmt.Errorf("closing engine: %w", err)
 	}
 	return nil
+}
+
+// requiredFields returns the names of a schema's required fields, sorted.
+func requiredFields(s *db.Schema) []string {
+	var names []string
+	for name, f := range s.Fields {
+		if f.Required {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	return names
 }
 
 func printDocs(title string, docs []*db.Document) {

@@ -2,29 +2,113 @@
 
 ## Automated Tests
 
+Run everything from the repository root.
+
 ```bash
-go test -race ./...                                   # all tests
-go test -race -count=20 -run 'Crash|Recovery|Torn|Concurrent' ./pkg/db/...   # recovery stress
-test -z "$(gofmt -l .)" && go vet ./...               # format and vet
+go test -race ./...                              # all tests (about a minute)
+go test -race ./pkg/db/...                       # engine only
+go test -race -run TestCrashMatrix ./pkg/db/     # a single test
+test -z "$(gofmt -l .)" && go vet ./...          # format and vet
 ```
 
-The suite covers the storage engine (WAL, data segments, flush, recovery
-with a crash-point matrix, compaction, query and index semantics), the MCP
-server (per-session `use_database`, an end-to-end tool flow), and the CLI.
+The suite covers:
+
+- **The storage engine:**
+  - the WAL, data segments, flush, and recovery with a crash-point
+    matrix;
+  - compaction, the metadata checkpoint, and the query and index
+    semantics;
+  - conditional writes and schema operations (update, rename, copy).
+- **The MCP server:** all 21 tools, per-session `use_database`, an
+  end-to-end tool flow, and the docs resources.
+- **The CLI:** `docs`, `healthcheck`, `utils` (including export/import
+  round trips), and `client` against a live test server.
+- **The examples:** `examples/basic` and `examples/mcp-client` run end to
+  end as smoke tests, and check their own results. The `mcp-client` test
+  builds the server binary first; `-short` skips it.
+
 Tests use only the standard `testing` package and temporary directories.
+
+### Stress tests
+
+The crash, recovery, concurrency, conditional-write, rename and schema
+tests are timing-sensitive. Run them many times before merging changes
+to the engine or making a release:
+
+```bash
+# Quick (about 30 seconds):
+go test -race -count=20 -run 'Crash|Recovery|Torn|Concurrent|Condition|Rename|Schema' ./pkg/db/...
+# Full, before a release (about 10 minutes):
+go test -race -count=200 -run 'Crash|Recovery|Torn|Concurrent|Condition|Rename|Schema' ./pkg/db/...
+```
+
+On a failure, the crash tests log the crash-hook trace, a listing of the
+data directory, and a diff of the expected and actual state.
+
+### Coverage
+
+```bash
+go test -coverpkg=./... -coverprofile=cover.out ./...   # run all tests, record coverage
+go tool cover -func=cover.out | tail -1                 # total percentage
+go tool cover -func=cover.out | grep -v examples/ | sort -k3 -n | head -30  # least-covered functions
+go tool cover -html=cover.out                           # line-by-line view in the browser
+go test -cover ./...                                    # quick per-package summary
+```
+
+`-coverpkg=./...` counts code exercised by tests in other packages too.
+For example, the engine is also exercised by the MCP and CLI tests.
+`cover.out` is a generated file; don't commit it. The example programs
+under `examples/` are covered by their smoke tests (see below).
+
+### Cross-platform builds
+
+Linux and macOS are supported. Every other target must still compile:
+
+```bash
+for os in linux darwin freebsd openbsd netbsd dragonfly solaris illumos windows; do GOOS=$os go build ./... || echo "FAIL $os"; done
+GOOS=aix GOARCH=ppc64 go build ./...    # aix exists only on ppc64
+```
 
 ### Benchmarks
 
 ```bash
-go test -run '^$' -bench . -benchmem ./pkg/db/...
+TMPDIR=$HOME/.cache/cachydb-bench go test -run '^$' -bench . -benchmem ./pkg/db/...
 ```
 
-`pkg/db/bench_test.go` measures parallel inserts (group commit), the cost
-of a one-document flush at 1k and 100k documents, cached and uncached
-reads, and indexed and scanning queries. Run them on a real disk: if
-`$TMPDIR` is a tmpfs, fsync costs nothing and the numbers are misleading.
-Point `TMPDIR` at the disk under test, e.g.
-`TMPDIR=$HOME/.cache/cachydb-bench go test -run '^$' -bench . ./pkg/db/...`.
+`pkg/db/bench_test.go` measures:
+
+- parallel inserts (group commit);
+- the cost of a one-document flush at 1k and 100k documents;
+- cached and uncached reads;
+- indexed and scanning queries.
+
+Run them on a real disk. If `$TMPDIR` is a tmpfs (as `/tmp` often is),
+fsync costs nothing and the numbers are misleading, hence the `TMPDIR`
+override above. To compare two versions, run both back to back on the
+same machine and disk. Absolute numbers vary between runs and days, so
+don't compare against numbers recorded earlier.
+
+### Docker image
+
+The image is tested in CI, not locally. Every pull request runs
+`.github/workflows/docker.yml`, which:
+
+- lints the Dockerfile and builds the image;
+- checks that it runs as UID 65532;
+- waits for it to report healthy and checks `GET /healthz`;
+- sends an MCP `initialize` over HTTP and checks `version --json`;
+- checks for a clean `docker stop`;
+- checks the stdio mode.
+
+### Before merging or releasing
+
+1. `go test -race ./...`
+2. The quick stress loop (the full 200-run loop before a release)
+3. Format and vet
+4. The cross-platform builds
+
+Check coverage and benchmarks when you change performance-sensitive code
+or add a feature.
 
 ## Using MCP Inspector (Recommended)
 
@@ -39,7 +123,7 @@ This will:
 
 - Start an interactive web UI
 - Connect to your server
-- Let you see all 12 tools
+- Let you see all 21 tools
 - Call tools with arguments
 - View responses in real-time
 

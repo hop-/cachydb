@@ -1,6 +1,8 @@
 // Command mcp-client connects to a cachydb binary over the stdio MCP
 // transport and exercises its tools: database management, collections
-// with a schema, document insert/find/update/delete, and indexes.
+// with a schema, document insert/find/update/delete, conditional updates
+// with $now, describe_collection, indexes, tag queries with projection and
+// sort, text search, count_documents, and distinct.
 //
 // Build the server first, from the repository root:
 //
@@ -86,15 +88,16 @@ func run(ctx context.Context, binPath, root string) (err error) {
 	fmt.Println()
 
 	steps := []struct {
-		title string
-		tool  string
-		args  map[string]any
+		title     string
+		tool      string
+		args      map[string]any
+		wantError bool // the call is expected to return a tool error
 	}{
-		{"=== Database management ===\nCurrent database", "current_database", nil},
-		{"Listing databases", "list_databases", nil},
-		{"Creating database 'test_db'", "create_database", map[string]any{"name": "test_db"}},
-		{"Switching this session to 'test_db'", "use_database", map[string]any{"name": "test_db"}},
-		{"Current database", "current_database", nil},
+		{"=== Database management ===\nCurrent database", "current_database", nil, false},
+		{"Listing databases", "list_databases", nil, false},
+		{"Creating database 'test_db'", "create_database", map[string]any{"name": "test_db"}, false},
+		{"Switching this session to 'test_db'", "use_database", map[string]any{"name": "test_db"}, false},
+		{"Current database", "current_database", nil, false},
 
 		{"=== Collections & documents ===\nCreating collection 'users' (in test_db)", "create_collection", map[string]any{
 			"name": "users",
@@ -105,40 +108,92 @@ func run(ctx context.Context, binPath, root string) (err error) {
 					"age":   map[string]any{"type": "number", "required": false},
 				},
 			},
-		}},
+		}, false},
 		{"Inserting Alice (generated ID)", "insert_document", map[string]any{
 			"collection": "users",
 			"document":   map[string]any{"name": "Alice Johnson", "email": "alice@example.com", "age": 28},
-		}},
+		}, false},
 		{"Inserting Bob (client-chosen ID 'bob')", "insert_document", map[string]any{
 			"collection": "users",
 			"document":   map[string]any{"_id": "bob", "name": "Bob Smith", "email": "bob@example.com", "age": 35},
-		}},
+		}, false},
 		{"Creating index on email", "create_index", map[string]any{
 			"collection": "users", "index_name": "email_idx", "field_name": "email",
-		}},
+		}, false},
 		{"Finding all documents", "find_documents", map[string]any{
 			"collection": "users", "query": map[string]any{},
-		}},
+		}, false},
 		{"Finding documents with age >= 30", "find_documents", map[string]any{
 			"collection": "users",
 			"query": map[string]any{
 				"filters": []map[string]any{{"field": "age", "operator": "gte", "value": 30}},
 			},
-		}},
+		}, false},
 		{"Finding by email (uses the index)", "find_documents", map[string]any{
 			"collection": "users",
 			"query": map[string]any{
 				"filters": []map[string]any{{"field": "email", "operator": "eq", "value": "bob@example.com"}},
 			},
-		}},
+		}, false},
 		{"Updating Bob", "update_document", map[string]any{
 			"collection": "users", "id": "bob", "updates": map[string]any{"age": 36, "city": "Berlin"},
-		}},
+		}, false},
+		{"Conditional update of Bob (only if age is still 36; stamps the server time)", "update_document", map[string]any{
+			"collection": "users", "id": "bob",
+			"updates": map[string]any{"age": 37, "updated": map[string]any{"$now": true}},
+			"unset":   []string{"city"},
+			"if":      []map[string]any{{"field": "age", "operator": "eq", "value": 36}},
+		}, false},
+		{"Same condition again (expected to fail: age is now 37)", "update_document", map[string]any{
+			"collection": "users", "id": "bob",
+			"updates": map[string]any{"age": 99},
+			"if":      []map[string]any{{"field": "age", "operator": "eq", "value": 36}},
+		}, true},
+		{"Describing 'users' (schema, indexes, count)", "describe_collection", map[string]any{
+			"collection": "users",
+		}, false},
 		{"Deleting Bob", "delete_document", map[string]any{
 			"collection": "users", "id": "bob",
-		}},
-		{"Listing collections in the current database", "list_collections", nil},
+		}, false},
+
+		{"=== Tags, projection, sort, count, distinct ===\nCreating schemaless collection 'notes'", "create_collection", map[string]any{
+			"name": "notes",
+		}, false},
+		{"Inserting a note", "insert_document", map[string]any{
+			"collection": "notes",
+			"document":   map[string]any{"_id": "n1", "title": "WAL design", "priority": 2, "tags": []string{"storage", "durability"}},
+		}, false},
+		{"Inserting another note", "insert_document", map[string]any{
+			"collection": "notes",
+			"document":   map[string]any{"_id": "n2", "title": "Index snapshots", "priority": 5, "tags": []string{"storage", "index"}},
+		}, false},
+		{"Indexing tags (each array element is indexed)", "create_index", map[string]any{
+			"collection": "notes", "index_name": "tags_idx", "field_name": "tags",
+		}, false},
+		{"Notes tagged 'storage': titles only, highest priority first", "find_documents", map[string]any{
+			"collection": "notes",
+			"query": map[string]any{
+				"filters": []map[string]any{{"field": "tags", "operator": "has", "value": "storage"}},
+				"fields":  []string{"title"},
+				"sort":    []map[string]any{{"field": "priority", "order": "desc"}},
+			},
+		}, false},
+		{"Notes whose title contains 'wal' (any case)", "find_documents", map[string]any{
+			"collection": "notes",
+			"query": map[string]any{
+				"filters": []map[string]any{{"field": "title", "operator": "contains", "value": "wal"}},
+			},
+		}, false},
+		{"Counting notes tagged 'storage'", "count_documents", map[string]any{
+			"collection": "notes",
+			"query": map[string]any{
+				"filters": []map[string]any{{"field": "tags", "operator": "has", "value": "storage"}},
+			},
+		}, false},
+		{"Distinct tags", "distinct", map[string]any{
+			"collection": "notes", "field": "tags",
+		}, false},
+		{"Listing collections in the current database", "list_collections", nil, false},
 	}
 
 	for _, s := range steps {
@@ -151,8 +206,15 @@ func run(ctx context.Context, binPath, root string) (err error) {
 		if err != nil {
 			return fmt.Errorf("calling %s: %w", s.tool, err)
 		}
-		if res.IsError {
+		if res.IsError != s.wantError {
+			if s.wantError {
+				return fmt.Errorf("tool %s succeeded but was expected to fail: %s", s.tool, resultText(res))
+			}
 			return fmt.Errorf("tool %s failed: %s", s.tool, resultText(res))
+		}
+		if s.wantError {
+			fmt.Printf("  failed as expected: %s\n\n", resultText(res))
+			continue
 		}
 		fmt.Printf("  %s\n\n", resultText(res))
 	}

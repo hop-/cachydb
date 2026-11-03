@@ -15,6 +15,12 @@ Embeds CachyDB as a Go library (`pkg/db`), without MCP.
 - Schema validation errors (`db.ErrSchemaValidation`)
 - Creating an index and querying with filters (results sorted by `_id`)
 - Updating and deleting documents
+- A conditional update (`UpdateWith` with `If`, i.e. compare-and-set), `$now`
+  server timestamps, `Unset`, and the `ErrConditionFailed` a stale writer gets
+- Inspecting a collection's schema and indexes (`Schema`, `Indexes`)
+- Tag queries on an indexed array field (`has`), with projection (`Fields`)
+  and sorting (`Sort`), plus `contains` text search, `CountDocuments`, and
+  `Distinct`
 - Closing the engine, reopening the same directory, and finding the data
   still there (durability)
 
@@ -44,7 +50,15 @@ official Go SDK client.
 - Database management (`create_database`, `use_database`, `current_database`, ...)
 - Creating a collection with a schema
 - Inserting, finding (with `query.filters`), updating, and deleting documents
-- Creating an index
+- A conditional `update_document` (`if`, `$now`, `unset`), and the expected
+  error when the condition no longer matches
+- `describe_collection`
+- Creating indexes, including one on an array field, and querying it with
+  `has`, `fields`, and `sort`; `contains` text search; `count_documents` and
+  `distinct`
+
+It also shows how a client tells an expected tool error from a real failure
+(`CallToolResult.IsError`).
 
 The tool schemas the client receives are typed (enums for `operator` and
 field `type`); `cachydb docs tools --format json` prints them without a
@@ -72,6 +86,17 @@ touches the default `~/.cachydb` (which a running server may have locked).
 - **Use `basic/`** to embed CachyDB in your own Go application
 - **Use `mcp-client/`** to see how MCP clients (AI assistants, tools) talk to CachyDB
 - **Use the MCP Inspector** (see [TESTING.md](../TESTING.md)) for interactive testing with a web UI
+
+## Tests
+
+Each example has a smoke test (`main_test.go`) that runs the whole program,
+and the programs check their own results. `go test ./...` therefore fails
+when an example no longer works with the current API or tools:
+
+```bash
+go test ./examples/...          # both (mcp-client builds the cachydb binary first)
+go test -short ./examples/...   # basic only; skips the binary build
+```
 
 ## Requirements
 

@@ -13,3 +13,6 @@ examples/*
 examples/*/*
 !examples/*/*.go
 !examples/*/*.md
+
+# Coverage profiles (see TESTING.md)
+cover.out
