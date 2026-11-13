@@ -12,7 +12,7 @@ CachyDB is a lightweight document database with a built-in MCP (Model Context Pr
 - **Module**: `github.com/hop-/cachydb`
 - **Build**: `go build -o cachydb`
 - **Test**: `go test -race ./...`
-- **Lint**: `test -z "$(gofmt -l .)" && go vet ./...`
+- **Lint**: `test -z "$(gofmt -l .)" && go vet ./... && go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...`
 - **Benchmarks**: `go test -run '^$' -bench . -benchmem ./pkg/db/...`
 - **Run**: `./cachydb` (stdio) or `./cachydb -t http -p 7601` (HTTP at `/mcp`, health at `/healthz`)
 - **Docker**: `docker run -d -p 7601:7601 -v cachydb-data:/data hovhannespalyan/cachydb` (HTTP; `-e TRANSPORT=stdio -i` for stdio); released by pushing a `vX.Y.Z` tag

@@ -65,8 +65,13 @@ Follow the Go conventions used throughout the code:
   stderr.
 - Never hold `Collection.mu` across file I/O. Respect the lock order in
   [STORAGE.md](STORAGE.md#concurrency-and-lock-order).
-- Format with `gofmt`; lint with `go vet` (there is no golangci-lint
-  config).
+- Format with `gofmt`; lint with `go vet` and `staticcheck` (there is no
+  golangci-lint config). `staticcheck` is pinned and run with `go run`, so
+  it is not in `go.mod`:
+  `go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...` (Staticcheck
+  2026.2.2; CI runs the same command, so change the version in
+  `.github/workflows/test.yml` too). Fix what it reports; suppress a
+  finding only with a `//lint:ignore <check> <reason>` comment.
 
 ## Key Patterns
 
@@ -158,6 +163,7 @@ go test -race ./...                                          # everything (about
 go test -race ./pkg/db/...                                   # engine only
 go test -race -count=200 -run 'Crash|Recovery|Torn|Concurrent|Condition|Rename|Schema|Model|Compat' ./pkg/db/...   # stress (slow)
 test -z "$(gofmt -l .)" && go vet ./... && go mod tidy -diff
+go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...       # pinned; also in CI
 for os in linux darwin freebsd openbsd netbsd dragonfly solaris illumos windows; do GOOS=$os go build ./... || echo "FAIL $os"; done
 GOOS=aix GOARCH=ppc64 go build ./...                         # aix exists only on ppc64
 go test -coverpkg=./... -coverprofile=cover.out ./... && go tool cover -func=cover.out | tail -1   # CI floor: 85.0%
@@ -174,7 +180,7 @@ Heavy layers, opt-in (all run nightly in CI; details and commands in
 | Kill test | `test/e2e/kill_test.go` (build tag `e2e`) | `TMPDIR=$HOME/.cache/cachydb-e2e go test -tags e2e -run TestKill ./test/e2e/` (real disk) | `CACHYDB_E2E_ROUNDS` (default 10), `CACHYDB_E2E_ARTIFACTS` |
 
 CI: `.github/workflows/test.yml` (every pull request and push to
-`master`: lint incl. `go mod tidy -diff`, `go test -race` and the quick
+`master`: lint incl. `staticcheck` and `go mod tidy -diff`, `go test -race` and the quick
 stress loop on the `go.mod` minimum and stable Go, on Linux only (macOS
 runners are too slow; darwin is checked by the cross-build), cross-builds,
 the 85.0% coverage floor) and

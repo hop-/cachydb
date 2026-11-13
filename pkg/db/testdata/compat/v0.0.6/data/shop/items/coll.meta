@@ -1,0 +1,12 @@
+{
+  "name": "items",
+  "schema": null,
+  "indexes": [
+    {
+      "name": "by_cat",
+      "field": "cat"
+    }
+  ],
+  "wal_offset": 8,
+  "created_offset": 7
+}

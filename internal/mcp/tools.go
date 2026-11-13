@@ -65,7 +65,7 @@ type SchemaDef struct {
 type CreateCollectionInput struct {
 	Database string     `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
 	Name     string     `json:"name" jsonschema:"Collection name: letters, digits, _ and -, starting with a letter or digit, at most 64 characters"`
-	Schema   *SchemaDef `json:"schema,omitempty" jsonschema:"Optional schema, checked on every insert and update; fixed once created. Omit for a schemaless collection"`
+	Schema   *SchemaDef `json:"schema,omitempty" jsonschema:"Optional schema, checked on every insert and update; change it later with update_schema. Omit for a schemaless collection"`
 }
 
 type ListCollectionsInput struct {

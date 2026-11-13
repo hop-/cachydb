@@ -1,0 +1,27 @@
+{
+  "name": "notes",
+  "schema": {
+    "fields": {
+      "prio": {
+        "type": "number",
+        "required": false
+      },
+      "title": {
+        "type": "string",
+        "required": true
+      }
+    }
+  },
+  "indexes": [
+    {
+      "name": "by_prio",
+      "field": "prio"
+    },
+    {
+      "name": "by_tags",
+      "field": "tags"
+    }
+  ],
+  "wal_offset": 5,
+  "created_offset": 3
+}

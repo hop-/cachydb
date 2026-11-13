@@ -9,6 +9,7 @@ go test -race ./...                              # all tests (about a minute)
 go test -race ./pkg/db/...                       # engine only
 go test -race -run TestCrashMatrix ./pkg/db/     # a single test
 test -z "$(gofmt -l .)" && go vet ./...          # format and vet
+go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...   # staticcheck (pinned; also in CI)
 ```
 
 The suite covers:
@@ -31,7 +32,7 @@ The suite covers:
 - **A model-based test** (`TestModel`) that runs random operations
   against the engine and an in-memory reference model.
 - **Upgrade fixtures** (`TestCompatFixtures`): data directories written by
-  v0.0.4 and v0.0.5 must open and read identically.
+  v0.0.4, v0.0.5 and v0.0.6 must open and read identically.
 - **A real-process kill test** (`test/e2e`, build tag `e2e`, not part of
   `go test ./...`).
 
@@ -44,7 +45,7 @@ CI; the commands below run them locally.
 `.github/workflows/test.yml` runs on every pull request and every push
 to `master` (and on demand). A red check blocks a broken change:
 
-- **lint:** `go build ./...`, `gofmt`, `go vet ./...`, and
+- **lint:** `go build ./...`, `gofmt`, `go vet ./...`, `staticcheck`, and
   `go mod tidy -diff` (`go.mod` and `go.sum` must be tidy);
 - **test:** `go test -race ./...` and the quick stress loop (below), on
   the minimum Go version from `go.mod` and the current stable Go, on
@@ -135,7 +136,7 @@ same operations.
 ### Upgrade fixtures
 
 `pkg/db/testdata/compat/<version>/` holds a data directory written by
-that release (v0.0.4, v0.0.5) and `expected.jsonl`, its logical content
+that release (v0.0.4, v0.0.5, v0.0.6) and `expected.jsonl`, its logical content
 in the export format. `TestCompatFixtures` opens a copy of each one,
 compares the export with `expected.jsonl`, checks the indexes against a
 scan, and writes and reopens. Every release adds its fixture, generated

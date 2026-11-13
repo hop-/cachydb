@@ -56,7 +56,8 @@ func saveGlobals(t *testing.T) {
 // keeps the context of the first run that reached it, which in a test
 // binary is an earlier (cancelled) run.
 func resetContexts(c *cobra.Command) {
-	c.SetContext(nil) //nolint:staticcheck // nil makes cobra take the root's context again
+	//lint:ignore SA1012 nil makes cobra take the root's context again
+	c.SetContext(nil)
 	for _, sub := range c.Commands() {
 		resetContexts(sub)
 	}

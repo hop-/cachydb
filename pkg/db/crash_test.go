@@ -34,21 +34,6 @@ type modelColl struct {
 	docs    map[string]map[string]any // id -> data
 }
 
-func (m model) clone() model {
-	out := make(model, len(m))
-	for dn, colls := range m {
-		out[dn] = make(map[string]*modelColl, len(colls))
-		for cn, mc := range colls {
-			docs := make(map[string]map[string]any, len(mc.docs))
-			for id, data := range mc.docs {
-				docs[id] = maps.Clone(data)
-			}
-			out[dn][cn] = &modelColl{schema: cloneSchema(mc.schema), indexes: maps.Clone(mc.indexes), docs: docs}
-		}
-	}
-	return out
-}
-
 // dump renders m deterministically, for comparisons with readable diffs.
 func (m model) dump() string {
 	var b strings.Builder
