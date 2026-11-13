@@ -81,7 +81,7 @@ on-disk format versions this build reads and writes.
 
 | Method | Notes |
 |--------|-------|
-| `Insert(ctx, *Document) (string, error)` | Empty `doc.ID` gets a UUID; `ErrExists`; `ErrSchemaValidation` (schema, or `"_id"` key in `Data`) |
+| `Insert(ctx, *Document) (string, error)` | Empty `doc.ID` gets a UUID v7 (generated ids sort in creation order); `ErrExists`; `ErrSchemaValidation` (schema, or `"_id"` key in `Data`) |
 | `Get(ctx, id) (*Document, error)` | Deep copy; `ErrNotFound` |
 | `Find(ctx, *Query) ([]*Document, error)` | See [Queries](#queries) |
 | `CountDocuments(ctx, *Query) (int, error)` | Filters and `Any` only; fast paths below |

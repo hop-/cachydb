@@ -212,10 +212,11 @@ standalone SSE, no retries) for a running `cachydb -t http` server.
 
 ## Configuration
 
-Settings come from environment variables (`internal/config/config.go`,
-loaded with `envconfig` using `envconfig:"NAME"` tags) and are overridden
-by flags: the flag defaults are the configured values. A malformed value
-(e.g. `WAL_RETENTION_AGE=soon`) aborts startup with exit status 1.
+Settings come from environment variables (`internal/config/config.go`:
+`Init` reads each one with `fromEnv`, the defaults are in `defaults()`)
+and are overridden by flags: the flag defaults are the configured values.
+A malformed value (e.g. `WAL_RETENTION_AGE=soon`) aborts startup with exit
+status 1 and an error that names the variable.
 
 | Environment variable | Default | Flag |
 |----------------------|---------|------|
@@ -239,7 +240,8 @@ Precedence: flag > environment variable > default.
   if the result is a whole number of bytes (`1.5GiB`). Negative values are
   rejected.
 - **Durations**: Go syntax (`90m`, `24h`, `168h`).
-- **Empty values**: `DB_NAME=` or `TRANSPORT=` count as unset.
+- **Empty values**: an empty variable (`DB_NAME=`, `PORT=`) counts as
+  unset.
 - **Default root**: `$HOME/.cachydb` (`CachyDB` instead of `.cachydb` on
   Windows, which is unsupported). If the home directory cannot be found,
   `./.cachydb`.

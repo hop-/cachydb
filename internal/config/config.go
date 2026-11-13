@@ -1,37 +1,51 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
-
-	"github.com/kelseyhightower/envconfig"
 )
 
 // Config is the environment configuration. Flags override every value
 // (precedence: flag > environment variable > default).
 type Config struct {
 	// Port is the HTTP transport port (env PORT).
-	Port int `envconfig:"PORT" default:"7601"`
+	Port int
 	// RootDir is the data directory (env ROOT_DIR); empty means
 	// $HOME/<RootDirName>.
-	RootDir     string `envconfig:"ROOT_DIR" default:""`
-	RootDirName string `default:".cachydb"`
+	RootDir     string
+	RootDirName string
 	// DBName is the default database the server creates and uses (env
 	// DB_NAME).
-	DBName string `envconfig:"DB_NAME" default:"main"`
+	DBName string
 	// Transport is "stdio" or "http" (env TRANSPORT).
-	Transport string `envconfig:"TRANSPORT" default:"stdio"`
+	Transport string
 
 	// WALRetentionAge keeps processed WAL segments for this long; 0 means
-	// no age limit.
-	WALRetentionAge time.Duration `envconfig:"WAL_RETENTION_AGE" default:"24h"`
+	// no age limit (env WAL_RETENTION_AGE).
+	WALRetentionAge time.Duration
 	// WALRetentionSize caps the total size of processed WAL segments; 0
-	// means no size limit.
-	WALRetentionSize ByteSize `envconfig:"WAL_RETENTION_SIZE" default:"1GiB"`
-	// CacheSize bounds the document cache; 0 disables it.
-	CacheSize ByteSize `envconfig:"CACHE_SIZE" default:"64MiB"`
+	// means no size limit (env WAL_RETENTION_SIZE).
+	WALRetentionSize ByteSize
+	// CacheSize bounds the document cache; 0 disables it (env CACHE_SIZE).
+	CacheSize ByteSize
+}
+
+// defaults returns the configuration of an empty environment. RootDir is
+// derived from RootDirName by Init.
+func defaults() Config {
+	return Config{
+		Port:             7601,
+		RootDirName:      ".cachydb",
+		DBName:           "main",
+		Transport:        "stdio",
+		WALRetentionAge:  24 * time.Hour,
+		WALRetentionSize: GiB,
+		CacheSize:        64 * MiB,
+	}
 }
 
 var cfg Config
@@ -41,28 +55,26 @@ var (
 )
 
 // Init loads the configuration from the environment and applies the
-// defaults. It returns an error for a malformed value (for example
-// WAL_RETENTION_AGE=soon); the fields that did parse are still set.
+// defaults. It returns an error that names the variable for a malformed
+// value (for example WAL_RETENTION_AGE=soon); that setting keeps its
+// default and the others are still set.
 func Init() error {
-	// Start from zero values: envconfig leaves a field without a default
-	// untouched when its variable is unset, so a previous Init's value
-	// would otherwise survive.
-	cfg = Config{}
-	err := envconfig.Process("", &cfg)
-	if err != nil {
-		err = fmt.Errorf("loading configuration from the environment: %w", err)
-	}
-
-	// An empty variable (DB_NAME=) means "not set", like an unset one.
-	if cfg.DBName == "" {
-		cfg.DBName = "main"
-	}
-	if cfg.Transport == "" {
-		cfg.Transport = "stdio"
-	}
-
+	cfg = defaults()
 	if windowsRootDirName != "" {
 		cfg.RootDirName = windowsRootDirName
+	}
+
+	err := errors.Join(
+		fromEnv("PORT", &cfg.Port, strconv.Atoi),
+		fromEnv("ROOT_DIR", &cfg.RootDir, asIs),
+		fromEnv("DB_NAME", &cfg.DBName, asIs),
+		fromEnv("TRANSPORT", &cfg.Transport, asIs),
+		fromEnv("WAL_RETENTION_AGE", &cfg.WALRetentionAge, time.ParseDuration),
+		fromEnv("WAL_RETENTION_SIZE", &cfg.WALRetentionSize, ParseByteSize),
+		fromEnv("CACHE_SIZE", &cfg.CacheSize, ParseByteSize),
+	)
+	if err != nil {
+		err = fmt.Errorf("loading configuration from the environment: %w", err)
 	}
 
 	if cfg.RootDir == "" {
@@ -76,6 +88,26 @@ func Init() error {
 
 	return err
 }
+
+// fromEnv sets *dst to the parsed value of the environment variable name.
+// An empty variable (DB_NAME=) means "not set", like an unset one, and
+// leaves *dst alone; so does a malformed value, which is returned as an
+// error that names the variable.
+func fromEnv[T any](name string, dst *T, parse func(string) (T, error)) error {
+	s := os.Getenv(name)
+	if s == "" {
+		return nil
+	}
+	v, err := parse(s)
+	if err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	*dst = v
+	return nil
+}
+
+// asIs is the parser of a string setting.
+func asIs(s string) (string, error) { return s, nil }
 
 // GetConfig returns the configuration loaded by Init.
 func GetConfig() Config {

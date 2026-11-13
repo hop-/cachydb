@@ -69,7 +69,7 @@ cachydb/
 │   ├── app/                 # Builder (options → Engine + MCP server), App Start/Stop
 │   ├── cmd/                 # cobra commands: root/app, docs, version, healthcheck, utils list/migrate/export/import/find/get, client, flags
 │   ├── exportfmt/           # JSONL export format, Export/Import over Source/Target (engine adapter)
-│   ├── config/              # envconfig settings, ByteSize parser, Windows root dir name
+│   ├── config/              # environment settings, ByteSize parser, Windows root dir name
 │   ├── docs/                # embedded agent docs topics (cachydb docs, MCP resources)
 │   └── mcp/                 # server.go: handlers, sessions, transports;
 │                            # tools.go: tool definitions; docs.go: instructions, resources

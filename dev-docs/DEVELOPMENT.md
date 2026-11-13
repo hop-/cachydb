@@ -132,8 +132,9 @@ idempotent (see [DATABASE_ENGINE.md](DATABASE_ENGINE.md#migrations)).
 Add the command in `internal/cmd/` with `RunE` and register it in `init`.
 Give it an `Example` (a test requires one on every command). Utility
 commands open the engine through `withEngine`. A new engine setting needs a
-`Config` field with an `envconfig:"NAME"` tag (`envconfig` ignores `env:`
-tags), a flag in `setEngineFlags` whose default is the configured value
+`Config` field, its default in `defaults()` and a `fromEnv("NAME", ...)`
+line in `Init` (`internal/config/config.go`; no struct tags), a flag in
+`setEngineFlags` whose default is the configured value
 (flag > env > default) and whose usage names the env var, a `Builder`
 method that maps it into `db.Options`, and a row in
 `internal/docs/topics/config.md`.
@@ -337,8 +338,9 @@ tag). Keep `DOCKERHUB.md` under 25,000 bytes (Docker Hub's limit).
 | `github.com/google/jsonschema-go` | v0.4.3 | Tool input/output schemas (the SDK's schema package) |
 | `github.com/klauspost/compress` | v1.20.4 | zstd for data segments |
 | `github.com/spf13/cobra` | v1.10.2 | CLI framework |
-| `github.com/kelseyhightower/envconfig` | v1.4.0 | Env-var configuration |
-| `github.com/google/uuid` | v1.6.0 | Document ids |
+
+Document ids come from the standard `uuid` package (UUID v7) and the
+environment configuration from `os.Getenv`; neither needs a module.
 
 ## Known Limitations
 

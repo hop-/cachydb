@@ -9,8 +9,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
-
-	"github.com/google/uuid"
+	"uuid"
 
 	"github.com/hop-/cachydb/pkg/db/internal/segment"
 	"github.com/hop-/cachydb/pkg/db/internal/wal"

@@ -10,8 +10,7 @@ import (
 	"slices"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
+	"uuid"
 
 	"github.com/hop-/cachydb/pkg/db/internal/cache"
 	"github.com/hop-/cachydb/pkg/db/internal/segment"
@@ -68,9 +67,10 @@ func (c *Collection) cacheKey(id string) cache.Key {
 }
 
 // Insert adds doc and returns its id. An empty doc.ID gets a generated
-// UUID. It fails with ErrExists if a document with the id exists and with
-// ErrSchemaValidation if the document does not satisfy the collection's
-// schema or carries "_id" in its data. doc is not modified or retained.
+// UUID v7, so generated ids sort in creation order. It fails with
+// ErrExists if a document with the id exists and with ErrSchemaValidation
+// if the document does not satisfy the collection's schema or carries
+// "_id" in its data. doc is not modified or retained.
 func (c *Collection) Insert(ctx context.Context, doc *Document) (string, error) {
 	if doc == nil {
 		return "", errors.New("inserting document: document is nil")
@@ -80,7 +80,7 @@ func (c *Collection) Insert(ctx context.Context, doc *Document) (string, error) 
 	}
 	id := doc.ID
 	if id == "" {
-		id = uuid.NewString()
+		id = uuid.NewV7().String()
 	}
 	if len(id) > maxIDLen {
 		return "", fmt.Errorf("inserting document: id is %d bytes, max %d", len(id), maxIDLen)
