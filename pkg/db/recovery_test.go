@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sync"
@@ -388,9 +389,7 @@ func TestConcurrentWritesDuringFlushCrashRegressionF10(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, writers)
 	for g := range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			docs := map[string]map[string]any{}
 			for i := range ops {
 				id := fmt.Sprintf("g%d-%d", g, i%idsPer)
@@ -416,7 +415,7 @@ func TestConcurrentWritesDuringFlushCrashRegressionF10(t *testing.T) {
 				}
 			}
 			results[g] = docs
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)
@@ -427,9 +426,7 @@ func TestConcurrentWritesDuringFlushCrashRegressionF10(t *testing.T) {
 
 	want := model{"app": {"c": {indexes: map[string]string{"by_w": "w"}, docs: map[string]map[string]any{}}}}
 	for _, docs := range results {
-		for id, data := range docs {
-			want["app"]["c"].docs[id] = data
-		}
+		maps.Copy(want["app"]["c"].docs, docs)
 	}
 	opts.FlushInterval = time.Hour
 	e = openEngine(t, opts)

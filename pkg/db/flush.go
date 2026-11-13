@@ -201,11 +201,9 @@ func (e *Engine) kickFlush() {
 // startFlusher starts the background flusher. Called once by Open, before
 // the engine is returned, so Close cannot be waiting on bg yet.
 func (e *Engine) startFlusher() {
-	e.bg.Add(1)
-	go func() {
-		defer e.bg.Done()
+	e.bg.Go(func() {
 		e.flushLoop(e.bgCtx)
-	}()
+	})
 }
 
 // flushLoop flushes every collection each FlushInterval and, when kicked,
@@ -268,9 +266,7 @@ func (e *Engine) flushAll(ctx context.Context, onlyFull bool) error {
 			<-sem
 			break
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			defer func() { <-sem }()
 			err := c.flush()
 			if err == nil {
@@ -286,7 +282,7 @@ func (e *Engine) flushAll(ctx context.Context, onlyFull bool) error {
 			e.logger.Error("cachydb: flush failed; the changes stay in memory and the WAL and are retried",
 				"database", c.db.name, "collection", c.name, "err", err)
 			errs = append(errs, err)
-		}()
+		})
 	}
 	wg.Wait()
 	if crashed {

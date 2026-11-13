@@ -100,6 +100,6 @@ go test -short ./examples/...   # basic only; skips the binary build
 
 ## Requirements
 
-- Go 1.25 or later (dependencies are fetched by `go run`)
+- Go 1.27 or later (dependencies are fetched by `go run`)
 - Linux or macOS
 - For `mcp-client/`: a built `cachydb` binary

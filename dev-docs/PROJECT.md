@@ -64,7 +64,7 @@ server instructions, and `cachydb://docs/<topic>` resources.
 ```
 cachydb/
 ├── main.go                  # → cmd.Execute()
-├── go.mod                   # github.com/hop-/cachydb, Go 1.25.5
+├── go.mod                   # github.com/hop-/cachydb, Go 1.27.0
 ├── internal/
 │   ├── app/                 # Builder (options → Engine + MCP server), App Start/Stop
 │   ├── cmd/                 # cobra commands: root/app, docs, version, healthcheck, utils list/migrate/export/import/find/get, client, flags

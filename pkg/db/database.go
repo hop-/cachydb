@@ -395,9 +395,7 @@ func (d *Database) CopyCollection(ctx context.Context, name, newName string, tar
 	)
 	work := make(chan string)
 	for range min(copyWorkers, max(len(ids), 1)) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for id := range work {
 				doc, err := src.Get(ctx, id)
 				if errors.Is(err, ErrNotFound) {
@@ -415,7 +413,7 @@ func (d *Database) CopyCollection(ctx context.Context, name, newName string, tar
 				}
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	var aborted error
 feed:

@@ -129,9 +129,7 @@ func (e *Engine) loadCollections(ctx context.Context) (uint64, error) {
 	)
 	jobs := make(chan *Collection)
 	for range min(runtime.GOMAXPROCS(0), len(colls)) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for c := range jobs {
 				if failed.Load() {
 					continue // drain: Open fails anyway
@@ -145,7 +143,7 @@ func (e *Engine) loadCollections(ctx context.Context) (uint64, error) {
 				}
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	for _, c := range colls {
 		jobs <- c

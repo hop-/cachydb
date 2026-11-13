@@ -156,9 +156,7 @@ func TestReaderConcurrentReadAndRetire(t *testing.T) {
 		errs    = make(chan error, workers)
 	)
 	for w := range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			signaled := false
 			for i := 0; ; i++ {
 				if !r.Acquire() {
@@ -188,7 +186,7 @@ func TestReaderConcurrentReadAndRetire(t *testing.T) {
 					started <- struct{}{}
 				}
 			}
-		}()
+		})
 	}
 	for range workers {
 		<-started

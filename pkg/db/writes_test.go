@@ -409,9 +409,7 @@ func TestConcurrentCompareAndSet(t *testing.T) {
 	)
 	errs := make(chan error, agents)
 	for range agents {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range attempts {
 				cur, err := c.Get(ctx, "doc")
 				if err != nil {
@@ -433,7 +431,7 @@ func TestConcurrentCompareAndSet(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)

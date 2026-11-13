@@ -281,8 +281,7 @@ func (l *Log) scanSegment(f *os.File, path string, newest bool, expected *uint64
 		if err == io.EOF {
 			return size, nil
 		}
-		var re *recordError
-		if errors.As(err, &re) {
+		if re, ok := errors.AsType[*recordError](err); ok {
 			if newest {
 				torn, err := isTornTail(f, re, size)
 				if err != nil {
@@ -581,10 +580,7 @@ func (l *Log) ReadFrom(from uint64, fn func(Record) error) error {
 	if len(segs) == 0 {
 		return fmt.Errorf("%w: no segments in %s", ErrCorrupt, l.dir)
 	}
-	i := sort.Search(len(segs), func(i int) bool { return segs[i].start > from }) - 1
-	if i < 0 {
-		i = 0
-	}
+	i := max(sort.Search(len(segs), func(i int) bool { return segs[i].start > from })-1, 0)
 	expected := segs[i].start
 	for ; i < len(segs) && expected < limit; i++ {
 		s := segs[i]
@@ -635,8 +631,7 @@ func readSegment(path string, from, limit uint64, expected *uint64, fn func(Reco
 		if err == io.EOF {
 			return nil
 		}
-		var re *recordError
-		if errors.As(err, &re) {
+		if re, ok := errors.AsType[*recordError](err); ok {
 			return corruptErr(path, re.pos, re.reason)
 		}
 		if err != nil {

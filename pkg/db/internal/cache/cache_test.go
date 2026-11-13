@@ -279,9 +279,7 @@ func TestConcurrentAccess(t *testing.T) {
 	)
 	var wg sync.WaitGroup
 	for w := range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := range iters {
 				k := Key{DB: fmt.Sprintf("d%d", i%2), Coll: fmt.Sprintf("c%d", i%3), ID: fmt.Sprintf("id%d", (i*7+w)%64)}
 				off := uint64(i % 5)
@@ -304,7 +302,7 @@ func TestConcurrentAccess(t *testing.T) {
 					}
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	checkInvariants(t, c)

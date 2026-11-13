@@ -3,6 +3,7 @@ package exportfmt
 import (
 	"context"
 	"errors"
+	"maps"
 
 	"github.com/hop-/cachydb/pkg/db"
 )
@@ -77,9 +78,7 @@ func (a Engine) Documents(ctx context.Context, database, collection string, fn f
 // DocMap returns d as a flat object with its _id.
 func DocMap(d *db.Document) map[string]any {
 	m := make(map[string]any, len(d.Data)+1)
-	for k, v := range d.Data {
-		m[k] = v
-	}
+	maps.Copy(m, d.Data)
 	m["_id"] = d.ID
 	return m
 }

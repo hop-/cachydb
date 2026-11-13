@@ -276,8 +276,7 @@ func Scan(dir string, seg uint32, fn func(Record, Location) error) (validEnd int
 		if err == io.EOF {
 			return validEnd, nil
 		}
-		var re *recordError
-		if errors.As(err, &re) {
+		if re, ok := errors.AsType[*recordError](err); ok {
 			return validEnd, corruptErr(path, re.pos, re.reason)
 		}
 		if err != nil {

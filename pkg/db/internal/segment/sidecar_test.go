@@ -209,7 +209,7 @@ func corruptions(valid []byte) map[string][]byte {
 		b[i] ^= 0x40
 		out[fmt.Sprintf("flip byte %d", i)] = b
 	}
-	for n := 0; n < len(valid); n++ {
+	for n := range valid {
 		out[fmt.Sprintf("truncate to %d", n)] = slices.Clone(valid[:n])
 	}
 	out["trailing garbage"] = append(slices.Clone(valid), 1, 2, 3, 4)

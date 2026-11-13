@@ -212,8 +212,7 @@ func newestRecordTime(path string) (t time.Time, err error) {
 		if err == io.EOF {
 			return t, nil
 		}
-		var re *recordError
-		if errors.As(err, &re) {
+		if re, ok := errors.AsType[*recordError](err); ok {
 			return time.Time{}, corruptErr(path, re.pos, re.reason)
 		}
 		if err != nil {

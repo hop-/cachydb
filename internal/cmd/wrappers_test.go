@@ -358,7 +358,7 @@ func TestClientImportReplace(t *testing.T) {
 	}
 	// A schema the stored documents violate: require a field none has.
 	var violating strings.Builder
-	for _, line := range strings.Split(strings.TrimSpace(data.String()), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(data.String()), "\n") {
 		var l map[string]any
 		if err := json.Unmarshal([]byte(line), &l); err != nil {
 			t.Fatal(err)

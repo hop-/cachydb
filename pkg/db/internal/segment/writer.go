@@ -115,8 +115,7 @@ func (w *Writer) recover() error {
 			w.size = size
 			return nil
 		}
-		var re *recordError
-		if errors.As(err, &re) {
+		if re, ok := errors.AsType[*recordError](err); ok {
 			torn, terr := isTornTail(w.f, re, size)
 			if terr != nil {
 				return fmt.Errorf("segment: reading %s: %w", w.path, terr)

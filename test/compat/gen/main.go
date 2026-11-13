@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -138,9 +139,7 @@ func (g *gen) update(ctx context.Context, database, name, id string, set map[str
 	if _, err := c.Update(ctx, id, set); err != nil {
 		return fmt.Errorf("updating %s in %s/%s: %w", id, database, name, err)
 	}
-	for k, v := range normalize(set) {
-		m.docs[id][k] = v
-	}
+	maps.Copy(m.docs[id], normalize(set))
 	return nil
 }
 
@@ -314,9 +313,7 @@ func (g *gen) writeExpected(path string) error {
 			}
 			for _, id := range sortedKeys(c.docs) {
 				doc := map[string]any{"_id": id}
-				for k, v := range c.docs[id] {
-					doc[k] = v
-				}
+				maps.Copy(doc, c.docs[id])
 				if err := line(map[string]any{"type": "document", "database": dbName, "collection": collName, "doc": doc}); err != nil {
 					return err
 				}

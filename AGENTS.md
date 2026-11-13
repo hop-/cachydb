@@ -8,7 +8,7 @@ CachyDB is a lightweight document database with a built-in MCP (Model Context Pr
 
 ## Quick Reference
 
-- **Language**: Go 1.25+ (`go.mod`: 1.25.5)
+- **Language**: Go 1.27+ (`go.mod`: 1.27.0)
 - **Module**: `github.com/hop-/cachydb`
 - **Build**: `go build -o cachydb`
 - **Test**: `go test -race ./...`

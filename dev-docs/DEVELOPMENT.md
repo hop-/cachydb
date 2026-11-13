@@ -5,7 +5,7 @@ Guide for AI agents and developers working on CachyDB. Overview:
 
 ## Prerequisites
 
-- Go 1.25+ (`go.mod`: `go 1.25.5`)
+- Go 1.27+ (`go.mod`: `go 1.27.0`)
 - Linux or macOS. Windows must still compile (`GOOS=windows go build ./...`)
   but is not supported at runtime.
 - No external services.
@@ -335,7 +335,7 @@ tag). Keep `DOCKERHUB.md` under 25,000 bytes (Docker Hub's limit).
 |---------|---------|---------|
 | `github.com/modelcontextprotocol/go-sdk` | v1.8.0 | MCP server/client SDK |
 | `github.com/google/jsonschema-go` | v0.4.3 | Tool input/output schemas (the SDK's schema package) |
-| `github.com/klauspost/compress` | v1.20.3 | zstd for data segments |
+| `github.com/klauspost/compress` | v1.20.4 | zstd for data segments |
 | `github.com/spf13/cobra` | v1.10.2 | CLI framework |
 | `github.com/kelseyhightower/envconfig` | v1.4.0 | Env-var configuration |
 | `github.com/google/uuid` | v1.6.0 | Document ids |

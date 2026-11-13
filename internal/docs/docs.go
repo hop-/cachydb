@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -68,12 +69,7 @@ func All() ([]Topic, error) {
 }
 
 func known(name string) bool {
-	for _, n := range Names {
-		if n == name {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(Names, name)
 }
 
 // parse splits a topic file into its front matter (name, title, summary;

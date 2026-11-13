@@ -683,7 +683,7 @@ Indexes speed up equality queries:
 
 Built with:
 
-- **Go 1.25+** - Programming language
+- **Go 1.27+** - Programming language
 - **Official MCP Go SDK** - [`github.com/modelcontextprotocol/go-sdk`](https://github.com/modelcontextprotocol/go-sdk)
 - Type-safe tool handlers with automatic JSON schema generation
 - **zstd compression** - [`github.com/klauspost/compress`](https://github.com/klauspost/compress)

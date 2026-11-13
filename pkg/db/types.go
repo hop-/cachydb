@@ -2,6 +2,7 @@ package db
 
 import (
 	"encoding/json"
+	"maps"
 	"reflect"
 	"time"
 )
@@ -80,9 +81,7 @@ type UpdateSpec struct {
 func (d *Document) MarshalJSON() ([]byte, error) {
 	combined := make(map[string]any)
 	combined["_id"] = d.ID
-	for k, v := range d.Data {
-		combined[k] = v
-	}
+	maps.Copy(combined, d.Data)
 	return json.Marshal(combined)
 }
 

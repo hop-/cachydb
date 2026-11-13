@@ -308,20 +308,18 @@ func schemaFor[T any]() *jsonschema.Schema {
 	return s
 }
 
-func boolPtr(b bool) *bool { return &b }
-
 // Annotation sets (approach-agent-ux §3.2). Every tool is closed-world:
 // it only touches this cachydb instance.
 func readOnly(title string) *mcp.ToolAnnotations {
-	return &mcp.ToolAnnotations{Title: title, ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: boolPtr(false)}
+	return &mcp.ToolAnnotations{Title: title, ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: new(false)}
 }
 
 func writing(title string, destructive, idempotent bool) *mcp.ToolAnnotations {
 	return &mcp.ToolAnnotations{
 		Title:           title,
-		DestructiveHint: boolPtr(destructive),
+		DestructiveHint: new(destructive),
 		IdempotentHint:  idempotent,
-		OpenWorldHint:   boolPtr(false),
+		OpenWorldHint:   new(false),
 	}
 }
 

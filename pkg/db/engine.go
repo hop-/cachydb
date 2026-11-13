@@ -382,11 +382,9 @@ func (e *Engine) Closed() bool { return e.isClosed() }
 // promptly once ctx is cancelled. It must be called from inside an
 // enter/exit pair (so Close cannot have started waiting on bg yet).
 func (e *Engine) spawn(fn func(ctx context.Context)) {
-	e.bg.Add(1)
-	go func() {
-		defer e.bg.Done()
+	e.bg.Go(func() {
 		fn(e.bgCtx)
-	}()
+	})
 }
 
 // removeInBackground deletes a directory renamed away by a drop.

@@ -53,8 +53,8 @@ func ParseByteSize(s string) (ByteSize, error) {
 
 	num, mult := lower, int64(1)
 	for _, u := range byteUnits {
-		if strings.HasSuffix(lower, u.suffix) {
-			num, mult = strings.TrimSpace(strings.TrimSuffix(lower, u.suffix)), u.mult
+		if before, ok := strings.CutSuffix(lower, u.suffix); ok {
+			num, mult = strings.TrimSpace(before), u.mult
 			break
 		}
 	}

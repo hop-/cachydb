@@ -205,7 +205,7 @@ func matches(field any, op string, v any) bool {
 func expectedDocs(t *testing.T, expected []byte, database, collection string) []*db.Document {
 	t.Helper()
 	var out []*db.Document
-	for _, line := range bytes.Split(bytes.TrimSpace(expected), []byte("\n")) {
+	for line := range bytes.SplitSeq(bytes.TrimSpace(expected), []byte("\n")) {
 		var l exportfmt.DocumentLine
 		if err := json.Unmarshal(line, &l); err != nil {
 			t.Fatal(err)

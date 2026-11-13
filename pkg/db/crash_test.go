@@ -125,7 +125,7 @@ func checkModel(t *testing.T, e *Engine, want model) {
 func lineDiff(got, want string) string {
 	count := func(s string) map[string]int {
 		m := map[string]int{}
-		for _, l := range strings.Split(strings.TrimSuffix(s, "\n"), "\n") {
+		for l := range strings.SplitSeq(strings.TrimSuffix(s, "\n"), "\n") {
 			m[l]++
 		}
 		return m

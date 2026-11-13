@@ -716,9 +716,7 @@ func TestConcurrentCompactionStress(t *testing.T) {
 		results = make([]map[string]map[string]any, writers)
 	)
 	for w := range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			rng := rand.New(rand.NewPCG(uint64(w), 1))
 			mine := map[string]map[string]any{}
 			for i := range ops {
@@ -742,13 +740,11 @@ func TestConcurrentCompactionStress(t *testing.T) {
 				}
 			}
 			results[w] = mine
-		}()
+		})
 	}
 	var rwg sync.WaitGroup
 	for r := range readers {
-		rwg.Add(1)
-		go func() {
-			defer rwg.Done()
+		rwg.Go(func() {
 			rng := rand.New(rand.NewPCG(uint64(r), 2))
 			for {
 				select {
@@ -781,12 +777,10 @@ func TestConcurrentCompactionStress(t *testing.T) {
 					}
 				}
 			}
-		}()
+		})
 	}
 	// Explicit compactions on top of the background compactor.
-	rwg.Add(1)
-	go func() {
-		defer rwg.Done()
+	rwg.Go(func() {
 		for {
 			select {
 			case <-stop:
@@ -799,7 +793,7 @@ func TestConcurrentCompactionStress(t *testing.T) {
 			}
 			time.Sleep(time.Millisecond)
 		}
-	}()
+	})
 	wg.Wait()
 	close(stop)
 	rwg.Wait()

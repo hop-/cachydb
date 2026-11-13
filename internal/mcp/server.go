@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -189,14 +190,12 @@ func (s *Server) trackSession(ss *mcp.ServerSession) *sessionState {
 	}
 	v, loaded := s.sessions.LoadOrStore(ss, &sessionState{})
 	if !loaded {
-		s.waiters.Add(1)
-		go func() {
-			defer s.waiters.Done()
+		s.waiters.Go(func() {
 			// The wait error only says how the session ended; there is
 			// nothing to do with it beyond forgetting the session.
 			_ = ss.Wait()
 			s.sessions.Delete(ss)
-		}()
+		})
 	}
 	return v.(*sessionState)
 }
@@ -569,9 +568,7 @@ func toDBMatchQuery(in *MatchQuery) *db.Query {
 // docMap returns doc as a flat object with its _id.
 func docMap(doc *db.Document) map[string]any {
 	m := make(map[string]any, len(doc.Data)+1)
-	for k, v := range doc.Data {
-		m[k] = v
-	}
+	maps.Copy(m, doc.Data)
 	m["_id"] = doc.ID
 	return m
 }

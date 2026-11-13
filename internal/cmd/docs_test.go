@@ -26,7 +26,7 @@ func TestPrintDocs(t *testing.T) {
 		}
 		for _, tp := range topics {
 			found := false
-			for _, line := range strings.Split(out.String(), "\n") {
+			for line := range strings.SplitSeq(out.String(), "\n") {
 				f := strings.Fields(line)
 				if len(f) > 2 && f[0] == tp.Name && f[1] == "—" && strings.HasSuffix(line, "— "+tp.Summary) {
 					found = true

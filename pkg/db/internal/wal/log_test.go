@@ -362,11 +362,9 @@ func TestConcurrentAppend(t *testing.T) {
 	var mu sync.Mutex
 	byOffset := map[uint64]string{}
 	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < perWorker; j++ {
+	for w := range workers {
+		wg.Go(func() {
+			for j := range perWorker {
 				r := testRec(w*perWorker + j)
 				off, err := l.Append(context.Background(), r)
 				if err != nil {
@@ -380,7 +378,7 @@ func TestConcurrentAppend(t *testing.T) {
 				byOffset[off] = r.ID
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	const total = workers * perWorker
@@ -410,7 +408,7 @@ func TestReopenContinuesInNewestSegment(t *testing.T) {
 	}
 	mustClose(t, l)
 
-	for round := 0; round < 2; round++ {
+	for round := range 2 {
 		l = env.mustOpen(t, nil)
 		want := uint64(4 + round)
 		if got := l.NextOffset(); got != want {
@@ -437,7 +435,7 @@ func TestReopenContinuesInNewestSegment(t *testing.T) {
 }
 
 func TestTornTailIsTruncated(t *testing.T) {
-	recSize := recordSize(ptr(testRec(1))) // same for every testRec index
+	recSize := recordSize(new(testRec(1))) // same for every testRec index
 	end2 := segmentHeaderSize + 2*recSize  // end of record 2
 	end3 := end2 + recSize                 // end of record 3 (file end)
 	tests := []struct {
@@ -515,8 +513,6 @@ func TestTornTailIsTruncated(t *testing.T) {
 	}
 }
 
-func ptr[T any](v T) *T { return &v }
-
 func TestTornHeaderOfNewestSegment(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -552,7 +548,7 @@ func TestTornHeaderOfNewestSegment(t *testing.T) {
 }
 
 func TestOpenDetectsCorruption(t *testing.T) {
-	recSize := recordSize(ptr(testRec(1)))
+	recSize := recordSize(new(testRec(1)))
 	tests := []struct {
 		name  string
 		setup func(t *testing.T, dir string)
@@ -644,7 +640,7 @@ func TestOpenDetectsCorruption(t *testing.T) {
 }
 
 func TestRotation(t *testing.T) {
-	recSize := recordSize(ptr(testRec(1)))
+	recSize := recordSize(new(testRec(1)))
 	env := newEnv(t, segmentHeaderSize+2*recSize) // exactly two records per segment
 	l := env.mustOpen(t, nil)
 	for i := 1; i <= 5; i++ {
@@ -735,7 +731,7 @@ func TestReadFromStopsOnCallbackError(t *testing.T) {
 }
 
 func TestReadFromDetectsMissingSegment(t *testing.T) {
-	recSize := recordSize(ptr(testRec(1)))
+	recSize := recordSize(new(testRec(1)))
 	env := newEnv(t, segmentHeaderSize+2*recSize)
 	l := env.mustOpen(t, nil)
 	for i := 1; i <= 5; i++ {
@@ -779,7 +775,7 @@ func TestSyncFailureIsSticky(t *testing.T) {
 
 	const batch = 3
 	errs := make(chan error, batch)
-	for i := 0; i < batch; i++ {
+	for i := range batch {
 		go func() {
 			_, err := l.Append(context.Background(), testRec(2+i))
 			errs <- err
@@ -791,13 +787,13 @@ func TestSyncFailureIsSticky(t *testing.T) {
 	if err := <-firstDone; err != nil {
 		t.Fatalf("first append: %v", err)
 	}
-	for i := 0; i < batch; i++ {
+	for range batch {
 		err := <-errs
 		if !errors.Is(err, ErrFailed) || !errors.Is(err, errDisk) {
 			t.Errorf("batch append error = %v, want ErrFailed wrapping the sync error", err)
 		}
 	}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if _, err := l.Append(context.Background(), testRec(10+i)); !errors.Is(err, ErrFailed) {
 			t.Errorf("later Append error = %v, want ErrFailed", err)
 		}
@@ -850,7 +846,7 @@ func TestCloseDrainsAndIsIdempotent(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 	close(release)
-	for i := 0; i < n; i++ {
+	for range n {
 		if err := <-errs; err != nil {
 			t.Errorf("queued Append: %v", err)
 		}

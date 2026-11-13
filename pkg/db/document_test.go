@@ -536,9 +536,7 @@ func TestConcurrentWritesDifferentDocuments(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, workers)
 	for w := range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := range perWorker {
 				id := fmt.Sprintf("w%d-%02d", w, i)
 				if _, err := c.Insert(ctx, &Document{ID: id, Data: map[string]any{"g": w % 2}}); err != nil {
@@ -556,7 +554,7 @@ func TestConcurrentWritesDifferentDocuments(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)

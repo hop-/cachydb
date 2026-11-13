@@ -195,7 +195,7 @@ func TestToolDefinitionsMatchRegistered(t *testing.T) {
 		t.Fatalf("DocsTopic(tools): %v", err)
 	}
 	var documented []string
-	for _, line := range strings.Split(topic.Content, "\n") {
+	for line := range strings.SplitSeq(topic.Content, "\n") {
 		if name, ok := strings.CutPrefix(line, "## "); ok && name != "Tools" {
 			documented = append(documented, name)
 		}

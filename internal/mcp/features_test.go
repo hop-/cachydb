@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -14,9 +15,7 @@ func TestNewToolsEndToEnd(t *testing.T) {
 	coll := map[string]any{"collection": "kb"}
 	with := func(extra map[string]any) map[string]any {
 		out := map[string]any{"collection": "kb"}
-		for k, v := range extra {
-			out[k] = v
-		}
+		maps.Copy(out, extra)
 		return out
 	}
 	callOK(t, cs, "create_collection", map[string]any{"name": "kb"})

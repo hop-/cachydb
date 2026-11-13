@@ -74,11 +74,9 @@ type compactMove struct {
 // startCompactor starts the background compactor. Called once by Open,
 // before the engine is returned, so Close cannot be waiting on bg yet.
 func (e *Engine) startCompactor() {
-	e.bg.Add(1)
-	go func() {
-		defer e.bg.Done()
+	e.bg.Go(func() {
 		e.compactLoop(e.bgCtx)
-	}()
+	})
 }
 
 // compactLoop runs a compaction pass every FlushInterval. Compactions run
@@ -225,7 +223,7 @@ func pickCompactionRun(segs []uint32, skip map[uint32]bool, total, dead map[uint
 func pickSmallRun(segs []uint32, skip map[uint32]bool, total, dead map[uint32]int64, segSize int64) []uint32 {
 	small := func(s uint32) bool { return !skip[s] && total[s] < segSize/4 }
 	live := func(s uint32) int64 { return max(total[s]-dead[s], 0) }
-	for i := 0; i < len(segs); i++ {
+	for i := range segs {
 		if !small(segs[i]) {
 			continue
 		}

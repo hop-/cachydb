@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"sync"
@@ -177,12 +178,8 @@ func (c *Collection) UpdateWith(ctx context.Context, id string, u UpdateSpec) (d
 		// change. Nested values are only read; write re-encodes the
 		// after-image into fresh values.
 		data := make(map[string]any, len(cur.Data)+len(set))
-		for k, v := range cur.Data {
-			data[k] = v
-		}
-		for k, v := range set {
-			data[k] = v
-		}
+		maps.Copy(data, cur.Data)
+		maps.Copy(data, set)
 		for _, k := range u.Unset {
 			delete(data, k)
 		}
