@@ -29,8 +29,12 @@ func TestCompatFixtures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(versions) < 2 {
-		t.Fatalf("found %d fixtures, want v0.0.4 and later", len(versions))
+	// One fixture per release since v0.0.4: a missing one is a failure, not
+	// a shorter test.
+	for _, want := range []string{"v0.0.4", "v0.0.5", "v0.0.6"} {
+		if !slices.Contains(versions, filepath.Join("testdata", "compat", want)) {
+			t.Errorf("no fixture for %s (found %v)", want, versions)
+		}
 	}
 	for _, fixture := range versions {
 		t.Run(filepath.Base(fixture), func(t *testing.T) {

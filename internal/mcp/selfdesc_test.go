@@ -109,6 +109,23 @@ func TestToolSchemaEnums(t *testing.T) {
 	}
 }
 
+// TestCreateCollectionSchemaDescription checks that the schema parameter
+// of create_collection tells the agent how to change a schema later
+// (update_schema, which must exist) instead of calling it fixed.
+func TestCreateCollectionSchemaDescription(t *testing.T) {
+	tools := listTools(t, connect(t, newTestServer(t)))
+	toolNamed(t, tools, "update_schema")
+
+	s := schemaAt(t, toolNamed(t, tools, "create_collection").InputSchema, "properties", "schema")
+	desc, _ := s["description"].(string)
+	if !strings.Contains(desc, "update_schema") {
+		t.Errorf("create_collection schema description %q does not mention update_schema", desc)
+	}
+	if strings.Contains(strings.ToLower(desc), "fixed") {
+		t.Errorf("create_collection schema description %q still says the schema is fixed", desc)
+	}
+}
+
 func TestToolAnnotationsAndOutputSchemas(t *testing.T) {
 	type hints struct{ readOnly, destructive, idempotent bool }
 	want := map[string]hints{
