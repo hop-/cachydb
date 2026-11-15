@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -128,10 +129,9 @@ func memOffset(t *testing.T, c *Collection, id string) uint64 {
 	return me.walOffset
 }
 
-func inKeydir(c *Collection, id string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	_, ok := c.keydir[id]
+func inKeydir(t *testing.T, c *Collection, id string) bool {
+	t.Helper()
+	_, ok := keyEntryOf(t, c, id)
 	return ok
 }
 
@@ -287,7 +287,7 @@ func TestFlushTriggers(t *testing.T) {
 			name: "interval",
 			mod:  func(o *Options) { o.FlushInterval = 5 * time.Millisecond },
 			trigger: func(t *testing.T, e *Engine, c *Collection) *Collection {
-				waitFor(t, "interval flush", func() bool { return inKeydir(c, "a") })
+				waitFor(t, "interval flush", func() bool { return inKeydir(t, c, "a") })
 				return c
 			},
 		},
@@ -295,7 +295,7 @@ func TestFlushTriggers(t *testing.T) {
 			name: "memtable size",
 			mod:  func(o *Options) { o.FlushInterval = time.Hour; o.MemtableSize = 1 },
 			trigger: func(t *testing.T, e *Engine, c *Collection) *Collection {
-				waitFor(t, "size-triggered flush", func() bool { return inKeydir(c, "a") })
+				waitFor(t, "size-triggered flush", func() bool { return inKeydir(t, c, "a") })
 				return c
 			},
 		},
@@ -303,7 +303,7 @@ func TestFlushTriggers(t *testing.T) {
 			name: "close",
 			mod:  func(o *Options) { o.FlushInterval = time.Hour },
 			trigger: func(t *testing.T, e *Engine, c *Collection) *Collection {
-				if inKeydir(c, "a") {
+				if inKeydir(t, c, "a") {
 					t.Fatal("flushed before Close")
 				}
 				_, c2 := reopenColl(t, e)
@@ -469,7 +469,7 @@ func TestFlushCheckpointExcludesConcurrentWrites(t *testing.T) {
 	if m := markers(segRecords(t, c.dir)); len(m) != 1 || m[0] != cp {
 		t.Errorf("markers on disk = %v, want [%d]", m, cp)
 	}
-	if !inKeydir(c, "a") || inKeydir(c, "x") || inKeydir(c, "b") {
+	if !inKeydir(t, c, "a") || inKeydir(t, c, "x") || inKeydir(t, c, "b") {
 		t.Error("keydir after the flush should hold a only")
 	}
 	if lw := e.lowWater(); lw > x {
@@ -571,7 +571,7 @@ func TestFlushFailureRetriedOnTick(t *testing.T) {
 		o.testSegWriter = func(w segmentWriter) segmentWriter { return &hookedSegWriter{segmentWriter: w, h: h} }
 	}, nil)
 	mustInsert(t, c, "a", map[string]any{"v": 1})
-	waitFor(t, "flush after injected failures", func() bool { return inKeydir(c, "a") })
+	waitFor(t, "flush after injected failures", func() bool { return inKeydir(t, c, "a") })
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.failAppend != 0 {
@@ -598,12 +598,13 @@ func TestSegmentRoll(t *testing.T) {
 			// The flushed entries are still in flushing and the keydir
 			// does not point at them yet.
 			c.mu.RLock()
-			defer c.mu.RUnlock()
-			if len(c.flushing) == 0 {
+			flushing := maps.Clone(c.flushing)
+			c.mu.RUnlock()
+			if len(flushing) == 0 {
 				t.Errorf("at %s: flushing is empty", p)
 			}
-			for id, me := range c.flushing {
-				if ke, ok := c.keydir[id]; ok && ke.walOffset >= me.walOffset {
+			for id, me := range flushing {
+				if ke, ok := keyEntryOf(t, c, id); ok && ke.WALOffset >= me.walOffset {
 					t.Errorf("at %s: keydir already repointed for %q", p, id)
 				}
 			}
@@ -659,9 +660,8 @@ func TestSegmentRoll(t *testing.T) {
 	if snap, err := segment.ReadIndexSnapshot(c.dir, "byv"); err != nil || snap.CoversSeg != 2 || len(snap.Keys["s:two"]) != 1 || len(snap.Keys["s:one"]) != 0 {
 		t.Errorf("snapshot after second roll = %+v, %v", snap, err)
 	}
-	c.mu.RLock()
-	dead1 := c.deadBytes[1]
-	c.mu.RUnlock()
+	_, deadBytes := segAccounting(t, c)
+	dead1 := deadBytes[1]
 	if dead1 == 0 {
 		t.Error("superseded version in segment 1 not counted as dead bytes")
 	}
@@ -776,9 +776,13 @@ func TestDeadBytes(t *testing.T) {
 	}
 	mustFlush(t, c)
 
-	c.flushMu.Lock()
-	hint := slices.Clone(c.activeHint)
-	c.flushMu.Unlock()
+	var hint []segment.HintEntry // the active segment's records
+	if _, err := segment.ScanHeaders(c.dir, 1, func(r segment.Record, loc segment.Location) error {
+		hint = append(hint, segment.HintEntry{ID: r.ID, Type: r.Type, WALOffset: r.WALOffset, Loc: loc})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	// Records: put a, put b, marker | put a', tombstone b, marker. Only a'
 	// is live.
 	if len(hint) != 6 {
@@ -791,17 +795,15 @@ func TestDeadBytes(t *testing.T) {
 			live = int64(h.Loc.Size)
 		}
 	}
-	c.mu.RLock()
-	got := c.deadBytes[1]
-	c.mu.RUnlock()
+	_, deadBytes := segAccounting(t, c)
+	got := deadBytes[1]
 	if got != total-live {
 		t.Errorf("deadBytes[1] = %d, want %d", got, total-live)
 	}
 
 	_, c = reopenColl(t, e)
-	c.mu.RLock()
-	reloaded := c.deadBytes[1]
-	c.mu.RUnlock()
+	_, deadBytes = segAccounting(t, c)
+	reloaded := deadBytes[1]
 	if reloaded != got {
 		t.Errorf("deadBytes after reopen = %d, want %d", reloaded, got)
 	}

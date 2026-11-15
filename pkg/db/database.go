@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/hop-/cachydb/pkg/db/internal/fsutil"
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
 	"github.com/hop-/cachydb/pkg/db/internal/wal"
 )
 
@@ -66,8 +67,8 @@ func (d *Database) errDropped() error {
 	return fmt.Errorf("database %q: %w", d.name, ErrNotFound)
 }
 
-// loadCollection reads the coll.meta of one collection directory; its data
-// segments are loaded later by Collection.load. It returns (nil, nil) for
+// loadCollection reads the coll.meta of one collection directory; its
+// index file and data segments are opened later by Collection.load. It returns (nil, nil) for
 // a directory without coll.meta (a create that did not reach its meta
 // write; WAL replay recreates it if its record is still in the log).
 func (d *Database) loadCollection(name string) (*Collection, error) {
@@ -144,12 +145,25 @@ func (d *Database) CreateCollection(ctx context.Context, name string, s *Schema)
 	if err := makeDir(dir); err != nil {
 		return fmt.Errorf("creating collection %q: %w", name, err)
 	}
+	// The index file before coll.meta: a directory without coll.meta is
+	// not a collection yet, and replay of the record creates both again.
+	// Remove first: a failed earlier attempt may have left a file.
+	if err := idxstore.Remove(dir); err != nil {
+		return fmt.Errorf("creating collection %q: %w", name, err)
+	}
+	st, err := idxstore.Create(dir, idxstore.Options{})
+	if err != nil {
+		return fmt.Errorf("creating collection %q: %w", name, err)
+	}
 	if err := writeCollMeta(dir, collMeta{Name: name, Schema: s, WALOffset: off, CreatedOffset: off}); err != nil {
+		_ = st.Close() // the meta error is the one to report
 		return fmt.Errorf("creating collection %q: %w", name, err)
 	}
 	done()
 
-	d.collections[name] = newCollection(d, name, s, off, off)
+	c := newCollection(d, name, s, off, off)
+	c.store = st
+	d.collections[name] = c
 	return nil
 }
 
@@ -221,14 +235,16 @@ func (d *Database) DropCollection(ctx context.Context, name string) error {
 	if err := e.hook(hookMetaWrite); err != nil {
 		return err
 	}
-	moved, err := renameAway(c.dir, off)
-	if err != nil {
-		return fmt.Errorf("dropping collection %q: %w", name, err)
-	}
-	done()
-
+	// Committed. The collection is gone from memory, and its index file
+	// and segments are closed, before its directory is renamed. If the
+	// rename fails, the directory stays until a restart replays the record.
 	c.markDropped()
 	delete(d.collections, name)
+	moved, err := renameAway(c.dir, off)
+	if err != nil {
+		return fmt.Errorf("dropping collection %q (restart to complete it): %w", name, err)
+	}
+	done()
 	e.removeInBackground(moved)
 	return nil
 }
@@ -315,7 +331,8 @@ func (d *Database) RenameCollection(ctx context.Context, oldName, newName string
 		return err
 	}
 	// Committed. If a file step fails now, the collection stays
-	// unavailable until a restart replays the record.
+	// unavailable until a restart replays the record. detach closes the
+	// index file and the segments before the directory is renamed.
 	if err := c.detach(); err != nil {
 		e.logger.Warn("cachydb: closing segments of a renamed collection", "database", d.name, "collection", oldName, "err", err)
 	}
@@ -381,9 +398,10 @@ func (d *Database) CopyCollection(ctx context.Context, name, newName string, tar
 		}
 	}
 
-	src.mu.RLock()
-	ids := src.liveIDsLocked()
-	src.mu.RUnlock()
+	ids, err := src.liveIDs()
+	if err != nil {
+		return 0, fmt.Errorf("copying collection %q: %w", name, err)
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()

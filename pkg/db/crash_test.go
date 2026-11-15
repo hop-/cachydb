@@ -255,7 +255,7 @@ var crashOps = []struct {
 // after it. The "torn" variants also lose the tail of the flush's
 // unsynced segment write.
 func TestCrashMatrix(t *testing.T) {
-	points := []hookPoint{hookMetaWrite, hookAfterWALSync, hookAfterSegWrite, hookAfterSegSync}
+	points := []hookPoint{hookMetaWrite, hookAfterWALSync, hookAfterSegWrite, hookAfterSegSync, hookAfterIndexCommit}
 	for _, p := range points {
 		for _, op := range crashOps {
 			for _, torn := range []bool{false, true} {
@@ -285,7 +285,7 @@ func TestCrashMatrix(t *testing.T) {
 						t.Fatalf("flush: %v", flushErr)
 					}
 					crashed := errors.Is(opErr, errSimulatedCrash) || errors.Is(flushErr, errSimulatedCrash)
-					wantCrash := p == hookAfterSegWrite || p == hookAfterSegSync || (p == hookMetaWrite) == op.meta
+					wantCrash := p == hookAfterSegWrite || p == hookAfterSegSync || p == hookAfterIndexCommit || (p == hookMetaWrite) == op.meta
 					if crashed != wantCrash {
 						t.Logf("expected state before the operation:\n%s", want.dump())
 						t.Fatalf("crashed = %v, want %v at hook %s (op error %v, flush error %v)", crashed, wantCrash, p, opErr, flushErr)

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"slices"
 	"testing"
 
@@ -82,13 +81,11 @@ func nextSegOf(c *Collection) uint32 {
 // segment, which the compaction reads.
 func firstLivePut(t *testing.T, c *Collection) segment.Location {
 	t.Helper()
-	c.mu.RLock()
-	defer c.mu.RUnlock()
 	var best segment.Location
 	found := false
-	for _, ke := range c.keydir {
-		if !found || ke.loc.Seg < best.Seg || (ke.loc.Seg == best.Seg && ke.loc.Pos < best.Pos) {
-			best, found = ke.loc, true
+	for _, ke := range keyTable(t, c) {
+		if loc := entryLocation(ke); !found || loc.Seg < best.Seg || (loc.Seg == best.Seg && loc.Pos < best.Pos) {
+			best, found = loc, true
 		}
 	}
 	if !found {
@@ -120,23 +117,6 @@ func TestCompactionErrorPaths(t *testing.T) {
 				}
 				return func() {
 					if err := os.Remove(path); err != nil {
-						t.Fatal(err)
-					}
-				}
-			},
-		},
-		{
-			name: "hint file cannot be written",
-			inject: func(t *testing.T, c *Collection) func() {
-				path := segment.HintPath(c.dir, nextSegOf(c))
-				if err := os.Mkdir(path, 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(filepath.Join(path, "keep"), nil, 0o644); err != nil {
-					t.Fatal(err)
-				}
-				return func() {
-					if err := os.RemoveAll(path); err != nil {
 						t.Fatal(err)
 					}
 				}

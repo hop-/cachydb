@@ -6,13 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"math"
 	"slices"
 	"sync"
 	"time"
 	"uuid"
 
 	"github.com/hop-/cachydb/pkg/db/internal/cache"
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
 	"github.com/hop-/cachydb/pkg/db/internal/segment"
 	"github.com/hop-/cachydb/pkg/db/internal/wal"
 )
@@ -24,13 +24,22 @@ import (
 // inflight → WAL append (the commit point) → hookAfterWALSync → apply to
 // the memtable, indexes, cache, and count under Collection.mu.
 //
-// Read: memtable → flushing → cache → keydir + data segment. Documents
-// stored in the memtable and the cache are immutable; callers of the read
-// path get deep clones and never share memory with them.
+// Read: memtable → flushing → key table (a read transaction on the index
+// file) → cache or data segment. Documents stored in the memtable and the
+// cache are immutable; callers of the read path get deep clones and never
+// share memory with them.
+//
+// Snapshot rule (approach-index-and-query §5): a reader looks at the
+// overlay (memtable and flushing) under Collection.mu first and only then
+// starts its read transaction on the index file. The flusher clears
+// flushing only after its index transaction committed, so a change is
+// always in the overlay or in the transaction's snapshot, never in
+// neither. An id found in the overlay is answered from the overlay alone.
 
-// maxIDLen is the longest document id the WAL and segment formats can
-// store (u16 length prefix).
-const maxIDLen = math.MaxUint16
+// maxIDLen is the longest document id the engine stores: what an index
+// key in the index file can carry (idxstore.MaxIDLen). The WAL and segment
+// formats could hold up to 65,535 bytes.
+const maxIDLen = idxstore.MaxIDLen
 
 // maxReadRetries bounds how often a read restarts after the segment it was
 // about to read was retired (compaction moved the document meanwhile).
@@ -45,7 +54,7 @@ const findCtxCheckEvery = 256
 const memEntryOverhead = 64
 
 // errSegmentRetired reports that a data segment was retired between the
-// keydir lookup and the read; the caller looks the document up again.
+// key-table lookup and the read; the caller looks the document up again.
 var errSegmentRetired = errors.New("data segment retired")
 
 // docLock returns the stripe lock serializing writes to id (FNV-1a).
@@ -394,9 +403,10 @@ func (c *Collection) apply(id string, prev, next *Document, off, lb uint64, size
 
 // applyLocked is apply without the inflight bookkeeping, shared with WAL
 // replay. existed reports whether a live version of id existed before the
-// write; prev is that version when the caller has it (needed only to
-// update the indexes, so replay passes nil when the collection has none).
-// Callers hold mu exclusively.
+// write (decided from the overlay first, then the key table); prev is
+// that version when the caller has it (needed only to update the indexes,
+// so replay passes nil when the collection has none). Callers hold mu
+// exclusively.
 func (c *Collection) applyLocked(id string, existed bool, prev, next *Document, off uint64, size int64) {
 	me, ok := c.memtable[id]
 	if ok && me.walOffset >= off {
@@ -437,13 +447,16 @@ func (c *Collection) applyLocked(id string, existed bool, prev, next *Document, 
 }
 
 // current returns the live version of id through the read path (§5.3):
-// memtable → flushing → cache → keydir + data segment. doc is nil when the
-// document does not exist. When owned is false, doc is shared with the
-// memtable or the cache and must be neither modified nor handed out
-// without a Clone; otherwise it is a private copy. (Every path currently
-// returns shared documents, so callers clone only what they hand out.)
+// memtable → flushing → key table → cache or data segment. doc is nil
+// when the document does not exist. When owned is false, doc is shared
+// with the memtable or the cache and must be neither modified nor handed
+// out without a Clone; otherwise it is a private copy. (Every path
+// currently returns shared documents, so callers clone only what they
+// hand out.)
 func (c *Collection) current(id string) (doc *Document, owned bool, err error) {
 	for attempt := 0; ; attempt++ {
+		// The overlay first, under mu; the read transaction only after it
+		// (the snapshot rule above).
 		c.mu.RLock()
 		if c.dropped {
 			c.mu.RUnlock()
@@ -457,12 +470,15 @@ func (c *Collection) current(id string) (doc *Document, owned bool, err error) {
 			c.mu.RUnlock()
 			return me.doc, false, nil
 		}
-		ke, ok := c.keydir[id]
 		c.mu.RUnlock()
+
+		ke, ok, err := c.storedEntry(id)
+		if err != nil {
+			return nil, false, err
+		}
 		if !ok {
 			return nil, false, nil
 		}
-
 		doc, err := c.readStored(id, ke)
 		if errors.Is(err, errSegmentRetired) && attempt < maxReadRetries {
 			continue // compaction moved it; look it up again
@@ -490,35 +506,47 @@ func newDocCache(maxBytes int64) *cache.LRU[cachedDoc] {
 	return cache.New(maxBytes, func(v cachedDoc) int64 { return v.size })
 }
 
-// readStored reads the version of id described by the keydir entry ke,
+// readStored reads the version of id described by the key-table entry ke,
 // from the cache or else from its data segment (and caches it). The
 // returned document is shared with the cache: it must be neither modified
 // nor handed out without a Clone.
-func (c *Collection) readStored(id string, ke keyEntry) (*Document, error) {
+func (c *Collection) readStored(id string, ke idxstore.Entry) (*Document, error) {
 	lru, key := c.db.e.cache, c.cacheKey(id)
-	if v, ok := lru.Get(key, ke.walOffset); ok {
+	if v, ok := lru.Get(key, ke.WALOffset); ok {
 		return v.doc, nil
 	}
 
-	r, err := c.acquireReader(ke.loc.Seg)
+	r, err := c.acquireReader(ke.Seg)
 	if err != nil {
 		return nil, err
 	}
-	rec, err := r.Read(ke.loc)
+	rec, err := r.Read(entryLocation(ke))
 	r.Release()
 	if err != nil {
 		return nil, fmt.Errorf("reading document %q of collection %q: %w", id, c.name, err)
 	}
-	if rec.Type != segment.TypePut || rec.ID != id || rec.WALOffset != ke.walOffset {
+	if rec.Type != segment.TypePut || rec.ID != id || rec.WALOffset != ke.WALOffset {
 		return nil, fmt.Errorf("reading document %q of collection %q: %w: record at segment %d byte %d is %s %q@%d, want put@%d",
-			id, c.name, segment.ErrCorrupt, ke.loc.Seg, ke.loc.Pos, rec.Type, rec.ID, rec.WALOffset, ke.walOffset)
+			id, c.name, segment.ErrCorrupt, ke.Seg, ke.Pos, rec.Type, rec.ID, rec.WALOffset, ke.WALOffset)
 	}
 	doc, err := decodeDocument(id, rec.Doc)
 	if err != nil {
 		return nil, err
 	}
-	lru.Put(key, ke.walOffset, cachedDoc{doc: doc, size: cachedDocSize(len(rec.Doc))})
+	lru.Put(key, ke.WALOffset, cachedDoc{doc: doc, size: cachedDocSize(len(rec.Doc))})
 	return doc, nil
+}
+
+// entryLocation returns the data-segment location a key-table entry
+// points at.
+func entryLocation(ke idxstore.Entry) segment.Location {
+	return segment.Location{Seg: ke.Seg, Pos: ke.Pos, Size: ke.Size}
+}
+
+// locationEntry returns the key-table entry for the record at loc written
+// by the change with WAL offset off.
+func locationEntry(loc segment.Location, off uint64) idxstore.Entry {
+	return idxstore.Entry{Seg: loc.Seg, Pos: loc.Pos, Size: loc.Size, WALOffset: off}
 }
 
 // acquireReader returns the reader of data segment seg with a reference
@@ -599,14 +627,16 @@ func decodeDocument(id string, data []byte) (*Document, error) {
 // every filter.
 func (c *Collection) candidates(filters []QueryFilter) ([]string, error) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 	if c.dropped {
+		c.mu.RUnlock()
 		return nil, c.errDropped()
 	}
-	if ids, ok := c.indexedCandidatesLocked(filters); ok {
+	ids, ok := c.indexedCandidatesLocked(filters)
+	c.mu.RUnlock()
+	if ok {
 		return ids, nil
 	}
-	return c.liveIDsLocked(), nil
+	return c.liveIDs()
 }
 
 // indexedCandidatesLocked returns the smallest index-backed candidate set
@@ -632,8 +662,8 @@ func (c *Collection) filterCandidatesLocked(f QueryFilter) ([]string, bool) {
 		if f.Operator != "eq" {
 			return nil, false
 		}
-		// The keydir/memtable are the primary index. A non-string value
-		// equals no id.
+		// The key table and the memtable are the primary index. A
+		// non-string value equals no id.
 		if s, ok := f.Value.(string); ok {
 			return []string{s}, true
 		}
@@ -681,32 +711,91 @@ func (c *Collection) indexOnLocked(field string) *index {
 	return best
 }
 
-// liveIDsLocked returns every live id, sorted: keydir ∪ flushing ∪
-// memtable, newer layers overriding older ones (tombstones remove).
-// Callers hold mu.
-func (c *Collection) liveIDsLocked() []string {
-	set := make(map[string]struct{}, len(c.keydir)+len(c.memtable))
-	for id := range c.keydir {
-		set[id] = struct{}{}
-	}
-	for _, layer := range []map[string]memEntry{c.flushing, c.memtable} {
-		for id, me := range layer {
-			if me.doc == nil {
-				delete(set, id)
-			} else {
-				set[id] = struct{}{}
-			}
+// captureOverlay returns the overlay M of the snapshot rule (see the top
+// of this file): every id with a change that is not in the index file yet,
+// with its document (nil = deleted; the memtable wins over flushing), and
+// the index file to read after it. The documents are shared with the
+// memtable and immutable. A read transaction started on the returned store
+// after this call sees every change that is not in M.
+func (c *Collection) captureOverlay() (map[string]*Document, *idxstore.Store, error) {
+	c.mu.RLock()
+	st, err := c.storeLocked()
+	var overlay map[string]*Document
+	if n := len(c.memtable) + len(c.flushing); err == nil && n > 0 {
+		overlay = make(map[string]*Document, n)
+		for id, me := range c.flushing {
+			overlay[id] = me.doc
+		}
+		for id, me := range c.memtable {
+			overlay[id] = me.doc
 		}
 	}
-	return sortedIDs(set)
+	c.mu.RUnlock()
+	if err != nil {
+		return nil, nil, err
+	}
+	if st == nil {
+		// A renamed collection opening its file on first use: still after
+		// the overlay was captured.
+		if st, err = c.openStoreOnUse(); err != nil {
+			return nil, nil, err
+		}
+	}
+	return overlay, st, nil
+}
+
+// liveIDs returns every live id in ascending order: an ordered walk of
+// the key table merged with the overlay, whose entries override the key
+// table's (a deleted id is left out, a new one added in its place).
+// Callers hold no collection lock.
+func (c *Collection) liveIDs() ([]string, error) {
+	overlay, st, err := c.captureOverlay()
+	if err != nil {
+		return nil, err
+	}
+	added := make([]string, 0, len(overlay)) // the overlay's live ids, ascending
+	for id, doc := range overlay {
+		if doc != nil {
+			added = append(added, id)
+		}
+	}
+	slices.Sort(added)
+
+	var ids []string
+	err = st.View(func(tx *idxstore.Tx) error {
+		n, err := tx.Count()
+		if err != nil {
+			return err
+		}
+		ids = make([]string, 0, int(n)+len(added))
+		next := 0 // added[next:] is not merged yet
+		cur := tx.KeyCursor()
+		for k, _, ok := cur.First(); ok; k, _, ok = cur.Next() {
+			for next < len(added) && added[next] < string(k) {
+				ids = append(ids, added[next])
+				next++
+			}
+			if _, changed := overlay[string(k)]; changed {
+				continue // the overlay decides: merged from added, or deleted
+			}
+			ids = append(ids, string(k))
+		}
+		ids = append(ids, added[next:]...)
+		return cur.Err()
+	})
+	if err != nil {
+		return nil, c.storeErr(err)
+	}
+	return ids, nil
 }
 
 // buildIndex builds the index name on field from every live document.
 // Callers hold Database.mu exclusively, so no document write runs.
 func (c *Collection) buildIndex(ctx context.Context, name, field string) (*index, error) {
-	c.mu.RLock()
-	ids := c.liveIDsLocked()
-	c.mu.RUnlock()
+	ids, err := c.liveIDs()
+	if err != nil {
+		return nil, err
+	}
 
 	ix := newIndex(name, field)
 	for i, id := range ids {

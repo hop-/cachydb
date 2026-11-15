@@ -1,39 +1,44 @@
 package db
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"slices"
 	"time"
 
 	"github.com/hop-/cachydb/pkg/db/internal/fsutil"
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
 	"github.com/hop-/cachydb/pkg/db/internal/segment"
 )
 
-// Compaction (§9) reclaims the space of records the keydir no longer
-// references: superseded and deleted versions, tombstones, and checkpoint
-// markers.
+// Compaction (§9; approach-index-and-query §7) reclaims the space of
+// records the key table no longer references: superseded and deleted
+// versions, tombstones, and the checkpoint markers of older versions.
 //
 // One background goroutine checks every collection each FlushInterval. A
 // collection is compacted when its sealed segments hold at least 2
 // segments and deadBytes/totalBytes >= CompactionRatio, or, failing that,
 // when a run of at least smallRunMin adjacent sealed segments are each
 // smaller than DataSegmentSize/4 (small segments are merged even when
-// fully live; plan 002 C3). The input run is a
-// contiguous run of sealed segments, never the active segment nor the
-// segment holding the newest checkpoint marker (markers are not copied, so
-// that one must survive). The output is one new segment, id nextSeg (max
-// existing + 1), written with its hint file and fsynced (file and
-// directory) before the swap. The swap repoints, under Collection.mu, only
-// the keydir entries that still reference the copied (seg, pos) and WAL
-// offset (compare-and-swap); entries a concurrent flush changed meanwhile
-// are left alone and their copies count as dead bytes of the output. The
-// old segments are then retired: their hint files are removed at once,
-// their data files once the last in-flight read releases them. Index
-// snapshots are rewritten afterwards.
+// fully live; plan 002 C3). The byte accounting comes from the index file.
+// The input run is a contiguous run of registered segments, never the
+// active segment. The output is one new segment, id nextSeg (max
+// registered + 1), fsynced (file and directory) before the swap.
+//
+// The live records of an input segment are found with a header-only scan
+// (segment.ScanHeaders) and the key table: a put is live when its id's
+// entry points at exactly that record. The swap is one index transaction:
+// it repoints each copied id whose entry still has the old location and
+// WAL offset (entries a concurrent flush changed meanwhile are left alone
+// and their copies count as dead bytes of the output), registers the
+// output, and removes the inputs. Only then are the old segments retired:
+// their files are removed once the last in-flight read releases them. A
+// crash before the transaction leaves an output file the index file does
+// not register, and a crash after it leaves unregistered input files; Open
+// deletes both (Collection.load).
 //
 // Ordering invariant: a superseded version is always in a segment whose id
 // is at most that of the record superseding it. Flushes append to the
@@ -43,11 +48,12 @@ import (
 // tombstone may be dropped exactly when every segment on disk with an id
 // up to the run's last one is in the run — i.e. the run starts at the
 // oldest existing segment — because then every older version of its
-// document is in the run too and is not copied (the keydir no longer
+// document is in the run too and is not copied (the key table no longer
 // references it). Otherwise tombstones are copied: an older version in a
-// segment outside the run would come back on the next Open. The check
-// lists the files on disk, so a retired segment whose file is still held
-// by a read (or failed to be removed) keeps tombstones until it is gone.
+// segment outside the run would come back if the index file were rebuilt
+// from the segments. The check lists the files on disk, so a retired
+// segment whose file is still held by a read (or failed to be removed)
+// keeps tombstones until it is gone.
 
 // compactBatchBytes is roughly how many document bytes compaction buffers
 // before appending them to the output segment.
@@ -69,6 +75,14 @@ type compactMove struct {
 	id        string
 	walOffset uint64
 	old, new  segment.Location
+}
+
+// compactRecord is a record of an input segment that compaction copies.
+type compactRecord struct {
+	typ       segment.RecordType
+	id        string
+	walOffset uint64
+	loc       segment.Location
 }
 
 // startCompactor starts the background compactor. Called once by Open,
@@ -142,25 +156,31 @@ func (c *Collection) compact(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// planCompaction picks the input run, seals the active segment, and
-// reserves the output id. Callers hold compactMu.
+// planCompaction picks the input run from the index file's segment
+// accounting, seals the active segment, and reserves the output id.
+// Callers hold compactMu.
 func (c *Collection) planCompaction() (compactPlan, bool, error) {
 	e := c.db.e
 	c.flushMu.Lock()
 	defer c.flushMu.Unlock()
 
 	c.mu.RLock()
-	if c.dropped {
-		c.mu.RUnlock()
+	dropped := c.dropped
+	c.mu.RUnlock()
+	if dropped {
 		return compactPlan{}, false, nil
 	}
-	segs := slices.Sorted(maps.Keys(c.segBytes))
-	skip := map[uint32]bool{c.activeSeg: true, c.markerSeg: true}
-	run := pickCompactionRun(segs, skip, c.segBytes, c.deadBytes, e.opts.CompactionRatio, e.opts.DataSegmentSize)
-	if run == nil {
-		run = pickSmallRun(segs, skip, c.segBytes, c.deadBytes, e.opts.DataSegmentSize)
+	// flushMu keeps the flusher out, so the accounting read here still
+	// holds when the active segment is sealed below.
+	segs, total, dead, err := c.compactionAccounting()
+	if err != nil {
+		return compactPlan{}, false, err
 	}
-	c.mu.RUnlock()
+	skip := map[uint32]bool{c.activeSeg: true}
+	run := pickCompactionRun(segs, skip, total, dead, e.opts.CompactionRatio, e.opts.DataSegmentSize)
+	if run == nil {
+		run = pickSmallRun(segs, skip, total, dead, e.opts.DataSegmentSize)
+	}
 	if run == nil {
 		return compactPlan{}, false, nil
 	}
@@ -169,16 +189,49 @@ func (c *Collection) planCompaction() (compactPlan, bool, error) {
 	if err != nil {
 		return compactPlan{}, false, err
 	}
-	c.sealForCompaction()
+	_, registered := total[c.activeSeg]
+	c.sealForCompaction(registered)
 	out := c.nextSeg
 	c.nextSeg++
 	return compactPlan{run: run, out: out, dropTombs: coversOlderVersions(run, onDisk)}, true, nil
 }
 
+// compactionAccounting returns what compaction planning works with: the
+// collection's registered data segments in ascending order, and per
+// segment its record bytes and the dead bytes a compaction could reclaim.
+// The numbers come from the index file. The index file counts every
+// tombstone as dead; the tombstones a compaction of this process had to
+// copy (keptTombs) are taken out again, because compacting their segment
+// once more would only copy them once more.
+// Callers hold no collection lock other than flushMu or compactMu.
+func (c *Collection) compactionAccounting() (segs []uint32, total, dead map[uint32]int64, err error) {
+	st, err := c.indexStore()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var stats []idxstore.SegmentStats
+	err = st.View(func(tx *idxstore.Tx) (err error) {
+		stats, err = tx.Segments()
+		return err
+	})
+	if err != nil {
+		return nil, nil, nil, c.storeErr(err)
+	}
+	segs = make([]uint32, len(stats))
+	total = make(map[uint32]int64, len(stats))
+	dead = make(map[uint32]int64, len(stats))
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for i, s := range stats {
+		segs[i], total[s.Seg] = s.Seg, s.RecordBytes
+		dead[s.Seg] = max(s.DeadBytes-c.keptTombs[s.Seg], 0)
+	}
+	return segs, total, dead, nil
+}
+
 // pickCompactionRun returns the input run for a compaction, or nil if none
 // is needed. segs lists the live segments in ascending order; segments in
-// skip (the active one, the one with the newest checkpoint marker) are not
-// sealed candidates and split runs. A compaction is needed when there are
+// skip (the active one) are not sealed candidates and split runs. A compaction is needed when there are
 // at least 2 candidates and their dead bytes reach ratio of their total
 // bytes. The run is the contiguous run of candidates with the most dead
 // bytes — the oldest one on ties — whose live bytes fit in maxLive (one
@@ -258,11 +311,12 @@ func coversOlderVersions(run, onDisk []uint32) bool {
 // sealForCompaction seals the active segment, if it is not sealed yet, so
 // that every later flush goes to a segment newer than the compaction
 // output (the ordering invariant). The next flush creates the new active
-// segment. An active segment without records is removed instead of being
-// kept as an empty sealed segment. Failures are logged: the data is
-// already durable, a missing hint is rebuilt on open, and a leftover empty
-// file is harmless. Callers hold flushMu.
-func (c *Collection) sealForCompaction() {
+// segment. An active segment that no flush has written to (registered is
+// false: the index file does not know it) is removed instead of being kept
+// as an empty sealed segment. Failures are logged: the data is already
+// durable, and a leftover file that is not registered is removed on open.
+// Callers hold flushMu.
+func (c *Collection) sealForCompaction(registered bool) {
 	if c.activeSeg == 0 || c.activeSealed {
 		return
 	}
@@ -276,26 +330,22 @@ func (c *Collection) sealForCompaction() {
 		}
 	}
 	c.activeSealed = true
-	if len(c.activeHint) == 0 {
-		c.mu.Lock()
-		delete(c.segBytes, seg)
-		c.mu.Unlock()
+	if !registered {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			e.logger.Warn("cachydb: removing empty data segment", "file", path, "err", err)
 		}
-		return
 	}
-	if err := segment.WriteHint(c.dir, seg, c.activeHint); err != nil {
-		e.logger.Warn("cachydb: writing hint file; the segment will be scanned on open", "file", path, "err", err)
-	}
-	c.activeHint = nil
 }
 
 // runCompaction copies the live records of plan.run into segment plan.out,
-// swaps the keydir, retires the old segments, and rewrites the index
-// snapshots. Callers hold compactMu.
+// swaps the key table over in one index transaction, and retires the old
+// segments. Callers hold compactMu.
 func (c *Collection) runCompaction(ctx context.Context, plan compactPlan) error {
 	e := c.db.e
+	st, err := c.indexStore()
+	if err != nil {
+		return err
+	}
 	w, err := segment.Create(c.dir, plan.out)
 	if err != nil {
 		return err
@@ -310,12 +360,13 @@ func (c *Collection) runCompaction(ctx context.Context, plan compactPlan) error 
 	}
 
 	var (
-		moves    []compactMove
-		hint     []segment.HintEntry
-		outBytes int64
-		batch    []segment.Record
-		batchSrc []segment.HintEntry
-		pending  int
+		moves     []compactMove
+		records   int
+		outBytes  int64
+		tombBytes int64 // copied tombstones: dead bytes of the output from the start
+		batch     []segment.Record
+		batchSrc  []compactRecord
+		pending   int
 	)
 	appendBatch := func() error {
 		if len(batch) == 0 {
@@ -328,9 +379,11 @@ func (c *Collection) runCompaction(ctx context.Context, plan compactPlan) error 
 		for i, loc := range locs {
 			src := batchSrc[i]
 			outBytes += int64(loc.Size)
-			hint = append(hint, segment.HintEntry{ID: src.ID, Type: src.Type, WALOffset: src.WALOffset, Loc: loc})
-			if src.Type == segment.TypePut {
-				moves = append(moves, compactMove{id: src.ID, walOffset: src.WALOffset, old: src.Loc, new: loc})
+			records++
+			if src.typ == segment.TypePut {
+				moves = append(moves, compactMove{id: src.id, walOffset: src.walOffset, old: src.loc, new: loc})
+			} else {
+				tombBytes += int64(loc.Size)
 			}
 		}
 		batch, batchSrc, pending = batch[:0], batchSrc[:0], 0
@@ -341,7 +394,7 @@ func (c *Collection) runCompaction(ctx context.Context, plan compactPlan) error 
 		if err := ctx.Err(); err != nil {
 			return fail(err)
 		}
-		keep, err := c.liveEntries(seg, plan.dropTombs)
+		keep, err := c.liveEntries(st, seg, plan.dropTombs)
 		if err != nil {
 			return fail(err)
 		}
@@ -353,14 +406,14 @@ func (c *Collection) runCompaction(ctx context.Context, plan compactPlan) error 
 			return fail(err)
 		}
 		for _, en := range keep {
-			rec := segment.Record{Type: en.Type, WALOffset: en.WALOffset, ID: en.ID}
-			if en.Type == segment.TypePut {
-				if rec, err = r.Read(en.Loc); err != nil {
+			rec := segment.Record{Type: en.typ, WALOffset: en.walOffset, ID: en.id}
+			if en.typ == segment.TypePut {
+				if rec, err = r.Read(en.loc); err != nil {
 					break
 				}
-				if rec.Type != segment.TypePut || rec.ID != en.ID || rec.WALOffset != en.WALOffset {
-					err = fmt.Errorf("%w: record at segment %d byte %d is %s %q@%d, hint says put %q@%d",
-						segment.ErrCorrupt, seg, en.Loc.Pos, rec.Type, rec.ID, rec.WALOffset, en.ID, en.WALOffset)
+				if rec.Type != segment.TypePut || rec.ID != en.id || rec.WALOffset != en.walOffset {
+					err = fmt.Errorf("%w: record at segment %d byte %d is %s %q@%d, the scan said put %q@%d",
+						segment.ErrCorrupt, seg, en.loc.Pos, rec.Type, rec.ID, rec.WALOffset, en.id, en.walOffset)
 					break
 				}
 			}
@@ -386,13 +439,10 @@ func (c *Collection) runCompaction(ctx context.Context, plan compactPlan) error 
 		return fail(err)
 	}
 
-	// Make the output durable — data, hint, directory entries — before
+	// Make the output durable — data and directory entry — before
 	// anything references it.
 	open = false
 	if err := w.Close(); err != nil {
-		return fail(err)
-	}
-	if err := segment.WriteHint(c.dir, plan.out, hint); err != nil {
 		return fail(err)
 	}
 	if err := fsutil.SyncDir(c.dir); err != nil {
@@ -402,24 +452,59 @@ func (c *Collection) runCompaction(ctx context.Context, plan compactPlan) error 
 		return err // simulated crash: no cleanup
 	}
 
-	// Swap (memory only).
-	c.mu.Lock()
+	// Swap: one index transaction, in ascending id order (see applyFlush).
+	// No collection lock is held; a flush that commits before it changes
+	// the entries the compare-and-swap then leaves alone.
+	slices.SortFunc(moves, func(a, b compactMove) int { return cmp.Compare(a.id, b.id) })
 	var lost int64
-	for _, m := range moves {
-		if ke, ok := c.keydir[m.id]; ok && ke.walOffset == m.walOffset && ke.loc == m.old {
-			c.keydir[m.id] = keyEntry{loc: m.new, walOffset: m.walOffset}
-		} else {
-			lost += int64(m.new.Size) // changed since it was copied
+	committing := false
+	err = st.Update(func(u *idxstore.WTx) error {
+		lost, committing = 0, false
+		for _, m := range moves {
+			cur, ok, err := u.Key(m.id)
+			if err != nil {
+				return err
+			}
+			if !ok || cur != locationEntry(m.old, m.walOffset) {
+				lost += int64(m.new.Size) // changed since it was copied
+				continue
+			}
+			if err := u.PutKey(m.id, locationEntry(m.new, m.walOffset)); err != nil {
+				return err
+			}
 		}
+		if err := u.SetSegment(idxstore.SegmentStats{Seg: plan.out, RecordBytes: outBytes, DeadBytes: lost + tombBytes}); err != nil {
+			return err
+		}
+		for _, s := range plan.run {
+			if err := u.DeleteSegment(s); err != nil {
+				return err
+			}
+		}
+		committing = true
+		return nil
+	})
+	if err != nil {
+		err = c.storeErr(err)
+		if committing && c.maybeRegistered(st, plan.out) {
+			// The commit failed late: bbolt may already have written the
+			// transaction, so the key table may point into the output (see
+			// afterFailedIndexCommit). Keep every file, inputs and output;
+			// the next Open removes whichever side the index file does not
+			// register.
+			return fmt.Errorf("%w (the output segment %d and the input segments are kept until the next open)", err, plan.out)
+		}
+		return fail(err)
 	}
-	c.segBytes[plan.out] = outBytes
-	if lost > 0 {
-		c.deadBytes[plan.out] = lost
+
+	// Retire the inputs (memory only), then remove their files.
+	c.mu.Lock()
+	if tombBytes > 0 {
+		c.keptTombs[plan.out] = tombBytes
 	}
 	readers := make(map[uint32]*segment.Reader)
 	for _, s := range plan.run {
-		delete(c.segBytes, s)
-		delete(c.deadBytes, s)
+		delete(c.keptTombs, s)
 		c.retired[s] = struct{}{}
 		if r, ok := c.readers[s]; ok {
 			readers[s] = r
@@ -432,56 +517,66 @@ func (c *Collection) runCompaction(ctx context.Context, plan compactPlan) error 
 		c.removeSegmentFiles(s, readers[s])
 	}
 
-	c.flushMu.Lock()
-	c.writeSnapshotsAfterCompaction()
-	c.flushMu.Unlock()
-
 	e.logger.Debug("cachydb: compacted data segments",
 		"database", c.db.name, "collection", c.name, "segments", plan.run, "output", plan.out,
-		"output_bytes", outBytes, "records", len(hint), "tombstones_dropped", plan.dropTombs)
+		"output_bytes", outBytes, "records", records, "tombstones_dropped", plan.dropTombs)
 	return nil
 }
 
+// maybeRegistered reports whether the index file may register data segment
+// seg: true when it does, or when that cannot be read.
+func (c *Collection) maybeRegistered(st *idxstore.Store, seg uint32) bool {
+	registered := true
+	err := st.View(func(tx *idxstore.Tx) (err error) {
+		_, registered, err = tx.Segment(seg)
+		return err
+	})
+	return err != nil || registered
+}
+
 // liveEntries returns the records of segment seg that compaction copies:
-// puts the keydir still references at exactly this location, and
-// tombstones unless dropTombs. Checkpoint markers are never copied. The
-// records come from the segment's hint file, or a scan if it has none.
-func (c *Collection) liveEntries(seg uint32, dropTombs bool) ([]segment.HintEntry, error) {
-	entries, err := segment.ReadHint(c.dir, seg)
-	if err == nil {
-		err = checkHintFits(c.dir, seg, entries)
-	}
+// puts whose key-table entry points at exactly this record, and tombstones
+// unless dropTombs. Checkpoint markers (in segments written by older
+// versions) are never copied. The records come from a header-only scan,
+// which verifies every checksum but decompresses nothing.
+func (c *Collection) liveEntries(st *idxstore.Store, seg uint32, dropTombs bool) ([]compactRecord, error) {
+	var recs []compactRecord
+	_, err := segment.ScanHeaders(c.dir, seg, func(r segment.Record, loc segment.Location) error {
+		if r.Type == segment.TypePut || (r.Type == segment.TypeTombstone && !dropTombs) {
+			recs = append(recs, compactRecord{typ: r.Type, id: r.ID, walOffset: r.WALOffset, loc: loc})
+		}
+		return nil
+	})
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			c.db.e.logger.Warn("cachydb: ignoring invalid hint file; scanning the segment",
-				"file", segment.DataPath(c.dir, seg), "err", err)
-		}
-		if entries, err = scanHint(c.dir, seg); err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
-	keep := entries[:0]
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	for _, en := range entries {
-		switch en.Type {
-		case segment.TypePut:
-			if ke, ok := c.keydir[en.ID]; ok && ke.loc == en.Loc {
-				keep = append(keep, en)
+	keep := recs[:0]
+	err = st.View(func(tx *idxstore.Tx) error {
+		for _, en := range recs {
+			if en.typ == segment.TypePut {
+				ke, ok, err := tx.Key(en.id)
+				if err != nil {
+					return err
+				}
+				if !ok || ke != locationEntry(en.loc, en.walOffset) {
+					continue
+				}
 			}
-		case segment.TypeTombstone:
-			if !dropTombs {
-				keep = append(keep, en)
-			}
+			keep = append(keep, en)
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, c.storeErr(err)
 	}
 	return keep, nil
 }
 
-// removeSegmentFiles deletes the hint file of segment seg and then its data
-// file: at once, or through r (an open reader of it) once the last read
-// releases it. Errors are logged; a leftover data file only holds records
-// that also exist elsewhere, and is loaded as a normal segment on open.
+// removeSegmentFiles deletes the data file of segment seg: at once, or
+// through r (an open reader of it) once the last read releases it. A hint
+// file an older version wrote for the segment goes first. Errors are
+// logged; a leftover data file is not registered in the index file, and
+// Open removes it.
 func (c *Collection) removeSegmentFiles(seg uint32, r *segment.Reader) {
 	logger := c.db.e.logger
 	logErr := func(err error) {
@@ -492,35 +587,10 @@ func (c *Collection) removeSegmentFiles(seg uint32, r *segment.Reader) {
 			logErr(err)
 		}
 	}
-	// Hint first: a data file left without its hint is scanned on open,
-	// while a hint left without its data file is ignored.
 	remove(segment.HintPath(c.dir, seg))
 	if r != nil {
 		r.RetireWith(logErr)
 		return
 	}
 	remove(segment.DataPath(c.dir, seg))
-}
-
-// writeSnapshotsAfterCompaction rewrites the index snapshots so they cover
-// the newest segment: snapshots covering a retired segment are useless,
-// and output records count as "after" an older covered position. Callers
-// hold flushMu, so no flush changes the segments meanwhile.
-func (c *Collection) writeSnapshotsAfterCompaction() {
-	c.mu.RLock()
-	newest := slices.Max(slices.Collect(maps.Keys(c.segBytes)))
-	c.mu.RUnlock()
-	var size int64
-	if c.active != nil && c.activeSeg == newest {
-		size = c.active.Size()
-	} else {
-		fi, err := os.Stat(segment.DataPath(c.dir, newest))
-		if err != nil {
-			c.db.e.logger.Warn("cachydb: writing index snapshots after compaction; the indexes will be rebuilt on open",
-				"collection", c.name, "err", err)
-			return
-		}
-		size = fi.Size()
-	}
-	c.writeIndexSnapshots(newest, uint64(size))
 }

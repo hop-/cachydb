@@ -11,7 +11,8 @@
 //	bucket "ix/<name>"  index key (key.go) -> Flags (1 byte)
 //
 // The meta bucket holds "format" (the layout version), "complete" (absent
-// while a rebuild is in progress), "checkpoint" (WAL offset), "count"
+// while a rebuild is in progress), "checkpoint" (WAL offset), "maxwal" (the
+// highest WAL offset of any change the file reflects), "count"
 // (live documents, kept by PutKey and DeleteKey), "covered" (the data
 // position the index reflects), one "seg:<id>" per live data segment
 // (record bytes, dead bytes), and one "ix:<name>" per index (its complex
@@ -110,6 +111,9 @@ var (
 	// ErrBadID is returned for a document id that is empty or longer than
 	// MaxIDLen.
 	ErrBadID = errors.New("idxstore: invalid document id")
+	// ErrClosed is returned by Begin, View, Key, and Update on a Store that
+	// was closed.
+	ErrClosed = errors.New("idxstore: index file is closed")
 )
 
 // NeedsRebuild reports whether err, returned by Open, means the index
@@ -363,6 +367,9 @@ func (s *Store) Close() error {
 func (s *Store) Begin() (*Tx, error) {
 	btx, err := s.db.Begin(false)
 	if err != nil {
+		if errors.Is(err, berrors.ErrDatabaseNotOpen) {
+			return nil, fmt.Errorf("%w: %s", ErrClosed, s.path)
+		}
 		return nil, fmt.Errorf("idxstore: %s: starting a read transaction: %w", s.path, err)
 	}
 	r, err := newReader(btx, s.path)
@@ -414,6 +421,9 @@ func (s *Store) Update(fn func(u *WTx) error) error {
 	})
 	if fnErr != nil {
 		return fnErr // fn's own error, as it is; bbolt rolled back
+	}
+	if errors.Is(err, berrors.ErrDatabaseNotOpen) {
+		return fmt.Errorf("%w: %s", ErrClosed, s.path)
 	}
 	if err != nil {
 		return fmt.Errorf("idxstore: %s: update: %w", s.path, err)

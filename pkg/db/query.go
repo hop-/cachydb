@@ -395,6 +395,21 @@ func (c *Collection) countFast(p *preparedQuery) (int, bool, error) {
 	if len(p.anyOf) > 0 || len(p.filters) > 1 {
 		return 0, false, nil
 	}
+	if len(p.filters) == 1 && p.filters[0].Field == "_id" {
+		f := p.filters[0]
+		if f.Operator != "eq" {
+			return 0, false, nil
+		}
+		id, ok := f.Value.(string)
+		if !ok {
+			return 0, true, nil
+		}
+		live, err := c.live(id)
+		if err != nil || !live {
+			return 0, err == nil, err
+		}
+		return 1, true, nil
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.dropped {
@@ -404,16 +419,6 @@ func (c *Collection) countFast(p *preparedQuery) (int, bool, error) {
 		return c.Count(), true, nil
 	}
 	f := p.filters[0]
-	if f.Field == "_id" {
-		if f.Operator != "eq" {
-			return 0, false, nil
-		}
-		id, ok := f.Value.(string)
-		if !ok || !c.liveLocked(id) {
-			return 0, true, nil
-		}
-		return 1, true, nil
-	}
 	if f.Operator != "eq" && f.Operator != "has" {
 		return 0, false, nil
 	}
@@ -430,15 +435,23 @@ func (c *Collection) countFast(p *preparedQuery) (int, bool, error) {
 	return ix.countHas(f.Value), true, nil
 }
 
-// liveLocked reports whether the document id exists. Callers hold mu.
-func (c *Collection) liveLocked(id string) bool {
+// live reports whether the document id exists: the overlay decides if it
+// has the id, otherwise the key table. Callers hold no collection lock.
+func (c *Collection) live(id string) (bool, error) {
+	c.mu.RLock()
+	if c.dropped {
+		c.mu.RUnlock()
+		return false, c.errDropped()
+	}
 	for _, layer := range []map[string]memEntry{c.memtable, c.flushing} {
 		if me, ok := layer[id]; ok {
-			return me.doc != nil
+			c.mu.RUnlock()
+			return me.doc != nil, nil
 		}
 	}
-	_, ok := c.keydir[id]
-	return ok
+	c.mu.RUnlock()
+	_, ok, err := c.storedEntry(id)
+	return ok, err
 }
 
 // Distinct returns the distinct values of field among the documents
@@ -530,18 +543,21 @@ func (c *Collection) distinct(ctx context.Context, field string, q *Query) ([]an
 // documents (every live id for _id, or the keys of an index on field),
 // or false.
 func (c *Collection) distinctFast(field string) ([]any, bool, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.dropped {
-		return nil, false, c.errDropped()
-	}
 	if field == "_id" {
-		ids := c.liveIDsLocked()
+		ids, err := c.liveIDs()
+		if err != nil {
+			return nil, false, err
+		}
 		out := make([]any, len(ids))
 		for i, id := range ids {
 			out[i] = id
 		}
 		return out, true, nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.dropped {
+		return nil, false, c.errDropped()
 	}
 	ix := c.indexOnLocked(field)
 	if ix == nil {

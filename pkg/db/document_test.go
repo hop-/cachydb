@@ -11,6 +11,7 @@ import (
 	"testing"
 	"uuid"
 
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
 	"github.com/hop-/cachydb/pkg/db/internal/segment"
 	"github.com/hop-/cachydb/pkg/db/internal/wal"
 )
@@ -58,7 +59,7 @@ func docIDs(docs []*Document) []string {
 }
 
 // seedSegment writes docs as put records into a new data segment seg of c
-// and points the keydir at them, as a flush would have (task 10).
+// and points the key table at them, as a flush would have (task 10).
 func seedSegment(t *testing.T, c *Collection, seg uint32, walOffset uint64, docs ...*Document) {
 	t.Helper()
 	w, err := segment.Create(c.dir, seg)
@@ -80,10 +81,14 @@ func seedSegment(t *testing.T, c *Collection, seg uint32, walOffset uint64, docs
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	entries := make(map[string]idxstore.Entry, len(docs))
+	var size int64
 	for i, d := range docs {
-		c.keydir[d.ID] = keyEntry{loc: locs[i], walOffset: walOffset}
+		entries[d.ID] = locationEntry(locs[i], walOffset)
+		size += int64(locs[i].Size)
+	}
+	putKeyEntries(t, c, seg, size, entries)
+	for range docs {
 		c.count.Add(1)
 	}
 }
@@ -864,11 +869,9 @@ func TestReadFromSegmentAndCache(t *testing.T) {
 func TestReadFromSegmentMismatch(t *testing.T) {
 	_, c := newTestColl(t, nil, nil)
 	seedSegment(t, c, 1, 7, &Document{ID: "s1", Data: map[string]any{"v": 1}})
-	c.mu.Lock()
-	ke := c.keydir["s1"]
-	ke.walOffset = 8 // keydir and record disagree
-	c.keydir["s1"] = ke
-	c.mu.Unlock()
+	ke, _ := keyEntryOf(t, c, "s1")
+	ke.WALOffset = 8 // keydir and record disagree
+	putKeyEntries(t, c, 1, 0, map[string]idxstore.Entry{"s1": ke})
 	if _, err := c.Get(context.Background(), "s1"); !errors.Is(err, segment.ErrCorrupt) {
 		t.Fatalf("Get = %v, want segment.ErrCorrupt", err)
 	}
@@ -1017,12 +1020,8 @@ func TestCachedDocumentIsNeverShared(t *testing.T) {
 	mustFlush(t, c) // now read from the data segment, through the cache
 
 	first := mustGet(t, c, "a")
-	ke := func() keyEntry {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		return c.keydir["a"]
-	}()
-	cached, ok := e.cache.Get(c.cacheKey("a"), ke.walOffset)
+	ke, _ := keyEntryOf(t, c, "a")
+	cached, ok := e.cache.Get(c.cacheKey("a"), ke.WALOffset)
 	if !ok {
 		t.Fatal("document not cached after a Get")
 	}

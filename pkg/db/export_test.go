@@ -7,7 +7,76 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
 )
+
+// Key-table accessors: the key table moved from the Collection.keydir map
+// into the index file (index.db); tests read it through these.
+
+// keyEntryOf returns the key-table entry of id, and whether there is one.
+func keyEntryOf(t testing.TB, c *Collection, id string) (idxstore.Entry, bool) {
+	t.Helper()
+	ke, ok, err := c.storedEntry(id)
+	if err != nil {
+		t.Fatalf("key-table lookup of %q: %v", id, err)
+	}
+	return ke, ok
+}
+
+// keyTable returns the whole key table: id -> entry.
+func keyTable(t testing.TB, c *Collection) map[string]idxstore.Entry {
+	t.Helper()
+	st, err := c.indexStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make(map[string]idxstore.Entry)
+	err = st.View(func(tx *idxstore.Tx) error {
+		cur := tx.KeyCursor()
+		for k, ke, ok := cur.First(); ok; k, ke, ok = cur.Next() {
+			out[string(k)] = ke
+		}
+		return cur.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// putKeyEntries writes entries into the key table in one index
+// transaction, as a flush would, and adds addBytes record bytes to segment
+// seg's accounting (registering it).
+func putKeyEntries(t testing.TB, c *Collection, seg uint32, addBytes int64, entries map[string]idxstore.Entry) {
+	t.Helper()
+	st, err := c.indexStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = st.Update(func(u *idxstore.WTx) error {
+		for id, ke := range entries {
+			if err := u.PutKey(id, ke); err != nil {
+				return err
+			}
+		}
+		return u.AddSegment(seg, addBytes, 0)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// segAccounting returns the registered data segments' record bytes and
+// dead bytes as compaction planning sees them (compactionAccounting).
+func segAccounting(t testing.TB, c *Collection) (total, dead map[uint32]int64) {
+	t.Helper()
+	_, total, dead, err := c.compactionAccounting()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return total, dead
+}
 
 // Crash-test helpers (interfaces.md #crash-hooks).
 

@@ -116,14 +116,16 @@ func docsModel(indexes map[string]string, docs map[string]map[string]any) model 
 // non-retired segment.
 func checkKeydirLive(t *testing.T, c *Collection) {
 	t.Helper()
+	keys := keyTable(t, c)
+	segBytes, _ := segAccounting(t, c)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	for id, ke := range c.keydir {
-		if _, ok := c.retired[ke.loc.Seg]; ok {
-			t.Errorf("keydir[%q] points into retired segment %d", id, ke.loc.Seg)
+	for id, ke := range keys {
+		if _, ok := c.retired[ke.Seg]; ok {
+			t.Errorf("keydir[%q] points into retired segment %d", id, ke.Seg)
 		}
-		if _, ok := c.segBytes[ke.loc.Seg]; !ok {
-			t.Errorf("keydir[%q] points into unknown segment %d", id, ke.loc.Seg)
+		if _, ok := segBytes[ke.Seg]; !ok {
+			t.Errorf("keydir[%q] points into unknown segment %d", id, ke.Seg)
 		}
 	}
 	for seg := range c.readers {
@@ -342,9 +344,8 @@ func TestCompactionRecords(t *testing.T) {
 			if err != nil || len(hint) != len(outRecs) {
 				t.Errorf("output hint = %d entries, %v; want %d", len(hint), err, len(outRecs))
 			}
-			c.mu.RLock()
-			outDead := c.deadBytes[out[0]]
-			c.mu.RUnlock()
+			_, deadBytes := segAccounting(t, c)
+			outDead := deadBytes[out[0]]
 			if outDead != 0 {
 				t.Errorf("deadBytes[output] = %d, want 0 (copied tombstones are needed)", outDead)
 			}
@@ -423,15 +424,15 @@ func TestCompactionSwapIsCompareAndSwap(t *testing.T) {
 	if got, want := recordKinds(outRecs), []string{"put:b", "put:c", "put:a"}; !slices.Equal(got, want) {
 		t.Fatalf("output %d records = %v, want %v", out, got, want)
 	}
-	c.mu.RLock()
-	ka, kb := c.keydir["a"], c.keydir["b"]
-	_, hasC := c.keydir["c"]
-	dead := c.deadBytes[out]
-	c.mu.RUnlock()
-	if ka.loc.Seg != out {
+	ka, _ := keyEntryOf(t, c, "a")
+	kb, _ := keyEntryOf(t, c, "b")
+	_, hasC := keyEntryOf(t, c, "c")
+	_, deadBytes := segAccounting(t, c)
+	dead := deadBytes[out]
+	if ka.Seg != out {
 		t.Errorf("a not repointed to the output: %+v", ka)
 	}
-	if kb.loc.Seg == out {
+	if kb.Seg == out {
 		t.Errorf("b updated during compaction was overwritten by its old copy: %+v", kb)
 	}
 	if hasC {
@@ -469,9 +470,7 @@ func TestCompactionRetiredSegmentReads(t *testing.T) {
 	mustInsert(t, c, "z", map[string]any{"v": 3})
 	mustFlushSeal(t, c) // 3
 
-	c.mu.RLock()
-	staleB := c.keydir["b"] // in segment 2, which no read has opened
-	c.mu.RUnlock()
+	staleB, _ := keyEntryOf(t, c, "b") // in segment 2, which no read has opened
 	held, err := c.acquireReader(1)
 	if err != nil {
 		t.Fatal(err)

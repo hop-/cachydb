@@ -2,15 +2,9 @@ package db
 
 import (
 	"context"
-	"encoding/binary"
-	"hash/crc32"
-	"os"
-	"path/filepath"
 	"reflect"
 	"slices"
 	"testing"
-
-	"github.com/hop-/cachydb/pkg/db/internal/segment"
 )
 
 // Tests of the plan-004 query features: element operators, OR groups,
@@ -200,67 +194,6 @@ func TestFindElementOperatorsUseIndex(t *testing.T) {
 				t.Errorf("examined %d candidates, want %d", examined, tt.examined)
 			}
 		})
-	}
-}
-
-// TestRecoveryOldIndexSnapshotRebuilds: a version-1 index snapshot
-// (whole-value keys, before plan 004) is rejected at open and the index
-// rebuilt with element keys.
-func TestRecoveryOldIndexSnapshotRebuilds(t *testing.T) {
-	ctx := context.Background()
-	opts, e, c := newCrashColl(t, nil, nil)
-	if err := c.CreateIndex(ctx, "by_g", "g"); err != nil {
-		t.Fatal(err)
-	}
-	mustInsert(t, c, "s", map[string]any{"g": "a"})
-	mustInsert(t, c, "arr", map[string]any{"g": []any{"a", "b"}})
-	if err := e.Close(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	// What plan 003 wrote: arrays not indexed, sidecar version 1.
-	snap, err := segment.ReadIndexSnapshot(c.dir, "by_g")
-	if err != nil {
-		t.Fatal(err)
-	}
-	snap.Keys = map[string][]string{"s:a": {"s"}}
-	if err := segment.WriteIndexSnapshot(c.dir, snap); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(c.dir, "idx-by_g.snap")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	binary.LittleEndian.PutUint16(data[4:], 1)
-	end := len(data) - 4
-	binary.LittleEndian.PutUint32(data[end:], crc32.Checksum(data[:end], crc32.MakeTable(crc32.Castagnoli)))
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	e = openEngine(t, opts)
-	if got := e.recov.indexesRebuilt.Load(); got != 1 {
-		t.Errorf("indexes rebuilt = %d, want 1", got)
-	}
-	if got := e.recov.snapshotsLoaded.Load(); got != 0 {
-		t.Errorf("snapshots loaded = %d, want 0", got)
-	}
-	c = mustColl(t, mustDB(t, e, "app"), "c")
-	docs, examined, err := c.find(ctx, &Query{Filters: []QueryFilter{{"g", "has", "b"}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ids := docIDs(docs); !slices.Equal(ids, []string{"arr"}) || examined != 1 {
-		t.Errorf("has b = %v after examining %d, want [arr] from the index", ids, examined)
-	}
-	if err := e.Close(ctx); err != nil {
-		t.Fatal(err)
-	}
-	// Close wrote a current snapshot, which loads.
-	e = openEngine(t, opts)
-	if got := e.recov.snapshotsLoaded.Load(); got != 1 {
-		t.Errorf("snapshots loaded after a clean close = %d, want 1", got)
 	}
 }
 

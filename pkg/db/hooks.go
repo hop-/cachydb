@@ -14,7 +14,8 @@ type hookPoint string
 const (
 	hookAfterWALSync      hookPoint = "after-wal-sync-before-apply"       // document writes (task 09)
 	hookAfterSegWrite     hookPoint = "after-segment-write-before-fsync"  // flush (task 10)
-	hookAfterSegSync      hookPoint = "after-segment-fsync-before-keydir" // flush (task 10)
+	hookAfterSegSync      hookPoint = "after-segment-fsync-before-keydir" // flush (task 10): before the index transaction
+	hookAfterIndexCommit  hookPoint = "after-index-commit-before-apply"   // flush: after the index transaction committed, before the overlay is cleared
 	hookCompactBeforeSwap hookPoint = "compaction-before-swap"            // compaction (task 12)
 	hookMetaWrite         hookPoint = "during-meta-write"                 // metadata ops: after the WAL append, before the meta file change
 	hookRenameDir         hookPoint = "rename-after-dir-before-meta"      // rename_collection: after the directory rename, before coll.meta (plan 004)

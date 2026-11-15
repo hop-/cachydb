@@ -39,6 +39,9 @@ func (r *reader) checkLayout() error {
 	if _, err := r.Checkpoint(); err != nil {
 		return err
 	}
+	if _, err := r.MaxWALOffset(); err != nil {
+		return err
+	}
 	if _, err := r.Count(); err != nil {
 		return err
 	}

@@ -18,6 +18,7 @@ var (
 	keyFormat     = []byte("format")     // u32 layout version
 	keyComplete   = []byte("complete")   // present once the file is whole
 	keyCheckpoint = []byte("checkpoint") // u64 WAL offset
+	keyMaxWAL     = []byte("maxwal")     // u64 WAL offset; absent means 0
 	keyCount      = []byte("count")      // u64 live documents
 	keyCovered    = []byte("covered")    // u32 segment · u64 end position
 	segKeyPrefix  = []byte("seg:")       // + u32 segment id -> i64 record bytes · i64 dead bytes
@@ -166,6 +167,20 @@ func (r *reader) Key(id string) (e Entry, ok bool, err error) {
 // collection's changes (0 initially).
 func (r *reader) Checkpoint() (uint64, error) { return r.metaUint64(keyCheckpoint) }
 
+// MaxWALOffset returns the highest WAL offset of any change the file
+// reflects, as recorded by RaiseMaxWALOffset (0 initially). It can be above
+// Checkpoint: a flush may write changes newer than its checkpoint.
+func (r *reader) MaxWALOffset() (uint64, error) {
+	v := r.meta.Get(keyMaxWAL)
+	if v == nil {
+		return 0, nil
+	}
+	if len(v) != 8 {
+		return 0, r.corrupt("meta %q is %d bytes", keyMaxWAL, len(v))
+	}
+	return binary.BigEndian.Uint64(v), nil
+}
+
 // Count returns the number of documents in the key table. It is kept by
 // PutKey and DeleteKey, so reading it costs nothing.
 func (r *reader) Count() (int64, error) {
@@ -285,8 +300,9 @@ func (r *reader) IndexCursor(name string) (*IndexCursor, error) {
 // that moment. Byte slices it hands out point into the file and are valid
 // only until Close.
 //
-// Its read methods (Key, Count, Checkpoint, Covered, Segments, Segment,
-// Indexes, IndexStats, KeyCursor, IndexCursor) are also available on WTx.
+// Its read methods (Key, Count, Checkpoint, MaxWALOffset, Covered, Segments,
+// Segment, Indexes, IndexStats, KeyCursor, IndexCursor) are also available
+// on WTx.
 type Tx struct {
 	reader
 }
@@ -391,6 +407,16 @@ func (u *WTx) writeErr(err error) error {
 // collection's changes.
 func (u *WTx) SetCheckpoint(cp uint64) error {
 	return u.putMeta(keyCheckpoint, binary.BigEndian.AppendUint64(nil, cp))
+}
+
+// RaiseMaxWALOffset records that the file reflects a change with WAL offset
+// off: it raises the value MaxWALOffset returns to off if it is lower.
+func (u *WTx) RaiseMaxWALOffset(off uint64) error {
+	cur, err := u.MaxWALOffset()
+	if err != nil || off <= cur {
+		return err
+	}
+	return u.putMeta(keyMaxWAL, binary.BigEndian.AppendUint64(nil, off))
 }
 
 // SetCovered stores the data position the file reflects (see Covered).
