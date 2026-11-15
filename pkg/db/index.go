@@ -77,7 +77,7 @@ func indexKeysOf(doc *Document, field string) docIndexKeys {
 	if doc == nil {
 		return docIndexKeys{}
 	}
-	v, ok := doc.GetValue(field)
+	v, ok := doc.GetPath(field)
 	if !ok {
 		return docIndexKeys{entries: []indexEntry{{enc: missingValue}}}
 	}
@@ -225,13 +225,31 @@ const indexBuildBatch = 50_000
 //
 // The caller keeps the key table and the documents still: it holds
 // flushMu and compactMu, or runs at Open before the flusher starts.
+//
+// buildIndexes never checks uniqueness (the rebuild, syncIndexes, and WAL
+// replay must not fail on data that is already committed); CreateIndex
+// uses buildIndexesChecked.
 func (c *Collection) buildIndexes(ctx context.Context, st *idxstore.Store, defs []indexDef) error {
+	return c.buildIndexesChecked(ctx, st, defs, nil, false)
+}
+
+// buildIndexesChecked is buildIndexes that, when check is set, first makes
+// sure that no two live documents share a value of a unique index of defs
+// and otherwise fails with ErrUniqueViolation (duplicateValues) before it
+// writes anything. The live documents are those of the key table whose id
+// is not in overlay, plus the live documents of overlay (the unflushed
+// changes, which the caller keeps still).
+func (c *Collection) buildIndexesChecked(ctx context.Context, st *idxstore.Store, defs []indexDef, overlay map[string]*Document, check bool) error {
 	if len(defs) == 0 {
 		return nil
 	}
 	ops := make([][]indexOp, len(defs))
 	complexN := make([]int64, len(defs))
 	arraysN := make([]int64, len(defs))
+	var owners [][]uniqueOwner // per def, when checked
+	if check {
+		owners = make([][]uniqueOwner, len(defs))
+	}
 	err := st.View(func(tx *idxstore.Tx) error {
 		n := 0
 		cur := tx.KeyCursor()
@@ -246,7 +264,13 @@ func (c *Collection) buildIndexes(ctx context.Context, st *idxstore.Store, defs 
 			if err != nil {
 				return err
 			}
+			_, changed := overlay[id]
 			for i, def := range defs {
+				if check && def.Unique && !changed {
+					if uv, ok := uniqueValueOf(doc, def); ok {
+						owners[i] = append(owners[i], uniqueOwner{dkey: uv.dkey, v: uv.v, id: id})
+					}
+				}
 				keys := indexKeysOf(doc, def.Field)
 				if keys.complex {
 					complexN[i]++
@@ -263,6 +287,20 @@ func (c *Collection) buildIndexes(ctx context.Context, st *idxstore.Store, defs 
 	})
 	if err != nil {
 		return err
+	}
+	for i := range owners {
+		if !defs[i].Unique {
+			continue
+		}
+		for id, doc := range overlay {
+			if uv, ok := uniqueValueOf(doc, defs[i]); ok {
+				owners[i] = append(owners[i], uniqueOwner{dkey: uv.dkey, v: uv.v, id: id})
+			}
+		}
+		if err := duplicateValues(owners[i]); err != nil {
+			return err
+		}
+		owners[i] = nil
 	}
 
 	err = st.Update(func(u *idxstore.WTx) error {

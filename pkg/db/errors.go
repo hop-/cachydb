@@ -19,4 +19,8 @@ var (
 	// whose document no longer matches, or no longer exists; nothing was
 	// written. Re-read the document and retry.
 	ErrConditionFailed = errors.New("condition failed")
+	// ErrUniqueViolation reports a write whose value for a unique index
+	// already belongs to another document, or a unique index that cannot be
+	// created because existing documents share a value; nothing was written.
+	ErrUniqueViolation = errors.New("unique index violation")
 )

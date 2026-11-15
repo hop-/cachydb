@@ -37,8 +37,22 @@ An omitted or empty `query` returns every document in the collection.
 - `any` is a list of groups (each a list of filters). When `any` is set,
   a document must also match **every filter of at least one group** (OR of
   ANDs). An empty or omitted `any` adds no constraint.
-- `field` is a **top-level** field name or `_id`. There is no dot
-  notation for nested fields.
+- `field` is a field name, `_id`, or a **nested path** with dots, see
+  below.
+
+## Nested fields
+
+A field name with dots is a path through nested objects:
+`{"field": "meta.author", "operator": "eq", "value": "ana"}` matches
+`{"meta": {"author": "ana"}}`. Paths work in filters, `any` groups, `if`
+conditions, `sort`, `fields`, `distinct`, and index fields.
+
+- A top-level key that equals the whole name wins: a document with a
+  literal `"meta.author"` key is matched by that key.
+- A path that crosses an array or a value that is not an object is
+  missing: `tags.0` does not index into an array, and `meta.author` is
+  missing when `meta` is a string or an array.
+- Updates (`updates`, `unset`) and schemas use top-level field names only.
 
 ## Operators
 
@@ -93,8 +107,10 @@ be stored literally.
   `null` < `false` < `true` < numbers < strings < arrays < objects
   (`desc` reverses it). It reads **every matching document**; sorting by
   `_id` stops as soon as enough matches are found.
-- `fields` lists the top-level fields to return; `_id` is always
-  returned and unknown names are ignored. Filters and sort may use fields
+- `fields` lists the fields (or nested paths) to return; `_id` is always
+  returned and unknown names are ignored. A nested path returns its value
+  nested under the path: `"fields": ["meta.author"]` gives
+  `{"_id": …, "meta": {"author": …}}`. Filters and sort may use fields
   that are not returned. Omit it for whole documents.
 - `skip` matching documents are skipped (after sorting), then at most
   `limit` are returned. `limit` 0 or omitted means no limit.
@@ -116,8 +132,16 @@ be stored literally.
 
 ## Indexes
 
-- `create_index` builds a hash index on one top-level field. For an array
-  field, **each element** is indexed.
+- `create_index` builds an index on one field, which may be a nested path
+  (`meta.author`). For an array field, **each element** is indexed.
+- An index can be **unique**: a write whose value for the field already
+  belongs to another document then fails with "unique index violation"
+  and writes nothing. Only a single value is constrained (a string,
+  number, boolean, or `null`); a missing field, an array, and an object are
+  not. `1` and `1.0` are the same value. Updating or replacing a document
+  may keep its own value, and deleting a document frees its value.
+  Creating a unique index fails, and changes nothing, if documents already
+  share a value; the error lists up to 10 of the values with their ids.
 - Filters that use an index: `eq` (on `_id` or an indexed field), and
   `has`, `has_any` (union), `has_all` (intersection) on an indexed field.
   With several, the smallest candidate set is used and every filter is

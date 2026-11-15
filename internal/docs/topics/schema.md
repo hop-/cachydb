@@ -42,6 +42,10 @@ create_collection {
 - `required: true` means the field must be present. A field that is
   present must have the declared type; `null` does not match any type.
 - Fields that are not in the schema are allowed, with any value.
+- Schema fields are **top-level**: a schema field named `meta.author` is
+  the top-level key `"meta.author"`, not the nested field. Queries and
+  indexes can still use nested paths (see the query topic); a schema can
+  require the parent object (`"meta": {"type": "object"}`).
 - Validation runs on every `insert_document` and `replace_document`, and
   on the **result** of every `update_document` (after `updates` and
   `unset`; unsetting a required field fails) and upsert.

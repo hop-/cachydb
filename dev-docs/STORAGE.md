@@ -348,7 +348,7 @@ or, failing that, when at least 4 adjacent candidates are each smaller than
 
 ```
 Engine.metaMu → Database.mu → compactMu → flushMu → Collection.mu
-                Database.mu (shared) → docLock → Collection.mu
+                Database.mu (shared) → docLock → uniqueLocks (ascending) → Collection.mu
 ```
 
 | Lock / goroutine | Guards / role |
@@ -357,7 +357,8 @@ Engine.metaMu → Database.mu → compactMu → flushMu → Collection.mu
 | `Engine.metaMu` | create/drop database, including I/O |
 | `Database.mu` | collections map, collection schemas; exclusive for metadata ops (incl. the whole `CreateIndex` build, `UpdateSchema` validation, and the flush inside `RenameCollection`); shared by document writes |
 | `docLocks[256]` | one document's read-modify-write; held across the WAL append |
-| `Collection.mu` | keydir, memtables, indexes, inflight; memory-only sections |
+| `uniqueLocks[256]` | writers of one `(unique index, encoded value)` (`pkg/db/unique.go`); taken after the document lock, only by writes that set a new value of a unique index, several in ascending stripe order, and held until the write is applied (so across the WAL append). The uniqueness check reads `index.db` in a short read transaction that ends before the append: no read transaction is held across the append |
+| `Collection.mu` | keydir, memtables, indexes, inflight, `uniquePending`; memory-only sections |
 | `flushMu`, `compactMu` | serialize flush / compaction per collection, and against drops |
 | `Engine.lwMu`, `metacpMu` | leaf locks: in-flight metadata offsets; `cachydb.metacp` rewrites |
 | WAL writer, flusher, compactor, retention, drop removal | background goroutines; all exit on `Close` |

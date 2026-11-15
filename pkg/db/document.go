@@ -20,8 +20,9 @@ import (
 // Document write and read paths (§5.2, §5.3).
 //
 // Write: Database.mu (shared, held to the end) → docLock(id) → read the
-// current version → build and validate the after-image → register
-// inflight → WAL append (the commit point) → hookAfterWALSync → apply to
+// current version → build and validate the after-image → lock and check
+// the new values of unique indexes (unique.go) → register inflight → WAL
+// append (the commit point) → hookAfterWALSync → apply to
 // the memtable (with the replaced version's index keys, memEntry.base),
 // cache, and count under Collection.mu. The secondary indexes in the index
 // file change with the flush.
@@ -355,6 +356,18 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, err)
 		}
 		rec.Op, rec.Payload = wal.OpPutDoc, payload
+
+		// Unique indexes (unique.go): lock the new values' stripes (held
+		// until the write is applied, so across the WAL append) and check
+		// them against the overlay and the index file. No read transaction
+		// is open after checkUnique returns.
+		if vals := c.changedUniqueValues(cur, next); len(vals) > 0 {
+			unlock := c.lockUnique(vals)
+			defer unlock()
+			if err := c.checkUnique(id, vals); err != nil {
+				return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, err)
+			}
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -432,7 +445,9 @@ func (c *Collection) applyLocked(id string, existed bool, base indexBase, baseOf
 		c.memBytes -= me.size
 		delta -= me.size
 		base, baseOff = me.base, me.baseOff
+		c.replaceUniquePendingLocked(id, me.doc, next)
 	}
+	c.addUniquePendingLocked(id, next)
 	c.db.e.pending.add(delta)
 	// memMin stays a lower bound of the memtable's offsets: an overwritten
 	// entry may leave it lower than the true minimum, which only makes the

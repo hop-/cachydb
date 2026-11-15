@@ -133,6 +133,16 @@ type Collection struct {
 	// by FNV-1a of the id (see docLock).
 	docLocks [numDocLocks]sync.Mutex
 
+	// uniqueLocks serializes writers of the same value of a unique index;
+	// stripe chosen by FNV-1a of (index name, encoded value) (unique.go).
+	// Lock order: docLock → uniqueLocks (ascending) → mu.
+	uniqueLocks [numUniqueLocks]sync.Mutex
+	// uniquePending maps unique index name → encoded value → the ids of
+	// unflushed documents (memtable or flushing) that held the value when
+	// they were applied (unique.go). Guarded by mu. Entries are hints that
+	// readers confirm against the overlay; nil when empty.
+	uniquePending map[string]map[string][]string
+
 	// count is the number of live documents: the count stored in the
 	// index file plus the net effect of the changes not flushed yet. A
 	// flush moves changes from the second part to the first, so it does
@@ -160,10 +170,12 @@ func newCollection(d *Database, name string, s *Schema, created, metaOffset uint
 // Name returns the collection name.
 func (c *Collection) Name() string { return c.name }
 
-// IndexInfo describes a secondary index.
+// IndexInfo describes a secondary index. Field may be a nested path
+// ("meta.author"). Unique reports a unique index (see Unique).
 type IndexInfo struct {
-	Name  string `json:"name"`
-	Field string `json:"field"`
+	Name   string `json:"name"`
+	Field  string `json:"field"`
+	Unique bool   `json:"unique,omitempty"`
 }
 
 // Schema returns a copy of the collection's schema, or nil for a
@@ -458,10 +470,14 @@ func (c *Collection) errDropped() error {
 }
 
 // CreateIndex creates the secondary index name on field and builds it
-// from the documents already in the collection. It fails with ErrExists if
-// an index with that name exists. It holds the database's metadata lock
-// for the whole build, so writes to the database wait while it runs
-// (known limitation: index creation is rare).
+// from the documents already in the collection. field may be a nested path
+// ("meta.author", see Document.GetPath). Options: Unique(true) makes the
+// index unique; creating it then fails with an error wrapping
+// ErrUniqueViolation, listing up to 10 shared values with their ids, if
+// existing documents share a value, and nothing changes. It fails with
+// ErrExists if an index with that name exists. It holds the database's
+// metadata lock for the whole build, so writes to the database wait while
+// it runs (known limitation: index creation is rare).
 //
 // The entries are built into the index file, in batches, from the
 // documents the key table lists, before the commit point; the collection's
@@ -469,7 +485,7 @@ func (c *Collection) errDropped() error {
 // key table when it is published. Unflushed changes are found by the next
 // flush, which reads the replaced versions' keys from the data segments
 // (forgetBaseLocked).
-func (c *Collection) CreateIndex(ctx context.Context, name, field string) error {
+func (c *Collection) CreateIndex(ctx context.Context, name, field string, opts ...IndexOption) error {
 	if err := ValidateName("index", name); err != nil {
 		return err
 	}
@@ -506,8 +522,20 @@ func (c *Collection) CreateIndex(ctx context.Context, name, field string) error 
 
 	// Build before the commit point: an error aborts the operation, and
 	// entries without a definition are dropped (here, or by the next Open).
+	// A unique index is checked for shared values first, over the key
+	// table's documents and the overlay (stable: no write or flush runs).
 	def := indexDef{Name: name, Field: field}
-	if err := c.buildIndexes(ctx, st, []indexDef{def}); err != nil {
+	for _, o := range opts {
+		o(&def)
+	}
+	def.Name, def.Field = name, field
+	var overlay map[string]*Document
+	if def.Unique {
+		c.mu.RLock()
+		overlay = c.overlayLocked()
+		c.mu.RUnlock()
+	}
+	if err := c.buildIndexesChecked(ctx, st, []indexDef{def}, overlay, def.Unique); err != nil {
 		c.dropIndexEntries(st, name)
 		return fmt.Errorf("creating index %q: %w", name, c.storeErr(err))
 	}
@@ -538,6 +566,7 @@ func (c *Collection) CreateIndex(ctx context.Context, name, field string) error 
 	c.mu.Lock()
 	c.indexes[name] = def
 	c.forgetBaseLocked(name)
+	c.fillUniquePendingLocked(def)
 	c.metaOffset = off
 	c.mu.Unlock()
 	return nil
@@ -600,6 +629,7 @@ func (c *Collection) DropIndex(ctx context.Context, name string) error {
 	c.mu.Lock()
 	delete(c.indexes, name)
 	c.forgetBaseLocked(name)
+	delete(c.uniquePending, name)
 	c.metaOffset = off
 	c.mu.Unlock()
 
@@ -682,6 +712,7 @@ func (c *Collection) moveState(name, dir string, metaOffset uint64) *Collection 
 	nc.memtable, c.memtable = c.memtable, make(map[string]memEntry)
 	nc.flushing, c.flushing = c.flushing, nil
 	nc.indexes, c.indexes = c.indexes, make(map[string]indexDef)
+	nc.uniquePending, c.uniquePending = c.uniquePending, nil
 	nc.inflight, c.inflight = c.inflight, nil
 	nc.retired, c.retired = c.retired, make(map[uint32]struct{})
 	nc.keptTombs, c.keptTombs = c.keptTombs, make(map[uint32]int64)

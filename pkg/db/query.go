@@ -98,8 +98,10 @@ type compiledQuery struct {
 	anyOf       [][]compiledFilter // groups that can match something
 	never       bool               // nothing can match (see compiledFilter.never)
 	sort        []SortKey          // normalized orders; nil = _id ascending
+	sortPaths   []fieldPath        // the fields of sort, split once
 	idDesc      bool               // sort is exactly _id descending
 	fields      []string
+	fieldPaths  []fieldPath // the fields of the projection, split once
 	skip, limit int
 }
 
@@ -114,10 +116,11 @@ func compileQuery(q *Query) (*compiledQuery, error) {
 		return nil, err
 	}
 	cq := &compiledQuery{
-		filters: filters,
-		fields:  q.Fields,
-		skip:    max(q.Skip, 0),
-		limit:   max(q.Limit, 0),
+		filters:    filters,
+		fields:     q.Fields,
+		fieldPaths: compilePaths(q.Fields),
+		skip:       max(q.Skip, 0),
+		limit:      max(q.Limit, 0),
 	}
 	for _, g := range resolveNowGroups(q.Any, ts) {
 		cg, err := compileFilters(g)
@@ -137,6 +140,9 @@ func compileQuery(q *Query) (*compiledQuery, error) {
 		cq.idDesc, sort = true, nil
 	}
 	cq.sort = sort
+	for _, k := range sort {
+		cq.sortPaths = append(cq.sortPaths, compilePath(k.Field))
+	}
 	cq.finish()
 	return cq, nil
 }
@@ -255,7 +261,7 @@ func (r *queryRun) take(doc *Document) bool {
 	if r.matched <= r.cq.skip {
 		return true
 	}
-	r.out = append(r.out, project(doc, false, r.cq.fields))
+	r.out = append(r.out, project(doc, false, r.cq.fieldPaths))
 	return r.cq.limit == 0 || len(r.out) < r.cq.limit
 }
 
@@ -321,7 +327,7 @@ func (c *Collection) findBySortWalk(ctx context.Context, s *querySnap, cq *compi
 	h := &sortHeap{keys: cq.sort}
 	var ov []*sortItem
 	for _, id := range s.overlayIDs(opt.cand) {
-		ov = append(ov, newSortItem(s.overlay[id], false, cq.sort))
+		ov = append(ov, newSortItem(s.overlay[id], false, cq.sortPaths))
 	}
 	slices.SortFunc(ov, h.cmp)
 	src, err := opt.open(ctx, s, cq.sort[0].Order == orderDesc)
@@ -345,7 +351,7 @@ func (c *Collection) findBySortWalk(ctx context.Context, s *querySnap, cq *compi
 		if doc == nil {
 			continue
 		}
-		it := newSortItem(doc, false, cq.sort)
+		it := newSortItem(doc, false, cq.sortPaths)
 		for ; oi < len(ov) && h.cmp(ov[oi], it) < 0; oi++ {
 			if !r.take(ov[oi].doc) {
 				return r.out, r.examined, r.err
@@ -376,7 +382,7 @@ func (c *Collection) findByHeap(ctx context.Context, s *querySnap, cq *compiledQ
 		if !cq.matches(doc) {
 			return true
 		}
-		it := newSortItem(doc, false, cq.sort)
+		it := newSortItem(doc, false, cq.sortPaths)
 		switch {
 		case keep == 0 || h.Len() < keep:
 			heap.Push(h, it)
@@ -393,7 +399,7 @@ func (c *Collection) findByHeap(ctx context.Context, s *querySnap, cq *compiledQ
 	slices.SortFunc(items, h.cmp)
 	out := make([]*Document, 0)
 	for i := cq.skip; i < len(items); i++ {
-		out = append(out, project(items[i].doc, items[i].owned, cq.fields))
+		out = append(out, project(items[i].doc, items[i].owned, cq.fieldPaths))
 	}
 	return out, examined, nil
 }
@@ -452,10 +458,10 @@ type sortItem struct {
 	vals  []sortValue
 }
 
-func newSortItem(doc *Document, owned bool, keys []SortKey) *sortItem {
-	it := &sortItem{doc: doc, owned: owned, vals: make([]sortValue, len(keys))}
-	for i, k := range keys {
-		v, ok := doc.GetValue(k.Field)
+func newSortItem(doc *Document, owned bool, paths []fieldPath) *sortItem {
+	it := &sortItem{doc: doc, owned: owned, vals: make([]sortValue, len(paths))}
+	for i := range paths {
+		v, ok := paths[i].get(doc)
 		it.vals[i] = newSortValue(v, ok)
 	}
 	return it
@@ -569,9 +575,12 @@ func canonicalJSON(v any) string {
 }
 
 // project returns a copy of doc limited to fields (plus _id), or a full
-// copy when fields is empty. Unknown fields are ignored. A doc that is
-// owned is returned as is when no projection applies.
-func project(doc *Document, owned bool, fields []string) *Document {
+// copy when fields is empty. Unknown fields are ignored. A field resolved
+// through a nested path (GetPath) is returned nested under that path:
+// "meta.author" gives {"meta": {"author": ...}}; a top-level key equal to
+// the whole name is returned under that key. A doc that is owned is
+// returned as is when no projection applies.
+func project(doc *Document, owned bool, fields []fieldPath) *Document {
 	if len(fields) == 0 {
 		if owned {
 			return doc
@@ -579,12 +588,43 @@ func project(doc *Document, owned bool, fields []string) *Document {
 		return doc.Clone()
 	}
 	out := &Document{ID: doc.ID, Data: make(map[string]any, len(fields))}
-	for _, f := range fields {
-		if v, ok := doc.Data[f]; ok {
-			out.Data[f] = deepCopy(v)
+	for i := range fields {
+		f := &fields[i]
+		if f.name == "_id" {
+			continue // always returned as the id
+		}
+		if v, ok := doc.Data[f.name]; ok {
+			out.Data[f.name] = deepCopy(v)
+			continue
+		}
+		if v, ok := f.get(doc); ok {
+			setPath(out.Data, f.parts, deepCopy(v))
 		}
 	}
 	return out
+}
+
+// setPath stores v in m under the nested path parts, creating the objects
+// on the way. An object already there (from another projected path, or a
+// deep copy of a whole projected object) is extended; a value that is not
+// an object is left as it is.
+func setPath(m map[string]any, parts []string, v any) {
+	last := len(parts) - 1
+	for _, p := range parts[:last] {
+		next, ok := m[p]
+		if !ok {
+			child := make(map[string]any, 1)
+			m[p] = child
+			m = child
+			continue
+		}
+		child, ok := next.(map[string]any)
+		if !ok {
+			return
+		}
+		m = child
+	}
+	m[parts[last]] = v
 }
 
 // CountDocuments returns the number of documents matching q's filters and
@@ -981,7 +1021,7 @@ func (c *Collection) distinctFast(field string) ([]any, bool, error) {
 // addDistinctValues adds the values doc holds in field (each element of an
 // array) to seen, keyed by distinctKey, copying the ones it adds.
 func addDistinctValues(seen map[string]any, doc *Document, field string) {
-	v, ok := doc.GetValue(field)
+	v, ok := doc.GetPath(field)
 	if !ok {
 		return
 	}

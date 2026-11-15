@@ -229,6 +229,7 @@ func (fv *filterValue) equals(v any) bool {
 // a code and the value normalized for it.
 type compiledFilter struct {
 	field string
+	path  fieldPath // field, split once (GetPath's rules)
 	op    opCode
 	value any // the filter value as given ($now resolved); the index plans encode it
 
@@ -257,7 +258,7 @@ func compileFilter(f QueryFilter) (compiledFilter, error) {
 		return compiledFilter{}, fmt.Errorf("filter on field %q: unknown operator %q (want one of %s)",
 			f.Field, f.Operator, strings.Join(operatorNames, " "))
 	}
-	cf := compiledFilter{field: f.Field, op: op, value: f.Value}
+	cf := compiledFilter{field: f.Field, path: compilePath(f.Field), op: op, value: f.Value}
 	switch op {
 	case opEq, opNe, opHas:
 		cf.val = newFilterValue(f.Value)
@@ -369,7 +370,7 @@ func (f *compiledFilter) never() bool {
 // begins with the value (case-sensitive, byte-wise). eq, ne, and in compare
 // arrays as whole values.
 func (f *compiledFilter) match(doc *Document) bool {
-	value, exists := doc.GetValue(f.field)
+	value, exists := f.path.get(doc)
 	if f.op == opExists {
 		return exists == f.exists
 	}

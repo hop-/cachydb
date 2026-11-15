@@ -409,10 +409,12 @@ func (c *Collection) flush() error {
 	}
 
 	// 4. The changes are in the index file: drop them from the overlay
-	// (memory only). Readers that still see flushing started before this
-	// point; readers that do not start their read transaction after the
-	// commit above.
+	// (memory only), with their values pending for unique indexes.
+	// Readers that still see flushing started before this point; readers
+	// that do not start their read transaction after the commit above.
+	drops := flushedUniqueValues(flushing, defs)
 	c.mu.Lock()
+	c.flushDropUniquePendingLocked(drops)
 	flushed := c.flushingBytes
 	c.flushing, c.flushingMin, c.flushingBytes = nil, 0, 0
 	c.checkpoint = max(c.checkpoint, cp)

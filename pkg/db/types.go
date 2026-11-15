@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"maps"
 	"reflect"
+	"strings"
 	"time"
 )
 
@@ -39,6 +40,8 @@ type Schema struct {
 
 // QueryFilter represents a query filter
 type QueryFilter struct {
+	// Field is a field name or a nested path ("meta.author"); see
+	// Document.GetPath for how it resolves.
 	Field string `json:"field"`
 	// Operator is one of "eq", "ne", "gt", "gte", "lt", "lte", "in",
 	// "contains", "has", "has_any", "has_all", "exists" (Value is a
@@ -54,7 +57,7 @@ type QueryFilter struct {
 type Query struct {
 	Filters []QueryFilter   `json:"filters"`
 	Any     [][]QueryFilter `json:"any,omitempty"`    // OR of AND groups; empty = no constraint
-	Fields  []string        `json:"fields,omitempty"` // projection: top-level fields to return (_id always); empty = all
+	Fields  []string        `json:"fields,omitempty"` // projection: fields or nested paths to return, a path's value nested under it (_id always); empty = all
 	Sort    []SortKey       `json:"sort,omitempty"`   // sort keys in order, then _id ascending; empty = _id ascending
 	Limit   int             `json:"limit"`
 	Skip    int             `json:"skip"`
@@ -62,7 +65,7 @@ type Query struct {
 
 // SortKey is one sort key of a Query.
 type SortKey struct {
-	Field string `json:"field"`
+	Field string `json:"field"`           // a field name or a nested path (Document.GetPath)
 	Order string `json:"order,omitempty"` // "asc" (default) or "desc"
 }
 
@@ -103,13 +106,94 @@ func (d *Document) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// GetValue safely extracts a value from a document by field name
+// GetValue safely extracts a value from a document by top-level field name
+// ("_id" is the id). It does not follow dotted paths; see GetPath. Schemas
+// use it: schema fields are top-level.
 func (d *Document) GetValue(fieldName string) (any, bool) {
 	if fieldName == "_id" {
 		return d.ID, true
 	}
 	val, ok := d.Data[fieldName]
 	return val, ok
+}
+
+// GetPath returns the value at a field path, as filters, sort keys,
+// projection, Distinct, conditions, and indexes resolve field names
+// (approach-index-and-query §6): "_id" is the id; a top-level key equal to
+// the whole path wins (a literal "a.b" key keeps working); otherwise the
+// path is split on "." and followed through nested objects. A path that
+// crosses an array or a value that is not an object is missing (ok false).
+func (d *Document) GetPath(path string) (any, bool) {
+	if path == "_id" {
+		return d.ID, true
+	}
+	if v, ok := d.Data[path]; ok {
+		return v, true
+	}
+	head, rest, dotted := strings.Cut(path, ".")
+	if !dotted {
+		return nil, false
+	}
+	v, ok := d.Data[head]
+	for ok {
+		m, isObject := v.(map[string]any)
+		if !isObject {
+			return nil, false
+		}
+		head, rest, dotted = strings.Cut(rest, ".")
+		v, ok = m[head]
+		if !dotted {
+			return v, ok
+		}
+	}
+	return nil, false
+}
+
+// fieldPath is a field name split once for resolution (GetPath's rules).
+type fieldPath struct {
+	name  string
+	parts []string // name split on "."; nil when name has no dot
+}
+
+func compilePath(name string) fieldPath {
+	p := fieldPath{name: name}
+	if name != "_id" && strings.Contains(name, ".") {
+		p.parts = strings.Split(name, ".")
+	}
+	return p
+}
+
+func compilePaths(names []string) []fieldPath {
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]fieldPath, len(names))
+	for i, n := range names {
+		out[i] = compilePath(n)
+	}
+	return out
+}
+
+// get resolves p in d exactly as d.GetPath(p.name).
+func (p *fieldPath) get(d *Document) (any, bool) {
+	if p.name == "_id" {
+		return d.ID, true
+	}
+	if v, ok := d.Data[p.name]; ok || p.parts == nil {
+		return v, ok
+	}
+	m := d.Data
+	last := len(p.parts) - 1
+	for i, part := range p.parts {
+		v, ok := m[part]
+		if !ok || i == last {
+			return v, ok
+		}
+		if m, ok = v.(map[string]any); !ok {
+			return nil, false
+		}
+	}
+	return nil, false
 }
 
 // Clone returns a deep copy of the document: nested maps, slices, and

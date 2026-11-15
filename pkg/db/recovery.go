@@ -765,7 +765,9 @@ func (e *Engine) removeAway(dir string, off uint64) error {
 // file from the documents its key table lists, unless the collection
 // already has it on the same field; the replayed changes in the memtable
 // reach it with their flush, which reads the replaced versions' keys from
-// the data segments (forgetBaseLocked). A dropped index loses its entries.
+// the data segments (forgetBaseLocked). A unique index is built without a
+// uniqueness check (the record is committed) and its pending values are
+// filled from the overlay. A dropped index loses its entries.
 func (c *Collection) replayIndexOp(ctx context.Context, r wal.Record) error {
 	defs := c.indexDefs()
 	switch r.Op {
@@ -793,6 +795,8 @@ func (c *Collection) replayIndexOp(ctx context.Context, r wal.Record) error {
 		c.mu.Lock()
 		c.indexes[def.Name] = def
 		c.forgetBaseLocked(def.Name)
+		delete(c.uniquePending, def.Name)
+		c.fillUniquePendingLocked(def)
 		c.metaOffset = r.Offset
 		c.mu.Unlock()
 	case wal.OpDropIndex:
@@ -807,6 +811,7 @@ func (c *Collection) replayIndexOp(ctx context.Context, r wal.Record) error {
 		c.mu.Lock()
 		delete(c.indexes, p.Name)
 		c.forgetBaseLocked(p.Name)
+		delete(c.uniquePending, p.Name)
 		c.metaOffset = r.Offset
 		c.mu.Unlock()
 		st, err := c.indexStore()
@@ -937,9 +942,10 @@ func (c *Collection) replayDoc(r wal.Record) (bool, error) {
 		existed bool
 		base    indexBase // the replaced version's keys (memEntry.base)
 		baseOff uint64
+		cur     *Document // the replaced version, when unique indexes need it
 	)
 	if inMem {
-		curOff, existed = me.walOffset, me.doc != nil // applyLocked keeps the entry's base
+		curOff, existed, cur = me.walOffset, me.doc != nil, me.doc // applyLocked keeps the entry's base
 	} else {
 		ke, ok, err := c.storedEntry(r.ID)
 		if err != nil {
@@ -956,11 +962,21 @@ func (c *Collection) replayDoc(r wal.Record) (bool, error) {
 					return false, err
 				}
 				base = c.indexKeysAll(prev)
+				cur = prev
 			}
 		}
 	}
 	if r.Offset <= curOff {
 		return false, nil
+	}
+	// The record is committed: a unique violation (which the write path
+	// prevents, so it means a damaged or foreign WAL) is applied anyway and
+	// only logged.
+	if vals := c.changedUniqueValues(cur, next); len(vals) > 0 {
+		if err := c.checkUnique(r.ID, vals); err != nil {
+			c.db.e.logger.Warn("cachydb: WAL replay applied a write that violates a unique index",
+				"database", c.db.name, "collection", c.name, "id", r.ID, "offset", r.Offset, "err", err)
+		}
 	}
 
 	size := int64(len(r.ID)+len(r.Payload)) + memEntryOverhead

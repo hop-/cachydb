@@ -92,9 +92,9 @@ on-disk format versions this build reads and writes.
 | `Replace(ctx, id, *Document, Condition) (*Document, error)` | Whole-document replace; `doc.ID` empty or `id`; `ErrNotFound` (missing), `ErrConditionFailed` |
 | `Delete(ctx, id) error` | `DeleteWith(ctx, id, nil)` |
 | `DeleteWith(ctx, id, Condition) error` | `ErrNotFound`, `ErrConditionFailed` |
-| `CreateIndex(ctx, name, field) error` | Builds from existing documents; blocks writes to the whole database while it runs; `ErrExists` |
+| `CreateIndex(ctx, name, field, ...IndexOption) error` | `field` may be a nested path; `Unique(true)` makes it unique (see [Unique indexes](#unique-indexes)); builds from existing documents; blocks writes to the whole database while it runs; `ErrExists`; `ErrUniqueViolation` if a unique index would cover shared values |
 | `DropIndex(ctx, name) error` | MCP `drop_index`; `ErrNotFound` |
-| `Schema() *Schema`, `Indexes() []IndexInfo` | Copies; indexes sorted by name (MCP `describe_collection`) |
+| `Schema() *Schema`, `Indexes() []IndexInfo` | Copies; indexes sorted by name, with `Unique` (MCP `describe_collection`) |
 | `UpdateSchema(ctx, *Schema) error` | `nil` removes the schema. Validates every document first (all or nothing; the error lists up to 10 failing ids and the total), then WAL op 9 (`update_schema`) + `coll.meta`; holds `Database.mu` exclusively throughout |
 | `Count() int` | O(1) |
 | `Name() string` | |
@@ -128,6 +128,7 @@ Errors are wrapped with context; test them with `errors.Is`.
 | `ErrInvalidName` | Name fails `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` (`names.go`, `ValidateName`) |
 | `ErrSchemaValidation` | Invalid schema, document violates the schema (a `*SchemaError` listing every violation wraps it), a reserved `_id` misuse, or `UpdateSchema` found non-matching documents |
 | `ErrConditionFailed` | An `if` condition did not match the stored document (or it is missing); nothing was written |
+| `ErrUniqueViolation` | A write's value for a unique index belongs to another document, or `CreateIndex` with `Unique(true)` found documents sharing a value; nothing was written |
 | `ErrClosed` | Engine closed |
 | `ErrDataDirInUse` | Another process (or engine) holds `cachydb.lock` |
 | `ErrIncompatibleDataDir` | Old-format or newer-format data directory |
@@ -153,6 +154,9 @@ type Document struct {
   `Document.ID`), and `Update` cannot change it. Ids are strings up to
   65535 bytes.
 - `Clone()` is a deep copy.
+- `GetPath(path)` resolves a field name the way queries and indexes do
+  (see [Field paths](#field-paths)); `GetValue(name)` is top-level only
+  (schemas use it).
 
 ## Schemas (`schema.go`, `types.go`)
 
@@ -181,6 +185,8 @@ type Field  struct { Type FieldType `json:"type"`; Required bool `json:"required
   c (expected string, got number)`. It wraps `ErrSchemaValidation`.
 - `UpdateSchema` changes the schema (see above); `c.schema` is replaced
   only under `Database.mu` held exclusively, which writes hold shared.
+- Schema fields are top-level: a field named `a.b` in a schema is the
+  top-level key `"a.b"`, never a nested path.
 
 ## Queries
 
@@ -199,8 +205,8 @@ type SortKey struct { Field, Order string } // "asc" (default) | "desc"
 Semantics (`compare.go`, `query.go`, `plan.go`):
 
 - All `Filters` must match (AND), and when `Any` is set every filter of at
-  least one group. `Field` is a **top-level** field name or `_id`; there
-  is no dot-notation for nested fields.
+  least one group. `Field` is a field name, `_id`, or a nested path
+  (`meta.author`, see [Field paths](#field-paths)).
 - Operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `contains`
   (case-insensitive substring of a string or of a string array element;
   `""` matches any string or array), `has` (an array element equals the
@@ -238,6 +244,22 @@ Semantics (`compare.go`, `query.go`, `plan.go`):
   Paging is deterministic. An invalid order or empty sort field is an
   error.
 - `Fields` is applied after filtering and sorting; `_id` is always kept.
+  A field found through a nested path is returned nested under its path
+  (`meta.author` → `{"meta": {"author": …}}`); several paths into one
+  object merge.
+
+### Field paths
+
+A field name with dots is a path through nested objects (`Document.GetPath`,
+`fieldPath` in `types.go`). It works in filters, `Any` groups, sort keys,
+projection (`Fields`), `Distinct`, conditions (`if`), and index
+definitions. Resolution: `_id` is the id; a top-level key equal to the
+whole name wins (documents with a literal `"a.b"` key keep working);
+otherwise the name is split on `.` and followed through objects. A path
+that crosses an array or a value that is not an object resolves to
+missing (`tags.0` is missing; indexing into arrays is not supported).
+Filters, sort keys, and projections split their paths once per call.
+Schemas, `UpdateSpec.Set`, and `Unset` stay top-level.
 
 ### Snapshot and plans (`plan.go`)
 
@@ -320,8 +342,49 @@ internal `find` returns the examined count for tests.
   drives a sort only while `complex`, `truncated`, and `arrays` are all 0:
   then every document has exactly one entry, ordered as `Find` sorts.
 - The `_id` lookup uses the key table (no separate `_id` index exists).
+- An index field may be a nested path; plans match an index to a filter or
+  sort key by the exact field string.
 - Unflushed changes are not in `index.db`; readers apply the snapshot rule
   above. See [STORAGE.md](STORAGE.md) for the file.
+
+### Unique indexes
+
+`CreateIndex(ctx, name, field, db.Unique(true))` creates a unique index
+(`indexDef.Unique`, stored in `coll.meta` and the `create_index` WAL
+payload as `"unique": true`; the key is omitted when false, so older files
+load as non-unique). Code: `unique.go`.
+
+- **What is constrained:** an indexable scalar: `null`, a boolean, a
+  number (not NaN), a string. A missing field, an array, an object, and NaN
+  are not constrained. Two values are the same when `eq` says so (`1` and
+  `1.0` are one value; long strings compare in full, not by their cut
+  index encoding).
+- **Writes:** an insert, update, replace, or upsert whose new value for a
+  unique index belongs to another live document fails with an error
+  wrapping `ErrUniqueViolation` (`... index "u" on field "email": value
+  "x@y" already belongs to document "a"`) and writes nothing. A write that
+  keeps the value its document already has is not checked, so a document
+  may keep its own value. A delete frees the value at once.
+- **How:** under the document lock, before the WAL append, the write takes
+  a striped lock per `(index, encoded value)` (`uniqueLocks`, 256 stripes,
+  ascending order, held until the write is applied) and checks the overlay
+  and then `index.db` (a short read transaction that ends before the WAL
+  append). The overlay is searched through `uniquePending` (unique index →
+  encoded value → ids of unflushed documents), filled by `applyLocked`,
+  cleaned when a memtable entry is overwritten, and cleared for the flushed
+  entries in flush step 4 after the index transaction commits. Every hit is
+  confirmed against the current overlay document. So two writers with
+  different ids and the same value never both succeed, also while the
+  first is still unflushed.
+- **Creation:** `CreateIndex` with `Unique(true)` first collects the values
+  of every live document (the key table's, plus the overlay's, which
+  cannot change: writes and flushes wait) and fails, before writing
+  anything, with `ErrUniqueViolation` listing up to 10 shared values with
+  up to 10 ids each (`buildIndexesChecked`, `duplicateValues`).
+- **Recovery:** WAL replay never fails on a unique violation (the record is
+  committed; the write path prevents it, so it means a damaged or foreign
+  WAL): it applies the write and logs a WARN. Rebuilding an index file and
+  replaying `create_index` build unique indexes without a check.
 
 ## Migrations
 
