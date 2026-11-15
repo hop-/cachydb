@@ -678,7 +678,10 @@ func TestReadTransactionIsSnapshot(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		_ = tx.Close() // let the update finish; the failure is reported below
-		t.Fatalf("update blocked by an open read transaction: %v", <-done)
+		t.Fatalf("update blocked for 10s by an open read transaction (result once the reader closed: %v). "+
+			"Likely cause: the commit had to remap (grow) the file, which waits for every open read transaction, "+
+			"because the free pages made above no longer suffice (a bbolt freelist or mmap growth change?); "+
+			"this is not necessarily a snapshot bug", <-done)
 	}
 	if n, _ := tx.Count(); n != 100 {
 		t.Errorf("snapshot Count = %d, want 100", n)

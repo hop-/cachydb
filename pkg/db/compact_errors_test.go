@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/hop-/cachydb/pkg/db/internal/segment"
@@ -15,12 +17,16 @@ import (
 // compactableColl returns a collection with several sealed segments, most
 // of whose documents are deleted, so a compaction is due, and the
 // documents that remain.
-func compactableColl(t *testing.T) (*Engine, *Collection, map[string]map[string]any) {
+// mod, if not nil, changes the options passed to Open.
+func compactableColl(t *testing.T, mod func(*Options)) (*Engine, *Collection, map[string]map[string]any) {
 	t.Helper()
 	ctx := context.Background()
 	e, c, _ := newFlushColl(t, func(o *Options) {
 		o.DataSegmentSize = 8 << 10
 		o.CompactionRatio = 0.3
+		if mod != nil {
+			mod(o)
+		}
 	})
 	if err := c.CreateIndex(ctx, "by_k", "k"); err != nil {
 		t.Fatal(err)
@@ -45,8 +51,9 @@ func compactableColl(t *testing.T) (*Engine, *Collection, map[string]map[string]
 		}
 	}
 	mustFlushSeal(t, c)
-	// One more flushed segment moves the newest checkpoint marker out of
-	// the segments with the garbage, so they are compaction candidates.
+	// One more flushed segment: compaction never takes the active
+	// segment, sealed or not, so the segments with the garbage must not
+	// be the newest one to be compaction candidates.
 	want["tail"] = map[string]any{"k": 9.0}
 	mustInsert(t, c, "tail", want["tail"])
 	mustFlushSeal(t, c)
@@ -99,18 +106,28 @@ func firstLivePut(t *testing.T, c *Collection) segment.Location {
 // data, no leftover output), that compactAll reports the error, that the
 // next pass succeeds once the cause is gone, and that the result
 // survives a reopen.
+//
+// The index transaction of the swap can fail too (task 02 Amendment 2):
+// before its commit it rolls back, and the compaction removes its output
+// like any other failure. A commit that fails late, after bbolt wrote the
+// transaction, may have left the key table pointing into the output, so
+// the compaction keeps the inputs and the output, and the next open
+// removes the side the index file does not register (the inputs).
 func TestCompactionErrorPaths(t *testing.T) {
 	tests := []struct {
 		name string
 		// inject makes the next compaction fail and returns a function
 		// that removes the cause.
-		inject func(t *testing.T, c *Collection) (undo func())
+		inject func(t *testing.T, c *Collection, f *commitFault) (undo func())
 		ctx    func() context.Context
 		wantIs error
+		// late: the swap transaction committed before the failure; the
+		// files are kept until the next open instead of being unchanged.
+		late bool
 	}{
 		{
 			name: "output segment cannot be created",
-			inject: func(t *testing.T, c *Collection) func() {
+			inject: func(t *testing.T, c *Collection, _ *commitFault) func() {
 				path := segment.DataPath(c.dir, nextSegOf(c))
 				if err := os.WriteFile(path, []byte("in the way"), 0o644); err != nil {
 					t.Fatal(err)
@@ -124,7 +141,7 @@ func TestCompactionErrorPaths(t *testing.T) {
 		},
 		{
 			name: "input record is corrupt",
-			inject: func(t *testing.T, c *Collection) func() {
+			inject: func(t *testing.T, c *Collection, _ *commitFault) func() {
 				loc := firstLivePut(t, c)
 				path := segment.DataPath(c.dir, loc.Seg)
 				data, err := os.ReadFile(path)
@@ -146,7 +163,7 @@ func TestCompactionErrorPaths(t *testing.T) {
 		},
 		{
 			name:   "context cancelled",
-			inject: func(*testing.T, *Collection) func() { return func() {} },
+			inject: func(*testing.T, *Collection, *commitFault) func() { return func() {} },
 			ctx: func() context.Context {
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel()
@@ -154,14 +171,33 @@ func TestCompactionErrorPaths(t *testing.T) {
 			},
 			wantIs: context.Canceled,
 		},
+		{
+			name: "index commit fails before the commit",
+			inject: func(_ *testing.T, _ *Collection, f *commitFault) func() {
+				f.arm(indexCommitCompact, false)
+				return func() {}
+			},
+			wantIs: errCommitInjected,
+		},
+		{
+			name: "index commit fails late",
+			inject: func(_ *testing.T, _ *Collection, f *commitFault) func() {
+				f.arm(indexCommitCompact, true)
+				return func() {}
+			},
+			wantIs: errCommitInjected,
+			late:   true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			e, c, want := compactableColl(t)
+			fault := &commitFault{}
+			e, c, want := compactableColl(t, func(o *Options) { o.testIndexCommit = fault.hook })
 			idx := map[string]string{"by_k": "k"}
 			before := recordSegs(t, c.dir)
+			out := nextSegOf(c) // the output id of the next compaction
 
-			undo := tt.inject(t, c)
+			undo := tt.inject(t, c, fault)
 			ctx := context.Background()
 			if tt.ctx != nil {
 				ctx = tt.ctx()
@@ -173,10 +209,40 @@ func TestCompactionErrorPaths(t *testing.T) {
 			if tt.wantIs != nil && !errors.Is(err, tt.wantIs) {
 				t.Fatalf("compactAll error = %v, want %v", err, tt.wantIs)
 			}
+			if tt.wantIs == errCommitInjected && fault.firedCount() != 1 {
+				t.Fatalf("the index commit fault fired %d times, want 1", fault.firedCount())
+			}
 			undo()
 
-			if got := recordSegs(t, c.dir); !slices.Equal(got, before) {
-				t.Fatalf("segments after a failed compaction = %v, want %v", got, before)
+			var inputs []uint32 // late: the inputs the committed swap unregistered
+			if tt.late {
+				if !strings.Contains(err.Error(), "kept until the next open") {
+					t.Errorf("compactAll error = %v, want it to say the files are kept until the next open", err)
+				}
+				// Nothing was removed: the inputs and the output are on disk,
+				// and the index file registers the output, not the inputs.
+				if got, wantSegs := recordSegs(t, c.dir), append(slices.Clone(before), out); !slices.Equal(got, wantSegs) {
+					t.Fatalf("segments after a late commit failure = %v, want %v (inputs and output kept)", got, wantSegs)
+				}
+				totals, _ := segAccounting(t, c)
+				if _, ok := totals[out]; !ok {
+					t.Fatalf("the index file does not register the output segment %d after the committed swap: %v", out, totals)
+				}
+				for _, s := range before {
+					if _, ok := totals[s]; !ok {
+						inputs = append(inputs, s)
+					}
+				}
+				if len(inputs) == 0 {
+					t.Fatalf("the committed swap unregistered no input segment: registered %v, on disk %v", totals, before)
+				}
+			} else {
+				if got := recordSegs(t, c.dir); !slices.Equal(got, before) {
+					t.Fatalf("segments after a failed compaction = %v, want %v", got, before)
+				}
+				if _, err := os.Stat(segment.DataPath(c.dir, out)); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("the output segment %d of the failed compaction is still on disk (%v)", out, err)
+				}
 			}
 			checkModel(t, e, docsModel(idx, want))
 			checkKeydirLive(t, c)
@@ -184,14 +250,32 @@ func TestCompactionErrorPaths(t *testing.T) {
 			if err := e.compactAll(context.Background()); err != nil {
 				t.Fatalf("compactAll retry: %v", err)
 			}
-			if got := recordSegs(t, c.dir); slices.Equal(got, before) {
+			if got := recordSegs(t, c.dir); !tt.late && slices.Equal(got, before) {
 				t.Fatalf("the retried compaction changed nothing: segments %v", got)
 			}
 			checkModel(t, e, docsModel(idx, want))
 			checkKeydirLive(t, c)
 
-			e, _ = reopenColl(t, e)
+			e, c = reopenColl(t, e)
 			checkModel(t, e, docsModel(idx, want))
+			checkKeydirLive(t, c)
+			if tt.late {
+				// The open removed the unregistered inputs and kept the
+				// output the key table points into.
+				onDisk := listSegs(t, c.dir)
+				for _, s := range inputs {
+					if slices.Contains(onDisk, s) {
+						t.Errorf("input segment %d, which the index file does not register, is still on disk after reopen: %v", s, onDisk)
+					}
+				}
+				if !slices.Contains(onDisk, out) {
+					t.Errorf("the registered output segment %d is gone after reopen: %v", out, onDisk)
+				}
+			}
+			totals, _ := segAccounting(t, c)
+			if got := listSegs(t, c.dir); !slices.Equal(got, slices.Sorted(maps.Keys(totals))) {
+				t.Errorf("segments on disk after reopen = %v, the index file registers %v", got, slices.Sorted(maps.Keys(totals)))
+			}
 		})
 	}
 }

@@ -90,6 +90,47 @@ func (w *hookedSegWriter) Sync() error {
 	return w.segmentWriter.Sync()
 }
 
+var errCommitInjected = errors.New("injected index commit error")
+
+// commitFault makes one index transaction fail (via Options.testIndexCommit,
+// set only in the Options passed to Open). The test arms it on the open
+// engine through the mutex, never by writing the engine's options, which
+// the background flusher and compactor read. hook runs inside the write
+// transaction when committed is false, so it only returns an error.
+type commitFault struct {
+	mu        sync.Mutex
+	site      string
+	committed bool
+	armed     bool
+	fired     int
+}
+
+// arm makes the next index transaction at site fail: inside the
+// transaction before the commit (committed false, rolled back) or after
+// it committed (committed true, a late commit failure).
+func (f *commitFault) arm(site string, committed bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.site, f.committed, f.armed = site, committed, true
+}
+
+func (f *commitFault) hook(site string, committed bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.armed || site != f.site || committed != f.committed {
+		return nil
+	}
+	f.armed = false
+	f.fired++
+	return errCommitInjected
+}
+
+func (f *commitFault) firedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fired
+}
+
 // newFlushColl is newTestColl with the flusher's timer effectively off
 // (flushes are triggered by the test) and the segment writer hooked.
 func newFlushColl(t *testing.T, mod func(*Options)) (*Engine, *Collection, *segHooks) {
@@ -523,31 +564,103 @@ func TestFlushCheckpointExcludesConcurrentWrites(t *testing.T) {
 	}
 }
 
+// segRecordLoc is a data segment record's header and location.
+type segRecordLoc struct {
+	rec string // "put a", "tombstone a"
+	loc segment.Location
+}
+
+// segRecordLocs returns the record headers and locations of every data
+// segment in dir, in order.
+func segRecordLocs(t *testing.T, dir string) []segRecordLoc {
+	t.Helper()
+	segs, err := segment.ListSegments(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []segRecordLoc
+	for _, seg := range segs {
+		if _, err := segment.ScanHeaders(dir, seg, func(r segment.Record, loc segment.Location) error {
+			out = append(out, segRecordLoc{rec: r.Type.String() + " " + r.ID, loc: loc})
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return out
+}
+
+func recNames(recs []segRecordLoc) []string {
+	out := make([]string, len(recs))
+	for i, r := range recs {
+		out[i] = r.rec
+	}
+	return out
+}
+
+// Failure modes of TestFlushFailureKeepsCheckpoint.
+const (
+	flushFailAppend        = "append"
+	flushFailSync          = "sync"
+	flushFailIndexEarly    = "index commit before the commit"
+	flushFailIndexLate     = "index commit fails late"
+	flushLateCommitWarning = "the index transaction of a flush failed at commit; keeping its records in the data segment"
+)
+
 // TestFlushFailureKeepsCheckpoint (F8): a failed flush keeps flushing
 // readable and the old checkpoint, the retry writes everything, and
-// nothing is lost after reopen.
+// nothing is lost after reopen. The failure is an append or sync error of
+// the data segment, or a failed index transaction (task 02 Amendment 2):
+// one that never reached its commit truncates the records away like a
+// failed append; one that failed late, after bbolt wrote the transaction,
+// keeps them (the key table may point at them) and logs a WARN, and the
+// retry counts its own second copies as dead.
 func TestFlushFailureKeepsCheckpoint(t *testing.T) {
-	for _, mode := range []string{"append", "sync"} {
+	for _, mode := range []string{flushFailAppend, flushFailSync, flushFailIndexEarly, flushFailIndexLate} {
 		t.Run(mode, func(t *testing.T) {
-			e, c, h := newFlushColl(t, nil)
+			ctx := context.Background()
+			fault := &commitFault{}
+			logs := &syncBuffer{}
+			e, c, h := newFlushColl(t, func(o *Options) {
+				o.testIndexCommit = fault.hook
+				o.Logger = slog.New(slog.NewTextHandler(logs, nil))
+			})
+			idx := map[string]string{"by_v": "v"}
+			if err := c.CreateIndex(ctx, "by_v", "v"); err != nil {
+				t.Fatal(err)
+			}
 			mustInsert(t, c, "a", map[string]any{"v": 1})
 			mustFlush(t, c)
 			cp0 := checkpointOf(c)
 
 			mustInsert(t, c, "b", map[string]any{"v": 2})
 			b := memOffset(t, c, "b")
-			if err := c.Delete(context.Background(), "a"); err != nil {
+			if err := c.Delete(ctx, "a"); err != nil {
 				t.Fatal(err)
 			}
-			h.mu.Lock()
-			if mode == "append" {
+			wantErr := errInjected
+			switch mode {
+			case flushFailAppend:
+				h.mu.Lock()
 				h.failAppend = 1
-			} else {
+				h.mu.Unlock()
+			case flushFailSync:
+				h.mu.Lock()
 				h.failSync = 1
+				h.mu.Unlock()
+			case flushFailIndexEarly:
+				fault.arm(indexCommitFlush, false)
+				wantErr = errCommitInjected
+			case flushFailIndexLate:
+				fault.arm(indexCommitFlush, true)
+				wantErr = errCommitInjected
 			}
-			h.mu.Unlock()
-			if err := c.flush(); !errors.Is(err, errInjected) {
+			if err := c.flush(); !errors.Is(err, wantErr) {
 				t.Fatalf("flush = %v, want the injected error", err)
+			}
+			late := mode == flushFailIndexLate
+			if wantErr == errCommitInjected && fault.firedCount() != 1 {
+				t.Fatalf("the index commit fault fired %d times, want 1", fault.firedCount())
 			}
 
 			c.mu.RLock()
@@ -568,13 +681,37 @@ func TestFlushFailureKeepsCheckpoint(t *testing.T) {
 			if lw := e.lowWater(); lw > b {
 				t.Errorf("lowWater = %d after failed flush, want <= %d", lw, b)
 			}
-			if got := storedCheckpoint(t, c); got != cp0 {
-				t.Errorf("index file checkpoint after the failed flush = %d, want %d", got, cp0)
-			}
-			// The failed attempt's records were truncated away: the segment
-			// holds only what the index file knows.
-			if recs := segRecords(t, c.dir); len(recs) != 1 || recs[0].ID != "a" || recs[0].Type != segment.TypePut {
-				t.Errorf("segment records after the failed flush = %+v, want only the first flush's put a", recs)
+			warned := strings.Contains(logs.String(), flushLateCommitWarning)
+			if late {
+				// bbolt wrote the transaction: the index file shows the
+				// flush, so its records must stay in the segment.
+				if got := storedCheckpoint(t, c); got <= cp0 {
+					t.Errorf("index file checkpoint after the late commit failure = %d, want the flush's (> %d)", got, cp0)
+				}
+				if got, want := recNames(segRecordLocs(t, c.dir)), []string{"put a", "put b", "tombstone a"}; !slices.Equal(got, want) {
+					t.Errorf("segment records after the late commit failure = %v, want %v (kept)", got, want)
+				}
+				if !inKeydir(t, c, "b") {
+					t.Error("the committed key table has no entry for b")
+				}
+				if !warned || !strings.Contains(logs.String(), "level=WARN") {
+					t.Errorf("no WARN %q logged: %q", flushLateCommitWarning, logs.String())
+				}
+			} else {
+				if got := storedCheckpoint(t, c); got != cp0 {
+					t.Errorf("index file checkpoint after the failed flush = %d, want %d", got, cp0)
+				}
+				// The failed attempt's records were truncated away: the segment
+				// holds only what the index file knows.
+				if recs := segRecords(t, c.dir); len(recs) != 1 || recs[0].ID != "a" || recs[0].Type != segment.TypePut {
+					t.Errorf("segment records after the failed flush = %+v, want only the first flush's put a", recs)
+				}
+				if inKeydir(t, c, "b") {
+					t.Error("the key table has an entry for b after a rolled-back flush")
+				}
+				if warned {
+					t.Errorf("the late-commit WARN was logged for a failure before the commit: %q", logs.String())
+				}
 			}
 
 			mustInsert(t, c, "c", map[string]any{"v": 3})
@@ -596,14 +733,54 @@ func TestFlushFailureKeepsCheckpoint(t *testing.T) {
 				t.Errorf("markers on disk = %v, want none", m)
 			}
 
-			_, c = reopenColl(t, e)
-			if _, err := c.Get(context.Background(), "a"); !errors.Is(err, ErrNotFound) {
+			// The retry wrote b, the tombstone of a, and c once; after a late
+			// failure it appended b and the tombstone again, and b's entry
+			// still points at the first copy, the one the committed
+			// transaction referenced.
+			recs := segRecordLocs(t, c.dir)
+			wantRecs := []string{"put a", "put b", "tombstone a", "put c"}
+			if late {
+				wantRecs = []string{"put a", "put b", "tombstone a", "put b", "tombstone a", "put c"}
+			}
+			if got := recNames(recs); !slices.Equal(got, wantRecs) {
+				t.Fatalf("segment records after the retry = %v, want %v", got, wantRecs)
+			}
+			liveB, liveC := recs[1].loc, recs[len(recs)-1].loc
+			for id, loc := range map[string]segment.Location{"b": liveB, "c": liveC} {
+				if ke, ok := keyEntryOf(t, c, id); !ok || ke.Seg != loc.Seg || ke.Pos != loc.Pos || ke.Size != loc.Size {
+					t.Errorf("key table entry of %s = %+v, %v; want %+v", id, ke, ok, loc)
+				}
+			}
+			wantDead := map[uint32]int64{}
+			wantTotal := map[uint32]int64{}
+			for _, r := range recs {
+				wantTotal[r.loc.Seg] += int64(r.loc.Size)
+				if r.loc != liveB && r.loc != liveC {
+					wantDead[r.loc.Seg] += int64(r.loc.Size)
+				}
+			}
+			totals, dead := segAccounting(t, c)
+			for seg, n := range wantTotal {
+				if totals[seg] != n || dead[seg] != wantDead[seg] {
+					t.Errorf("segment %d accounting = %d record bytes, %d dead; want %d, %d (the retry's own copies dead)",
+						seg, totals[seg], dead[seg], n, wantDead[seg])
+				}
+			}
+			want := docsModel(idx, map[string]map[string]any{"b": {"v": 2.0}, "c": {"v": 3.0}})
+			checkModel(t, e, want)
+
+			e, c = reopenColl(t, e)
+			if _, err := c.Get(ctx, "a"); !errors.Is(err, ErrNotFound) {
 				t.Errorf("after reopen Get(a) = %v, want ErrNotFound", err)
 			}
 			mustGet(t, c, "b")
 			mustGet(t, c, "c")
 			if c.Count() != 2 {
 				t.Errorf("Count after reopen = %d, want 2", c.Count())
+			}
+			checkModel(t, e, want)
+			if _, dead2 := segAccounting(t, c); !maps.Equal(dead2, dead) {
+				t.Errorf("dead bytes after reopen = %v, want %v", dead2, dead)
 			}
 		})
 	}
