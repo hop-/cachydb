@@ -12,21 +12,25 @@ Every change is appended to a **write-ahead log (WAL)** and fsynced before
 it is applied or acknowledged; concurrent writers share fsyncs (**group
 commit**). Applied changes sit in a per-collection **memtable**. A
 background **flusher** appends only the changed documents and tombstones to
-the collection's **append-only data segment**, followed by a **checkpoint
-marker**, with one fsync, then repoints the in-RAM **keydir** (id → segment
-location). Reads go memtable → **LRU cache** → keydir → segment. Background
+the collection's **append-only data segment** with one fsync, then applies
+the **key table** (id → segment location), the secondary index entries, the
+live count, the segment accounting, and the **checkpoint** in one
+transaction of the collection's **index file** (`index.db`, a bbolt B+tree
+file). Reads go memtable → **LRU cache** → key table → segment; queries
+stream from index or key-table cursors merged with the memtable. Background
 **compaction** rewrites sealed segments to drop dead records, and **WAL
 retention** deletes processed WAL segments by age and/or size. Every record
-carries its WAL offset, and load and replay apply "last writer wins by WAL
-offset", so recovery is idempotent. Only keys, indexes, memtables, and the
-bounded cache live in RAM.
+carries its WAL offset, and replay applies "last writer wins by WAL
+offset", so recovery is idempotent. Only memtables, the bounded cache, and
+small per-collection bookkeeping live in RAM; the Go heap does not grow
+with the number of documents (format version 3, plan 013).
 
 ## On-disk layout
 
 ```
 <root>/                               # Options.Dir (CLI: -R, default ~/.cachydb)
 ├── cachydb.lock                      # exclusive flock target (data-dir lock)
-├── cachydb.format                    # {"format":"cachydb","version":2}
+├── cachydb.format                    # {"format":"cachydb","version":3}
 ├── cachydb.metacp                    # {"offset":N}: metadata checkpoint (see Recovery)
 ├── wal-00000000000000000001.log      # WAL segments, named by first offset (20 digits)
 ├── wal-00000000000004213377.log
@@ -36,11 +40,15 @@ bounded cache live in RAM.
     ├── .deleted-<offset>/            # transient: dropped collection awaiting removal
     └── <coll>/
         ├── coll.meta                 # JSON, atomic write
+        ├── index.db                  # index file (bbolt): key table, secondary indexes, count, checkpoint
         ├── seg-000001.data           # sealed data segment
-        ├── seg-000001.hint           # hint file of the sealed segment
-        ├── seg-000002.data           # active data segment (append-only)
-        └── idx-<index>.snap          # index snapshot
+        └── seg-000002.data           # active data segment (append-only)
 ```
+
+Format version 2 directories (v0.0.4–v0.0.6) also had `seg-NNNNNN.hint`
+(hint files) and `idx-<index>.snap` (index snapshots) in each collection
+directory. Format 3 neither writes nor reads them; the upgrade deletes
+them (see "Format file and old data directories").
 
 - Root files contain a `.`; database, collection, and index names cannot
   (`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`, `pkg/db/names.go`), so names never
@@ -48,7 +56,8 @@ bounded cache live in RAM.
 - File names: `pkg/db/engine.go` (`cachydb.lock`), `pkg/db/format.go`,
   `pkg/db/metacp.go`,
   `pkg/db/meta.go`, `pkg/db/internal/wal/segment.go`,
-  `pkg/db/internal/segment/{segment,hint,snapshot}.go`.
+  `pkg/db/internal/segment/segment.go`, `pkg/db/internal/idxstore/store.go`
+  (`index.db`).
 
 ### Format file and old data directories
 
@@ -56,9 +65,35 @@ bounded cache live in RAM.
 `cachydb.format` in a root that holds legacy files (`wal.checkpoint`,
 `wal-<unix>-<offset>.log`, or any `<db>/db.meta.json`) fails with
 `ErrIncompatibleDataDir`: *"data directory … was created by an older
-cachydb format; move or delete it"*. There is no converter. A format
-version newer than `FormatVersion` (2) also fails. An empty root gets the
-file written atomically.
+cachydb format; move or delete it"*; there is no converter for those
+(pre-v0.0.4) directories. A version below 2 also fails (*"… cannot upgrade
+(it upgrades version 2) …"*), and so does a version newer than
+`FormatVersion` (3). An empty root gets the file written atomically.
+
+**Upgrade from format 2** (`pkg/db/upgrade.go`, `Engine.upgradeFormat`).
+Version 2 makes `checkDataDir` report `upgrade = true`. `recover` then runs
+the upgrade right after reading the metadata and before loading the
+collections and replaying the WAL:
+
+1. Delete every `index.db` in the directory (in a format-2 directory it can
+   only be the partial result of an interrupted upgrade).
+2. One collection at a time (database, then collection name order, to bound
+   memory to one id map): log INFO *"upgrading data directory format 2 ->
+   3; building index"* and build `index.db` from the data segments with the
+   rebuild routine (`rebuildIndex`, see Recovery). The checkpoint becomes
+   the newest checkpoint marker found in the segments (0 if none).
+3. After every collection succeeded, delete `seg-*.hint`, `idx-*.snap`, and
+   their leftover temporary files, then write `cachydb.format` with version
+   3 (atomic write).
+
+Until step 3 the directory still says version 2, so a crash anywhere
+restarts the upgrade from step 1. An upgrade that fails without a crash
+(for example a document id longer than 31,742 bytes, or an I/O error)
+removes the `index.db` files it built and leaves the format-2 files, so the
+old release still opens the directory. No document is rewritten; the WAL
+and data segments keep their format. The upgrade is **one-way**: an older
+binary cannot open a format-3 directory, so copy the directory or export
+first (README "Upgrading").
 
 ### Metadata files
 
@@ -77,7 +112,7 @@ a no-op.
 | File | JSON fields |
 |------|-------------|
 | `db.meta` | `name`, `schema_version`, `wal_offset` |
-| `coll.meta` | `name`, `schema` (or `null`), `indexes` (`[{name, field}]`, sorted), `wal_offset`, `created_offset` |
+| `coll.meta` | `name`, `schema` (or `null`), `indexes` (`[{name, field, unique}]`, sorted; `unique` omitted when false), `wal_offset`, `created_offset` |
 
 `wal_offset` is the WAL offset of the record that last wrote the file.
 `created_offset` is the offset of this collection incarnation's
@@ -104,7 +139,7 @@ u16 db_len · db · u16 coll_len · coll · u16 id_len · id · u32 payload_len 
 | 4 | `drop_db` | none |
 | 5 | `create_coll` | `{"schema": <Schema or null>}` |
 | 6 | `drop_coll` | none |
-| 7 | `create_index` | `{"name", "field"}` |
+| 7 | `create_index` | `{"name", "field"}`, plus `"unique": true` for a unique index |
 | 8 | `drop_index` | `{"name"}` |
 | 9 | `update_schema` | `{"schema": <Schema or null>}` (plan 004) |
 | 10 | `rename_coll` | `{"new_name"}`; `coll` is the old name (plan 004) |
@@ -150,44 +185,92 @@ u32 raw_len · u8 codec · body
 ```
 
 - Types: 1 = put (document after-image), 2 = tombstone, 3 = checkpoint
-  marker (`wal_offset` holds the checkpoint value, no id).
+  marker (`wal_offset` holds a checkpoint value, no id). Format 3 no
+  longer writes markers (the checkpoint is in `index.db`); readers accept
+  and ignore them in old segments, the upgrade takes the newest one as the
+  initial checkpoint, and compaction does not copy them.
 - Bodies are zstd-compressed JSON (`klauspost/compress`, `SpeedDefault`,
   shared encoder/decoder). Documents under 64 bytes are stored with codec 0
   (uncompressed).
 - The active segment is appended to; when it exceeds `DataSegmentSize`
-  (64 MiB) it is **sealed**: fsynced, its hint file and the collection's
-  index snapshots are written, and the next flush opens `seg-<n+1>.data`.
-  Segment ids only grow (compaction outputs take ids from the same counter).
+  (64 MiB) it is **sealed** (closed; it was fsynced by the flush) and the
+  next flush opens `seg-<n+1>.data`. Sealing writes no other file. Segment
+  ids only grow (compaction outputs take ids from the same counter).
 - Reads use `ReadAt` on files opened once and ref-counted, so compaction can
   retire a segment while a read holds it.
-- **Hint file** (`seg-NNNNNN.hint`, magic `CDBH`): one entry per record (id,
-  type, WAL offset, position, size) so a sealed segment loads without
-  reading the data. A missing or invalid hint means the segment is scanned
-  and the hint rewritten.
-- **Index snapshot** (`idx-<name>.snap`, magic `CDBI`, version 2): the
-  index's keys and id sets plus the data position `(seg, pos)` and WAL
-  offset it covers. Version 2 (plan 004) holds one key per array element
-  plus the marker keys `a:` (array values) and `u:` (unindexable values);
-  version-1 snapshots are rejected as corrupt, so their indexes are
-  rebuilt on the first open after an upgrade.
-  Written when a segment is sealed, after compaction, and on `Close` (if
-  the final flush succeeded). On open, a snapshot whose field matches
-  `coll.meta` and whose CRC checks is loaded and caught up from the records
-  after its position; otherwise the index is rebuilt from the documents.
-- Hint and snapshot files share a framing: magic · `u16` version (hint 1,
-  snapshot 2) · body · CRC32C over everything before it (`sidecar.go`).
+- **Header-only scan** (`segment.ScanHeaders`): reads each record's length,
+  type, id, and WAL offset and verifies its CRC without decompressing the
+  body. Compaction uses it to find a segment's records, and the rebuild
+  and upgrade use it to rebuild the key table (about 20× faster than a
+  full `Scan`).
+
+## Index file (`index.db`, `pkg/db/internal/idxstore`)
+
+One bbolt file per collection directory, so drops and renames stay
+directory operations. `idxstore` is the only package that imports
+`go.etcd.io/bbolt`; no bbolt type leaves it. The file is opened with the
+map free-list type, the free list synced, and a 1 s lock timeout.
+
+| Bucket | Key | Value |
+| --- | --- | --- |
+| `meta` | fixed names | `format` (layout version), `complete` (absent while a rebuild is in progress), `checkpoint` (u64 WAL offset), `maxwal` (highest WAL offset any reflected change has), `count` (live documents), `covered` (segment id · end position the file reflects), `seg:<u32>` per live segment (record bytes, dead bytes), `ix:<name>` per index (`complex`, `truncated`, `arrays` counters, ready flag) |
+| `keydir` | document id | segment id (u32) · position (u64) · size (u32) · WAL offset (u64): 24 bytes |
+| `ix/<name>` | encoded value · `0x00 0x00` · document id | 1 flag byte: bit 0 = array element, bit 1 = value truncated |
+
+Integers are big-endian. The value encoding is order-preserving (missing
+< null < false < true < numbers < strings, the engine's sort order); a
+missing field has its own entry, so every document is in every index. The
+encoding, flags, and counters and the query rules built on them are in
+[DATABASE_ENGINE.md](DATABASE_ENGINE.md#indexes). Document ids are at most
+**31,742 bytes** (`idxstore.MaxIDLen`): a bbolt key holds 32,768 bytes and
+an index key is up to 1,024 bytes of value, 2 bytes of terminator, and the
+id.
+
+Everything in `meta` changes in the same transaction as the entries it
+describes, so "the file reflects the WAL up to `checkpoint` and the
+segments up to `covered`" is atomic. Every change is one `Store.Update`
+(one bbolt transaction, fsynced at commit). Large transactions apply their
+keys in ascending order per bucket: bbolt splits leaves only at commit,
+and random-order inserts into a small bucket cost quadratic time.
+
+Readers use snapshot read transactions. bbolt has one writer at a time;
+a commit that has to grow the file (remap the mmap) waits until every
+open read transaction ends. A query keeps one read transaction open while
+it streams its results, so a long query can delay the flush that grows
+`index.db` (writers are not blocked: they only append to the WAL and the
+memtable, up to `MaxPendingBytes`). Never open a read transaction inside
+an update, or start an update while holding a read transaction in the
+same goroutine (deadlock on remap).
+
+`Store.Check` (bbolt's page check plus the invariants: entries well
+formed, every key in a registered segment, `count` equal to the keys,
+segment bytes equal to the referenced bytes, every index entry belonging
+to a key, the counters) reads the whole file; it is for tests and tools,
+not for `Open`. `Open` runs a cheap check only (file length against the
+newest transaction, the meta pages, the `meta` bucket and layout).
 
 ## In-memory state per collection (`pkg/db/collection.go`)
 
 | Field | Role |
 |-------|------|
-| `keydir` | id → `{segment location, walOffset}` of the live on-disk version; the primary (`_id`) index |
-| `memtable` | changes durable in the WAL but not yet in a segment (nil doc = tombstone) |
+| `store` | the open `index.db` (`*idxstore.Store`); nil before load, after drop/detach/close, and on a renamed collection until first use (`indexStore` opens it lazily, under `storeMu`) |
+| `memtable` | changes durable in the WAL but not yet in the index file (nil doc = tombstone); each `memEntry` also carries `base`/`baseOff` (below) |
 | `flushing` | the immutable memtable being flushed (still readable) |
-| `indexes` | multi-value secondary indexes |
+| `indexes` | the secondary index definitions (`indexDef{name, field, unique}`); the entries are in `index.db` |
+| `uniquePending` | unique index → encoded value → ids of unflushed documents holding it (hints for the uniqueness check) |
 | `inflight` | lower bounds of WAL offsets appended but not yet applied |
-| `deadBytes`, `segBytes` | per-segment byte accounting for compaction |
-| `count` | live document count, O(1) |
+| `checkpoint` | the checkpoint as of the last index commit |
+| `keptTombs` | per compaction output, tombstone bytes it had to copy (planning only, not persisted) |
+| `count` | live document count, O(1): the persisted count plus the overlay's delta |
+
+There is no map of all ids or index entries: the key table and the indexes
+are only in `index.db` (and the OS page cache). `memEntry.base` holds the
+index keys of the on-disk version that the first write of this memtable
+entry replaced, and `baseOff` that version's WAL offset (0 if there was
+none); later writes to the same id keep them. The flush deletes exactly
+those keys, so it reads no old document from disk. If `baseOff` no longer
+matches the key table, or `base` lacks an index created since,
+`oldIndexKeys` reads the replaced version from its segment instead.
 
 The LRU document cache (`pkg/db/internal/cache`) is one per engine, bounded
 by `CacheSize` bytes (64 MiB, can be disabled). It stores immutable
@@ -205,15 +288,23 @@ returns. A cached `Get` is ~8.5× faster than an uncached one
    wait (no lock held; ctx-aware; ErrClosed on Close) and kick the flusher
 1. Database.mu (shared, held to the end; blocks drops/index changes)
 2. docLock(id): 256 striped mutexes, FNV-1a of the id
-3. read current version: memtable → flushing → cache → keydir + segment
+3. read current version: memtable → flushing → key table (short read
+   transaction) → cache or segment
 4. check the `if` condition against the current version (ErrConditionFailed),
    build after-image (insert: ErrExists if present; update: merge top-level
    fields then unset, or upsert; replace: whole document; delete: ErrNotFound
    if absent), JSON round-trip, validate schema
-5. register inflight; WAL append + fsync            ← commit point
-6. under Collection.mu: memtable[id] = after-image@offset, update indexes,
-   invalidate cache, count; remove from inflight
+5. unique indexes: for each new value of a unique index, take its
+   uniqueLocks stripe (ascending) and check the value against
+   uniquePending/the overlay and index.db (ErrUniqueViolation)
+6. register inflight; WAL append + fsync            ← commit point
+7. under Collection.mu: memtable[id] = after-image@offset (keeping the
+   first base/baseOff), uniquePending, invalidate cache, count; remove
+   from inflight
 ```
+
+No read transaction is open across the WAL append. Index entries are not
+touched on the write path: the flusher applies them.
 
 Writes become visible only after they are durable. If the append fails,
 nothing is applied. Writes to different documents commit concurrently and
@@ -236,11 +327,25 @@ active segment and readers, evict its cache entries), `os.Rename` the
 directory and fsync the database directory (`hookRenameDir`), rewrite
 `coll.meta` with the new name and `wal_offset` (keeping
 `created_offset`), and register a new `*Collection` that takes over the
-in-memory state (`moveState`); its active segment reopens lazily. If a
-step after the commit fails, the collection is unavailable until a
-restart replays the record.
+in-memory state (`moveState`); its active segment and `index.db` reopen
+lazily. If a step after the commit fails, the collection is unavailable
+until a restart replays the record. Drops close the collection's segments
+and `index.db` (`markDropped`) and remove it from memory before the
+directory rename; if the rename fails, the error says to restart, and the
+replayed drop completes it.
 
-## Flush, checkpoint markers, low-water mark (`pkg/db/flush.go`)
+**Index changes.** `CreateIndex` holds `Database.mu` exclusively, then the
+collection's `compactMu` and `flushMu`, for the whole build: it reads every
+document the key table lists in one read transaction, sorts the entries,
+writes them in batches of 50,000 (fill percent 0.9), sets the counters and
+the ready flag in the last transaction, then appends the WAL record,
+writes `coll.meta`, and publishes the definition. A unique index over
+duplicate values fails before anything is written. On any failure before
+the publish the new bucket is dropped. `DropIndex` holds `Database.mu` and
+`flushMu`, appends the record, publishes the removal, and drops the bucket.
+Both remove the index from every memtable entry's `base`.
+
+## Flush, checkpoint, low-water mark (`pkg/db/flush.go`)
 
 Each collection is flushed every `FlushInterval` (1s), immediately when its
 memtable exceeds `MemtableSize` (16 MiB), and on `Close`. One flush pass
@@ -251,15 +356,33 @@ collection are still serialized by its `flushMu`:
 1. Under `Collection.mu`: `flushing = memtable`, new memtable, compute the
    checkpoint `cp` (one below the smallest offset of this collection's
    records the flush does not cover).
-2. Append the entries (sorted by WAL offset) and a checkpoint marker with
-   `cp` to the active segment; one fsync. No collection lock is held.
-3. Under `Collection.mu`: repoint keydir entries whose offset is newer,
-   drop tombstoned ids, account dead bytes, clear `flushing`, store `cp`.
-4. Seal and roll the segment if it is over `DataSegmentSize`.
+2. Append the entries (sorted by WAL offset) to the active segment; one
+   fsync. No collection lock is held. (`hookAfterSegWrite`,
+   `hookAfterSegSync`.)
+3. One `index.db` transaction (`applyFlush`), no collection lock held: for
+   each entry, if the key table's offset for the id is not older, count the
+   new record as dead and skip it; otherwise delete the old version's index
+   entries (from `base`), write the new key-table entry and index entries
+   (or delete the id for a tombstone), and adjust the `complex`, `arrays`,
+   and segment byte counters. Keys are applied in ascending order per
+   bucket. Then write `checkpoint = cp`, `covered = (segment, end)`, and
+   `maxwal`, and commit (bbolt fsyncs). (`hookAfterIndexCommit`.)
+4. Under `Collection.mu`: clear `flushing`, drop the flushed values from
+   `uniquePending`, store `cp`; release the pending bytes.
+5. Seal and roll the segment if it is over `DataSegmentSize`.
 
-A failed flush truncates the segment back, keeps `flushing` readable and the
-old checkpoint, and retries next tick. The cost of a flush depends on the
-number of changed documents, not the collection size.
+Readers stay correct throughout: a query captures the overlay (memtable
+and `flushing`) before it opens its read transaction, and `flushing` is
+cleared only after the commit, so a change is always in one of the two.
+
+A failed flush keeps `flushing` readable and the old checkpoint, and
+retries next tick. If the segment append or fsync failed, the segment is
+truncated back (`abandonActive`). If the index transaction failed before
+commit, the records stay unreferenced and the segment is truncated back;
+if it failed during commit (bbolt may have written it), the records stay
+and the writer is reopened by the next flush. The cost of a flush depends
+on the number of changed documents, not the collection size (see the 10M
+run in [DEVELOPMENT.md](DEVELOPMENT.md#scale-benchmark)).
 
 **Backpressure** (`pkg/db/backpressure.go`): the engine keeps an atomic
 count of the unflushed bytes of all collections (memtable plus flushing
@@ -283,13 +406,30 @@ deleted by retention.
 1. Take `cachydb.lock` (`ErrDataDirInUse`), check `cachydb.format`, remove
    `.deleted-*` leftovers, open the WAL (torn-tail truncation).
 2. Read every `db.meta` and `coll.meta`. A newer `schema_version` fails
-   with `ErrSchemaTooNew`; an older one logs a warning.
-3. Per collection, in parallel (bounded by GOMAXPROCS): build the keydir
-   from hint files or segment scans (highest WAL offset wins, a tombstone
-   removes the id), truncate a torn tail in the newest segment, read the
-   newest checkpoint marker, load or rebuild the indexes.
+   with `ErrSchemaTooNew`; an older one logs a warning. In a format-2
+   directory, run the upgrade now (see "Format file and old data
+   directories").
+3. Per collection, in parallel (bounded by GOMAXPROCS; `Collection.load`):
+   open `index.db` and read its checkpoint, count, covered position, and
+   segment accounting; then align the segments with it (`alignSegments`):
+   delete segment files it does not register (an unfinished compaction
+   output, or a first flush into a new segment, that did not reach its
+   index commit, or compaction inputs that did) and truncate the covered
+   segment to `covered` (a flush that did not reach its index commit, or a
+   torn write; WARN "torn tail"). If `index.db` is missing, fails the cheap
+   open check, is incomplete, or refers to data that is not there (a
+   registered segment without its file, `covered` past the segment end),
+   it is **rebuilt** from the segments with a WARN (`rebuildIndex`: header
+   scan of every segment, highest WAL offset per id wins, a tombstone
+   removes the id; key table in sorted batches of 50,000, every index of
+   `coll.meta` built from the documents, then the accounting, `covered`,
+   `maxwal`, and the checkpoint: the newest old checkpoint marker, else 0;
+   `complete` set last). A rebuild that meets an id over 31,742 bytes fails
+   `Open` before changing anything. Last, `syncIndexes` drops index buckets
+   with no definition in `coll.meta` (INFO) and builds definitions whose
+   bucket is missing or not ready (WARN).
 4. Fail with `ErrWALCorrupt` if the data references an offset at or beyond
-   the end of the WAL (WAL files are missing).
+   the end of the WAL (the index files' `maxwal`; WAL files are missing).
 5. Replay the WAL from the oldest offset any meta file or checkpoint may be
    missing: `min(metacp+1, every collection's replay floor + 1)`, where the
    floor is `max(checkpoint, created_offset, the database's wal_offset)`.
@@ -316,17 +456,34 @@ deleted by retention.
    older records (`created_offset` below the record) is removed like a
    drop; the old collection predating the record with the new name free →
    rename the directory, rewrite `coll.meta`, re-key; otherwise skip.
+   Replay compares a document record's offset with the memtable, then the
+   key table; a replayed put on a collection with indexes reads the
+   previous version from its segment (its index keys become `base`). A
+   replayed put that violates a unique index is applied with a WARN
+   (*"WAL replay applied a write that violates a unique index"*): replay
+   never fails on committed data.
 6. Write `cachydb.metacp`, then start the flusher, compactor, and WAL
    retention.
+
+Open no longer scans the data segments (unless it rebuilds an index file
+or builds an index). Its cost is the WAL open (every retained WAL segment
+is read and CRC-checked, up to `WALRetentionSize`) plus the replay of the
+tail, not the number of documents. The
+open log line reports `recoveryStats`: `collections_upgraded` (format 2 → 3
+builds), `index_files_rebuilt` (format-3 repairs only), `segments_scanned`
+(by the upgrade and those rebuilds), and the replayed and skipped record
+counts.
 
 ## Compaction (`pkg/db/compact.go`)
 
 One goroutine checks every collection each `FlushInterval`. A collection
-is compacted when its candidate segments (sealed, excluding the active
-segment and the segment holding the newest checkpoint marker) number at
-least 2 and their dead bytes reach `CompactionRatio` (0.5) of their total,
-or, failing that, when at least 4 adjacent candidates are each smaller than
-`DataSegmentSize/4` (merged even when fully live).
+is compacted when its candidate segments (the registered segments other
+than the active one) number at least 2 and their dead bytes reach
+`CompactionRatio` (0.5) of their total, or, failing that, when at least 4
+adjacent candidates are each smaller than `DataSegmentSize/4` (merged even
+when fully live). The byte accounting comes from `index.db`'s `seg:`
+entries, minus the tombstone bytes earlier outputs of this process had to
+copy (`keptTombs`).
 
 - **Run selection** (`pickCompactionRun`): the contiguous run of candidates
   with the most dead bytes (the oldest on ties), capped at one segment
@@ -336,20 +493,31 @@ or, failing that, when at least 4 adjacent candidates are each smaller than
   `DataSegmentSize`.
 - The active segment is sealed first, so every later flush goes to a newer
   segment than the output.
-- A put is copied iff the keydir still points at it. Tombstones are dropped
+- The input records come from the header-only scan; a put is copied iff its
+  key-table entry points at exactly that record. Tombstones are dropped
   only when the run starts at the oldest segment on disk; otherwise they are
   copied. Checkpoint markers are not copied.
-- The output (one new segment plus hint) is fsynced, then the keydir is
-  repointed by compare-and-swap on `(location, walOffset)`. The old segments
-  are retired: hints removed at once, data files once no read holds them.
-  Index snapshots are rewritten.
+- The output (one new segment) is fsynced (file and directory), then one
+  `index.db` transaction repoints each copied id whose entry still has the
+  old location and WAL offset (compare-and-swap; copies of entries a flush
+  changed meanwhile count as dead bytes of the output), registers the
+  output, and removes the inputs (`hookCompactBeforeSwap` comes before it).
+  Then the old segments are retired: their files are removed once no read
+  holds them. A crash before the transaction leaves an unregistered output,
+  and one after it unregistered inputs; `Open` deletes both. Index entries
+  do not change: they hold values and ids, not locations.
 
 ## Concurrency and lock order
 
 ```
-Engine.metaMu → Database.mu → compactMu → flushMu → Collection.mu
+Engine.metaMu → Database.mu → compactMu → flushMu → storeMu → Collection.mu
                 Database.mu (shared) → docLock → uniqueLocks (ascending) → Collection.mu
 ```
+
+`index.db` transactions are not locks in this order, but two rules hold:
+`Collection.mu` is never held across a transaction (the store pointer is
+read under `mu` and used after it is released), and no read transaction is
+held across a WAL append or while starting an update in the same goroutine.
 
 | Lock / goroutine | Guards / role |
 |------------------|---------------|
@@ -358,22 +526,34 @@ Engine.metaMu → Database.mu → compactMu → flushMu → Collection.mu
 | `Database.mu` | collections map, collection schemas; exclusive for metadata ops (incl. the whole `CreateIndex` build, `UpdateSchema` validation, and the flush inside `RenameCollection`); shared by document writes |
 | `docLocks[256]` | one document's read-modify-write; held across the WAL append |
 | `uniqueLocks[256]` | writers of one `(unique index, encoded value)` (`pkg/db/unique.go`); taken after the document lock, only by writes that set a new value of a unique index, several in ascending stripe order, and held until the write is applied (so across the WAL append). The uniqueness check reads `index.db` in a short read transaction that ends before the append: no read transaction is held across the append |
-| `Collection.mu` | keydir, memtables, indexes, inflight, `uniquePending`; memory-only sections |
-| `flushMu`, `compactMu` | serialize flush / compaction per collection, and against drops |
+| `Collection.mu` | the `store` pointer, memtables, index definitions, inflight, `uniquePending`, checkpoint; memory-only sections |
+| `storeMu` | opening `index.db` on first use after a rename (`indexStore`) against the operations that close it (`markDropped`, `detach`, `closeReaders`) |
+| `flushMu`, `compactMu` | serialize flush / compaction per collection, and against drops and index changes (`CreateIndex` takes both, `DropIndex` takes `flushMu`) |
 | `Engine.lwMu`, `metacpMu` | leaf locks: in-flight metadata offsets; `cachydb.metacp` rewrites |
 | WAL writer, flusher, compactor, retention, drop removal | background goroutines; all exit on `Close` |
 
 `Close` wakes writers waiting on backpressure, waits for in-flight
 operations, stops the background goroutines, runs a final flush, writes
-index snapshots and `cachydb.metacp`, closes segments and the WAL, and
-releases the lock. Public calls after `Close` return `ErrClosed`.
+`cachydb.metacp`, closes the segments, the index files, and the WAL, and
+releases the lock. It writes no other file. Public calls after `Close`
+return `ErrClosed`.
 
 ## Crash-point test hooks
 
 `Options.testHook` is unexported and only set from `pkg/db/export_test.go`.
-The engine calls it at the points in `pkg/db/hooks.go` (after the WAL fsync
-before apply, after the segment write before fsync, after the segment fsync
-before the keydir update, before the compaction swap, during metadata
-writes, and between a rename's directory rename and its `coll.meta`
-write). A hook can simulate a crash; the test then reopens the directory
+The engine calls it at the points in `pkg/db/hooks.go`:
+
+| Hook | Point |
+| --- | --- |
+| `hookAfterWALSync` | document write: after the WAL fsync, before the apply |
+| `hookAfterSegWrite` | flush: after the segment write, before its fsync |
+| `hookAfterSegSync` | flush: after the segment fsync, before the index transaction |
+| `hookAfterIndexCommit` | flush: after the index transaction committed, before the overlay is cleared |
+| `hookCompactBeforeSwap` | compaction: output durable, before the swap transaction |
+| `hookMetaWrite` | metadata operations: after the WAL append, before the meta file change |
+| `hookRenameDir` | `rename_coll`: after the directory rename, before `coll.meta` |
+| `hookUpgradeCollection` | format upgrade: after each collection's `index.db` is built |
+| `hookUpgradeBeforeFormat` | format upgrade: after the format-2 files are removed, before `cachydb.format` is rewritten |
+
+A hook can simulate a crash; the test then reopens the directory
 (`pkg/db/crash_test.go`). It is always nil outside tests.

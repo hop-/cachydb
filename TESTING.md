@@ -60,7 +60,8 @@ to `master` (and on demand). A red check blocks a broken change:
 `.github/workflows/nightly.yml` runs the heavy tests every day at 03:17
 UTC (and on demand, Actions > nightly > Run workflow): the 200-run stress
 loop, the kill test with 100 rounds, the model test with 20 seeds × 5000
-operations, and every fuzz target for 60s. A failing job uploads what
+operations, every fuzz target for 60s, and the 1M-document scale
+benchmark (its numbers are in the job log; they are not gated). A failing job uploads what
 reproduces it (the kill test's data directory and server logs, the model
 log with its seeds, the new fuzz corpus entries) and fails the run;
 GitHub notifies the repository owner. The Docker image has its own
@@ -90,8 +91,8 @@ decoder of disk or input data:
 | Package | Targets |
 | --- | --- |
 | `pkg/db/internal/wal` | `FuzzWALRecordDecode`, `FuzzWALSegmentRead` |
-| `pkg/db/internal/segment` | `FuzzSegmentRecordDecode`, `FuzzSidecarRead` (hint files, index snapshots), `FuzzSegmentScan` |
-| `pkg/db` | `FuzzMetaRead`, `FuzzDecodeDocument`, `FuzzIndexKey`, `FuzzCompare`, `FuzzMatchFilter` |
+| `pkg/db/internal/segment` | `FuzzSegmentRecordDecode`, `FuzzSegmentScan` |
+| `pkg/db` | `FuzzMetaRead`, `FuzzDecodeDocument`, `FuzzCompare`, `FuzzMatchFilter` |
 | `internal/exportfmt` | `FuzzImportJSONL` |
 
 They check that garbage never panics and is rejected with the right
@@ -136,10 +137,13 @@ same operations.
 ### Upgrade fixtures
 
 `pkg/db/testdata/compat/<version>/` holds a data directory written by
-that release (v0.0.4, v0.0.5, v0.0.6) and `expected.jsonl`, its logical content
-in the export format. `TestCompatFixtures` opens a copy of each one,
-compares the export with `expected.jsonl`, checks the indexes against a
-scan, and writes and reopens. Every release adds its fixture, generated
+that release (v0.0.4, v0.0.5, v0.0.6, all of data format 2) and
+`expected.jsonl`, its logical content in the export format.
+`TestCompatFixtures` opens a copy of each one, which upgrades it to format
+3 (each collection's `index.db` is built from its data segments and the
+hint files and index snapshots are removed), compares the export with
+`expected.jsonl`, checks the indexes against a scan, and writes and
+reopens. Every release adds its fixture, generated
 by the release's own code with `test/compat/gen`; the procedure is in
 [`pkg/db/testdata/compat/README.md`](pkg/db/testdata/compat/README.md).
 Never edit or regenerate an existing fixture.
@@ -201,6 +205,25 @@ TMPDIR=$HOME/.cache/cachydb-bench go test -run '^$' -bench . -benchmem ./pkg/db/
 - the cost of a one-document flush at 1k and 100k documents;
 - cached and uncached reads;
 - indexed and scanning queries.
+
+The scale benchmark (`pkg/db/scale_bench_test.go`) is opt-in: it does not
+run in the default `go test` path or in `test.yml`; the nightly workflow
+runs it once at 1M documents and only reports the numbers. It loads N
+documents with three indexes and reports the query times of the
+plan-013 targets, the heap after reopen, the reopen time, the file sizes,
+cold-cache times, and flushes under sustained random updates:
+
+```bash
+CACHYDB_SCALE_DOCS=1000000 TMPDIR=$HOME/.cache/cachydb-bench go test -run '^$' -bench 'Scale$' -benchtime 1x -timeout 30m ./pkg/db/
+CACHYDB_SCALE_DOCS=1000000 CACHYDB_SCALE_UUID_IDS=1 ...    # 36-byte random ids
+CACHYDB_SCALE_COLLECTIONS=300 TMPDIR=$HOME/.cache/cachydb-bench go test -run '^$' -bench 'ScaleCollections' -benchtime 1x ./pkg/db/
+```
+
+A 1M run takes three to five minutes and about 1.5 GB of disk; a 10M run
+about half an hour and up to 9 GB (use `-timeout 120m`). The report is
+printed to stdout; a missed target prints `MISSED` but does not fail the
+benchmark. The recorded runs and the knobs are in
+[`dev-docs/DEVELOPMENT.md`](dev-docs/DEVELOPMENT.md#scale-benchmark).
 
 Run them on a real disk. If `$TMPDIR` is a tmpfs (as `/tmp` often is),
 fsync costs nothing and the numbers are misleading, hence the `TMPDIR`

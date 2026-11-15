@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-CachyDB is a lightweight document database with a built-in MCP (Model Context Protocol) server, written in Go. Single binary, no external services. `pkg/db` is an embeddable engine: a group-commit write-ahead log plus append-only, zstd-compressed data segments, with keys and indexes in RAM. Supported platforms: Linux and macOS (the BSDs also get the data-directory lock; Windows, Solaris, illumos, and AIX compile, Windows is unsupported at runtime).
+CachyDB is a lightweight document database with a built-in MCP (Model Context Protocol) server, written in Go. Single binary, no external services. `pkg/db` is an embeddable engine: a group-commit write-ahead log plus append-only, zstd-compressed data segments, with the key table and secondary indexes on disk in one bbolt file per collection (`index.db`), so the heap does not grow with the document count (data format 3; format-2 directories upgrade on first open). Supported platforms: Linux and macOS (the BSDs also get the data-directory lock; Windows, Solaris, illumos, and AIX compile, Windows is unsupported at runtime).
 
 ## Quick Reference
 
@@ -13,7 +13,7 @@ CachyDB is a lightweight document database with a built-in MCP (Model Context Pr
 - **Build**: `go build -o cachydb`
 - **Test**: `go test -race ./...`
 - **Lint**: `test -z "$(gofmt -l .)" && go vet ./... && go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...`
-- **Benchmarks**: `go test -run '^$' -bench . -benchmem ./pkg/db/...`
+- **Benchmarks**: `TMPDIR=$HOME/.cache/cachydb-bench go test -run '^$' -bench . -benchmem ./pkg/db/...` (real disk; the 1M/10M scale benchmark is opt-in: `CACHYDB_SCALE_DOCS=1000000`, see `dev-docs/DEVELOPMENT.md` "Scale benchmark")
 - **Run**: `./cachydb` (stdio) or `./cachydb -t http -p 7601` (HTTP at `/mcp`, health at `/healthz`)
 - **Docker**: `docker run -d -p 7601:7601 -v cachydb-data:/data hovhannespalyan/cachydb` (HTTP; `-e TRANSPORT=stdio -i` for stdio); released by pushing a `vX.Y.Z` tag
 - **Data dir**: `~/.cachydb`; override with `-R` or `ROOT_DIR` (flag > env > default; also `-d`/`DB_NAME`, `-t`/`TRANSPORT`, `-p`/`PORT`)
@@ -31,10 +31,10 @@ Detailed docs live in `dev-docs/`. **Read before modifying code.**
 |----------|----------|
 | [`dev-docs/PROJECT.md`](dev-docs/PROJECT.md) | **Main doc**: overview, architecture, directory structure, data flow, compatibility |
 | [`dev-docs/DATABASE_ENGINE.md`](dev-docs/DATABASE_ENGINE.md) | `pkg/db` public API, options, errors, documents, schemas, query and index semantics, migrations |
-| [`dev-docs/STORAGE.md`](dev-docs/STORAGE.md) | On-disk layout and formats, WAL, data segments, flush and checkpoints, recovery, compaction, lock order |
+| [`dev-docs/STORAGE.md`](dev-docs/STORAGE.md) | On-disk layout and formats, WAL, data segments, `index.db`, flush and checkpoints, recovery, format upgrade, compaction, lock order, test hooks |
 | [`dev-docs/MCP_SERVER.md`](dev-docs/MCP_SERVER.md) | The 21 MCP tools, typed schemas and annotations, instructions and docs resources, transports, per-session `use_database`, errors |
 | [`dev-docs/CLI.md`](dev-docs/CLI.md) | Commands (incl. `docs`, `version --json`, `healthcheck`, `client`, `utils export/import/find/get`), flags, environment variables, known issues |
-| [`dev-docs/DEVELOPMENT.md`](dev-docs/DEVELOPMENT.md) | Rules, patterns, testing, benchmarks, releasing (Docker image), known limitations |
+| [`dev-docs/DEVELOPMENT.md`](dev-docs/DEVELOPMENT.md) | Rules, patterns, testing, benchmarks (incl. the recorded 1M/10M scale runs), releasing (Docker image), known limitations |
 
 Start with `dev-docs/PROJECT.md`, then `dev-docs/DEVELOPMENT.md`. User-facing docs: [`README.md`](README.md), [`DOCKERHUB.md`](DOCKERHUB.md) (Docker Hub overview), [`TESTING.md`](TESTING.md), [`examples/README.md`](examples/README.md).
 
@@ -46,9 +46,9 @@ Start with `dev-docs/PROJECT.md`, then `dev-docs/DEVELOPMENT.md`. User-facing do
 | `pkg/db/document.go` | Document write path (WAL commit point; `UpdateWith`, `Replace`, `DeleteWith`, conditions), read path, candidate selection |
 | `pkg/db/query.go`, `plan.go`, `compare.go`, `index.go`, `unique.go` | `Find` (OR groups, sort, projection), `CountDocuments`, `Distinct`; query plans and snapshots; compiled operators and `$now`; index entries; unique indexes (field paths: `types.go` `GetPath`) |
 | `pkg/db/collection.go`, `database.go` | Schema/index metadata ops incl. `UpdateSchema` (WAL op 9), `RenameCollection` (WAL op 10), `CopyCollection` |
-| `pkg/db/flush.go`, `recovery.go`, `compact.go` | Parallel flusher and checkpoints, recovery and replay, compaction (incl. small-segment merges) |
+| `pkg/db/flush.go`, `recovery.go`, `upgrade.go`, `compact.go` | Parallel flusher (segment append, then one `index.db` transaction with the checkpoint), recovery (index file open, segment alignment, rebuild) and replay, format 2 → 3 upgrade, compaction (incl. small-segment merges) |
 | `pkg/db/backpressure.go`, `metacp.go` | `MaxPendingBytes` write backpressure; `cachydb.metacp` metadata checkpoint |
-| `pkg/db/internal/wal/`, `internal/segment/` | WAL and data-segment file formats |
+| `pkg/db/internal/wal/`, `internal/segment/`, `internal/idxstore/` | WAL and data-segment file formats; `index.db` (the only bbolt importer: key table, index entries and key encoding, counters, checkpoint) |
 | `internal/mcp/server.go` | MCP tool handlers, sessions, transports |
 | `internal/mcp/tools.go`, `docs.go` | Tool definitions (typed schemas, annotations), instructions, docs resources |
 | `internal/docs/` | Embedded agent docs topics |

@@ -16,8 +16,11 @@ defer e.Close(ctx)                 // final flush, releases the data-dir lock
 
 `Open` takes the exclusive data-directory lock (`<Dir>/cachydb.lock`), checks
 the on-disk format, runs recovery, and starts the background flusher,
-compactor, and WAL retention. `Close` waits for in-flight calls, flushes
-everything, writes index snapshots, closes the WAL, and releases the lock.
+compactor, and WAL retention. A data directory of format 2 (v0.0.4–v0.0.6)
+is upgraded to format 3 in place on the first `Open`, one-way (see
+[STORAGE.md](STORAGE.md#format-file-and-old-data-directories)). `Close`
+waits for in-flight calls, flushes everything, closes the segments, the
+index files, and the WAL, and releases the lock.
 It is idempotent. Calls after `Close` return `ErrClosed`.
 
 ### Options (`pkg/db/options.go`)
@@ -151,8 +154,9 @@ type Document struct {
   JSON, so **integers come back as `float64`**, Go slices as `[]any`, and
   structs as `map[string]any`, in the library as well as over MCP.
 - `_id` is never a data field: `Insert` rejects `"_id"` in `Data` (set
-  `Document.ID`), and `Update` cannot change it. Ids are strings up to
-  65535 bytes.
+  `Document.ID`), and `Update` cannot change it. Ids are non-empty strings
+  up to 31,742 bytes (a key of the index file holds at most 32,768 bytes;
+  before format 3 the limit was 65,535).
 - `Clone()` is a deep copy.
 - `GetPath(path)` resolves a field name the way queries and indexes do
   (see [Field paths](#field-paths)); `GetValue(name)` is top-level only
@@ -284,7 +288,7 @@ One driver produces the candidates of the documents in `index.db`
 | `index range` | `gt`/`gte`/`lt`/`lte`, `starts_with` (prefix range), `exists true` (only while the index's `complex` and `arrays` counters are 0) | value, then `_id` |
 | `or union` | every `Any` group has a served filter | `_id` (value-ordered groups are collected first) |
 | `index sort` | `Sort` is one key on an indexed field, the index's `complex`, `truncated`, and `arrays` counters are 0, and no filter is served (or the query has a limit and the best filter is large) | the requested order, both directions |
-| `keydir` | none of the above | `_id`, both directions |
+| `keydir` (a walk of the key table) | none of the above | `_id`, both directions |
 | `none` | an AND filter can match nothing | — |
 
 Among served filters the smallest estimate wins: a cursor count of the

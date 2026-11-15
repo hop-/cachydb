@@ -24,7 +24,7 @@ A lightweight document-based database with Model Context Protocol (MCP) support,
 - **Export and client**: JSON Lines export/import (`cachydb utils export|import`), offline `utils find|get`, and `cachydb client` to call any tool of a running HTTP server from the shell
 - **MCP integration**: Built-in MCP server supporting stdio and Streamable HTTP transports, with `use_database` per session
 - **Durable writes**: Every acknowledged write is fsynced to a write-ahead log; concurrent writes share fsyncs (group commit)
-- **Append-only storage**: zstd-compressed, append-only data segments with background compaction; only keys and indexes are kept in RAM
+- **Append-only storage**: zstd-compressed, append-only data segments with background compaction; the key table and indexes live on disk in one index file per collection, so memory use does not grow with the number of documents (tested with 10 million)
 - **Crash recovery**: Restart always recovers, including after `kill -9`, power loss, or a torn file tail
 - **Embeddable**: `pkg/db` is a Go library (`db.Open`)
 
@@ -537,16 +537,16 @@ Developer documentation is in [`AGENTS.md`](AGENTS.md) and [`dev-docs/`](dev-doc
 
 ### Data Segments
 
-- **Append-only**: a background flusher (every second, or when 16 MiB of changes accumulate) appends only the changed documents and deletion tombstones to the collection's active segment, followed by a checkpoint marker, with one fsync. A one-document change never rewrites a collection. Up to four collections are flushed in parallel.
+- **Append-only**: a background flusher (every second, or when 16 MiB of changes accumulate) appends only the changed documents and deletion tombstones to the collection's active segment with one fsync, then updates the collection's index file in one atomic transaction. A one-document change never rewrites a collection. Up to four collections are flushed in parallel.
 - **Backpressure**: when the disk is slower than the writers, writes wait while the unflushed changes of all collections exceed `MaxPendingBytes` (by default 4 × the 16 MiB memtable size × half the CPUs, at most 1 GiB), so memory stays bounded
 - **Compression**: documents are compressed with zstd
-- **Keys in RAM**: an in-memory key directory maps each document id to its location on disk; documents are read on demand through an LRU cache of decoded documents (`CACHE_SIZE`, default 64 MiB), so a cached read skips the disk and the JSON decoding
+- **Index file**: each collection's `index.db` (a B+tree file, [bbolt](https://github.com/etcd-io/bbolt)) holds the key table (document id → location on disk), every secondary index, the document count, and the checkpoint; the flusher changes them together in one transaction. Documents are read on demand through an LRU cache of decoded documents (`CACHE_SIZE`, default 64 MiB), so a cached read skips the disk and the JSON decoding
 - **Compaction**: a background task rewrites sealed segments with many dead records (superseded or deleted versions) to reclaim space, and merges runs of small segments
-- **Hint files and index snapshots**: speed up startup; both are rebuilt automatically if missing or damaged
+- **Self-repairing index**: a missing or damaged `index.db` is rebuilt from the data segments on startup (logged as a warning)
 
 ### Recovery
 
-On startup CachyDB loads the key directories and indexes, then replays the WAL from each collection's last checkpoint (and, for metadata, from the `cachydb.metacp` checkpoint). Replay is idempotent, so a crash at any point — including during a flush or compaction — loses no acknowledged write. A clean shutdown flushes everything, so the next start has nothing to re-apply.
+On startup CachyDB checks the retained WAL and opens each collection's index file without reading the data segments, so startup time depends on the WAL size (bounded by `WAL_RETENTION_SIZE`), not on the number of documents; then it replays the WAL from each collection's last checkpoint (and, for metadata, from the `cachydb.metacp` checkpoint). Replay is idempotent, so a crash at any point — including during a flush or compaction — loses no acknowledged write. A clean shutdown flushes everything, so the next start has nothing to re-apply.
 
 ### Storage Format
 
@@ -563,10 +563,9 @@ Data is stored in `~/.cachydb/` (or the directory given with `-R`):
     ├── db.meta                     # Database metadata (schema version)
     └── users/                      # Collection
         ├── coll.meta               # Schema and index definitions
+        ├── index.db                # Key table and indexes (B+tree file)
         ├── seg-000001.data         # Sealed data segment (zstd records)
-        ├── seg-000001.hint         # Hint file for fast startup
-        ├── seg-000002.data         # Active data segment
-        └── idx-email_idx.snap      # Index snapshot
+        └── seg-000002.data         # Active data segment
 ```
 
 The files are binary (except the small JSON metadata files). See [`dev-docs/STORAGE.md`](dev-docs/STORAGE.md) for the formats.

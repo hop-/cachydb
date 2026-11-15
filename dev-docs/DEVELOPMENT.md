@@ -32,17 +32,18 @@ go test -race ./...                       # all tests
 | `internal/mcp/tools.go`, `docs.go` | Tool definitions (typed schemas, annotations, examples); instructions, docs resources, generated tools topic | New tools, tool descriptions |
 | `internal/docs/` | Embedded agent docs topics (`topics/*.md`) | Documentation an agent needs |
 | `pkg/db/engine.go`, `database.go`, `collection.go` | Public API, metadata operations | API changes |
-| `pkg/db/document.go` | Write path (`UpdateWith`, `Replace`, `DeleteWith`, conditions), read path, candidate selection | Document operations |
-| `pkg/db/query.go` | `Find` (OR groups, sort heap, projection), `CountDocuments`, `Distinct` | Query execution |
-| `pkg/db/compare.go`, `index.go` | Comparison, operators, `$now`; index keys (per element, marker keys) | New operators, index behavior |
+| `pkg/db/document.go` | Write path (`UpdateWith`, `Replace`, `DeleteWith`, conditions), read path | Document operations |
+| `pkg/db/query.go`, `plan.go` | `Find` (OR groups, sort heap, projection), `CountDocuments`, `Distinct`; snapshots, drivers, plan choice | Query execution |
+| `pkg/db/compare.go`, `index.go`, `unique.go` | Compiled operators, `$now`; index entries per document version, index builds; unique indexes | New operators, index behavior |
 | `pkg/db/types.go`, `schema.go` | Public types, schema validation | New field types |
-| `pkg/db/flush.go`, `recovery.go`, `compact.go` | Flush, recovery, compaction | Durability logic (read [STORAGE.md](STORAGE.md) first) |
+| `pkg/db/flush.go`, `recovery.go`, `upgrade.go`, `compact.go` | Flush (segment append + index transaction), recovery and index-file rebuild, format 2 → 3 upgrade, compaction | Durability logic (read [STORAGE.md](STORAGE.md) first) |
 | `pkg/db/backpressure.go`, `metacp.go` | `MaxPendingBytes` write backpressure; `cachydb.metacp` metadata checkpoint | Durability logic |
 | `pkg/db/meta.go`, `format.go` | Meta files, format file, old-format detection | On-disk layout changes |
 | `pkg/db/migration.go` | Schema-version migrations | New migrations |
 | `pkg/db/options.go` | `Options` and defaults | Tuning |
 | `pkg/db/internal/wal/` | WAL format, group commit, retention | WAL changes |
-| `pkg/db/internal/segment/` | Data segments, hints, index snapshots | Data format changes |
+| `pkg/db/internal/segment/` | Data segments, full and header-only scans | Data format changes |
+| `pkg/db/internal/idxstore/` | `index.db` (the only bbolt importer): buckets, key encoding, counters, `Check` | Index-file layout (bump its layout `formatVersion`) |
 | `pkg/db/internal/fsutil/`, `cache/` | Atomic writes, dir fsync, flock; LRU | Rarely |
 | `Dockerfile`, `.dockerignore` | Official image (multi-stage, distroless, non-root, `/data`) | Base-image bumps, build changes; keep the `go:embed` sources in the context |
 | `.github/workflows/docker.yml` | Image lint, smoke test, multi-arch publish, Docker Hub overview sync | Release process changes |
@@ -63,7 +64,9 @@ Follow the Go conventions used throughout the code:
 - **Nothing in `pkg/db` writes to stdout.** Log through `Options.Logger`
   (`slog`). In stdio mode stdout is the MCP channel; the binary logs to
   stderr.
-- Never hold `Collection.mu` across file I/O. Respect the lock order in
+- Never hold `Collection.mu` across file I/O or an `index.db` transaction,
+  and never hold an `index.db` read transaction across a WAL append or while
+  starting an update. Respect the lock order in
   [STORAGE.md](STORAGE.md#concurrency-and-lock-order).
 - Format with `gofmt`; lint with `go vet` and `staticcheck` (there is no
   golangci-lint config). `staticcheck` is pinned and run with `go run`, so
@@ -125,16 +128,29 @@ Follow the Go conventions used throughout the code:
 
 ### Changing an on-disk format
 
-The WAL, data segment, hint, and snapshot headers carry a version; the data
-directory has `cachydb.format` (`FormatVersion` in `pkg/db/format.go`).
-Bump the relevant version and decide how old files are handled: old data
-directories currently fail fast with `ErrIncompatibleDataDir` rather than
-being converted. Sidecars that can be rebuilt (index snapshots, plan 004:
-version 2) are simply rejected and rebuilt. Never change the numeric
-values of WAL ops (1–10) or record types; new metadata ops need a replay
-case in `replayRecord` and crash tests at `hookMetaWrite`. The upgrade
-fixtures (`TestCompatFixtures`) must keep passing; a new decoder gets a
-fuzz target next to it.
+The WAL and data segment headers carry a version, `index.db` has a layout
+version in its `meta` bucket (`formatVersion` in
+`pkg/db/internal/idxstore`), and the data directory has `cachydb.format`
+(`FormatVersion` in `pkg/db/format.go`, currently 3). Bump the relevant
+version and decide how old files are handled:
+
+- `index.db` is derived data: an index file with another layout version
+  fails the open check and is rebuilt from the segments with a WARN, so a
+  layout change needs no converter (but costs a rebuild on first open).
+- A `FormatVersion` bump needs an upgrade step: `checkDataDir` reports the
+  previous version as upgradable and `recover` runs the step after reading
+  the metadata (`upgradeFormat` in `pkg/db/upgrade.go` is the 2 → 3 step:
+  build every `index.db`, then delete the old files, then write the format
+  file last, so a crash restarts it). Versions older than the one before
+  fail with `ErrIncompatibleDataDir`; pre-v0.0.4 directories have no
+  converter at all.
+
+Never change the numeric values of WAL ops (1–10) or record types (a reader
+still accepts type 3, the old checkpoint marker); new metadata ops need a
+replay case in `replayRecord` and crash tests at `hookMetaWrite`. The
+upgrade fixtures (`TestCompatFixtures`, one per release) must keep
+passing, through the upgrade; a new decoder gets a fuzz target next to
+it.
 
 ### Adding a migration
 
@@ -184,10 +200,11 @@ Heavy layers, opt-in (all run nightly in CI; details and commands in
 
 | Layer | Where | Run | Knobs |
 | --- | --- | --- | --- |
-| Fuzzing | `fuzz_test.go` in `pkg/db`, `pkg/db/internal/{wal,segment}`, `internal/exportfmt` (11 targets) | `go test -run '^$' -fuzz '^FuzzX$' -fuzztime 30s ./<pkg>` | `-fuzztime`; crashers go to `testdata/fuzz/<Target>/` and are committed |
+| Fuzzing | `fuzz_test.go` in `pkg/db`, `pkg/db/internal/{wal,segment}`, `internal/exportfmt` (9 targets) | `go test -run '^$' -fuzz '^FuzzX$' -fuzztime 30s ./<pkg>` | `-fuzztime`; crashers go to `testdata/fuzz/<Target>/` and are committed |
 | Model test | `pkg/db/model_test.go` (`TestModel`) | `go test -run TestModel ./pkg/db/` (2 seeds × 300 ops by default) | `CACHYDB_MODEL_SEEDS`, `CACHYDB_MODEL_OPS`, `CACHYDB_MODEL_SEED` (reproduce) |
 | Upgrade fixtures | `pkg/db/testdata/compat/<version>/`, `pkg/db/compat_test.go`, generator `test/compat/gen` | part of `go test ./...` | none; one fixture per release |
 | Kill test | `test/e2e/kill_test.go` (build tag `e2e`) | `TMPDIR=$HOME/.cache/cachydb-e2e go test -tags e2e -run TestKill ./test/e2e/` (real disk) | `CACHYDB_E2E_ROUNDS` (default 10), `CACHYDB_E2E_ARTIFACTS` |
+| Scale benchmark | `pkg/db/scale_bench_test.go` (`BenchmarkScale`, `BenchmarkScaleCollections`); nightly runs 1M, report only | see [Scale benchmark](#scale-benchmark) | `CACHYDB_SCALE_DOCS`, `CACHYDB_SCALE_UUID_IDS`, `CACHYDB_SCALE_UPDATE_SECONDS`, `CACHYDB_SCALE_COLLECTIONS` |
 
 CI: `.github/workflows/test.yml` (every pull request and push to
 `master`: lint incl. `staticcheck` and `go mod tidy -diff`, `go test -race` and the quick
@@ -195,8 +212,8 @@ stress loop on the `go.mod` minimum and stable Go, on Linux only (macOS
 runners are too slow; darwin is checked by the cross-build), cross-builds,
 the 85.0% coverage floor) and
 `.github/workflows/nightly.yml` (03:17 UTC: 200-run stress, 100 kill
-rounds, 20 × 5000 model operations, 60s per fuzz target; failure
-artifacts). Keep the default `go test -race ./...` at about a minute:
+rounds, 20 × 5000 model operations, 60s per fuzz target, the 1M scale
+benchmark (reported, not gated); failure artifacts). Keep the default `go test -race ./...` at about a minute:
 put anything heavy behind the `e2e` tag or an env knob.
 
 What exists:
@@ -212,7 +229,7 @@ What exists:
   semantics, names, options, format detection; plan 004: `$now`,
   `SchemaError`, conditional writes (incl. 16-goroutine compare-and-set),
   unset, replace, upsert (`writes_test.go`), element operators, OR groups,
-  element index keys, the old-snapshot upgrade, sort, projection, count,
+  index-driven plans, sort, projection, count,
   distinct (`query_test.go`), describe, `UpdateSchema`, rename (crash after
   the record, crash between the directory rename and the meta write, with
   and without earlier collections of the new name and the metadata
@@ -220,7 +237,7 @@ What exists:
 - `internal/exportfmt`: exact format, round trip, conflict modes, bad
   input.
 - `pkg/db/internal/{wal,segment,cache,fsutil}`: codec, torn-tail,
-  retention, sidecar, LRU, and lock tests.
+  retention, header-only scan, LRU, and lock tests.
 - `internal/mcp`: tool list, per-session `use_database` (in-memory
   transports and HTTP), end-to-end tool flow, errors (`server_test.go`);
   schema enums, annotations, output schemas, `ToolDefinitions` vs. the
@@ -268,6 +285,176 @@ TMPDIR=$HOME/.cache/cachydb-bench go test -run '^$' -bench . -benchmem ./pkg/db/
 
 Run them on a real disk: if `$TMPDIR` is a tmpfs, fsync is free and the
 numbers say nothing about durability costs.
+
+### Scale benchmark
+
+`pkg/db/scale_bench_test.go` holds the opt-in scale benchmarks of plan 013
+(on-disk indexes). They never run in the default `go test` path or in
+`test.yml`; the nightly workflow runs `BenchmarkScale` at 1M documents and
+only reports it. Knobs:
+
+| Variable | Meaning |
+| --- | --- |
+| `CACHYDB_SCALE_DOCS=N` | run `BenchmarkScale` with N documents (unset: skipped) |
+| `CACHYDB_SCALE_UUID_IDS=1` | 36-byte random (v4-shaped) ids instead of `doc-0000000`; the worst case for page fill |
+| `CACHYDB_SCALE_UPDATE_SECONDS=S` | length of the sustained-update phase (default 20; 0 skips it) |
+| `CACHYDB_SCALE_COLLECTIONS=K` | run `BenchmarkScaleCollections`: K collections of 1,000 documents, three indexes each |
+
+```bash
+CACHYDB_SCALE_DOCS=1000000 TMPDIR=$HOME/.cache/cachydb-bench go test -run '^$' -bench 'Scale$' -benchtime 1x -timeout 30m ./pkg/db/
+CACHYDB_SCALE_DOCS=10000000 TMPDIR=$HOME/.cache/cachydb-bench go test -run '^$' -bench 'Scale$' -benchtime 1x -timeout 120m ./pkg/db/
+CACHYDB_SCALE_COLLECTIONS=300 TMPDIR=$HOME/.cache/cachydb-bench go test -run '^$' -bench 'ScaleCollections' -benchtime 1x -timeout 30m ./pkg/db/
+```
+
+`BenchmarkScale` loads N documents of about 330 bytes (JSON) through
+`Insert` with 256 writers, with three indexes in place (`cat`: a string
+with 100 values; `n`: a random number; `tags`: a two-element array, one
+element of 50 values and one of `even`/`odd`), so the load goes through
+the normal flusher. Then it closes, reopens, and reports: the file sizes,
+the reopen time, the Go heap after the open (two forced GCs), each query
+of investigation 003 table E2 (mean over up to 1,000 runs, values varied
+per run, page cache warm), the heap after the queries, flushes under 64
+writers doing random updates of two indexed fields (a flush every 1 s,
+then every 5 s, with the background flusher held off so each flush is
+timed), and, after evicting every file of the directory from the page
+cache with `posix_fadvise(DONTNEED)` (no root needed; Linux amd64/arm64
+only), the cold reopen and each query's first run. The report goes to
+stdout; the targets of approach §11 (at 1M: each `limit 10` query by
+`_id`, indexed value, range with a matching sort, and sort under 1 ms;
+heap after open under 150 MiB; reopen under 1 s) print `met` or `MISSED`
+but never fail the run. Data lives in `b.TempDir()` and is removed.
+
+Recorded runs (reference laptop: i7-1165G7, 8 threads, 16 GB RAM, NVMe,
+btrfs on LUKS, Go 1.27.4; single runs, 2026-11-15). "Before" is the
+format-2 engine with keys and indexes in RAM (investigation 003, E2, 1M
+documents of about 330 bytes, three indexes).
+
+| Measure | Before, 1M (E2) | 1M, sequential ids | 1M, UUID ids | 10M, sequential ids |
+| --- | --- | --- | --- | --- |
+| Load (`Insert`, 256 writers, indexes in place) | 11.6k docs/s | 97.9 s (10,213 docs/s) | 243.9 s (4,101 docs/s) | 1,370.1 s (7,299 docs/s) |
+| `index.db` after the load | (67 MiB of snapshots, keys and indexes in RAM) | 385.3 MiB (404 B/doc) | 534.3 MiB (560 B/doc) | 3,621.8 MiB (380 B/doc) |
+| `index.db` after the update phase | — | 550.8 MiB (578 B/doc) | 701.3 MiB (735 B/doc) | 5,174.0 MiB (543 B/doc) |
+| Data segments / WAL | 244 / 329 MiB | 267.4 / 339.9 MiB | 342.2 / 387.5 MiB | 2,683.8 / 984.9 MiB |
+| Reopen after clean close | 2.2 s | 0.55 s | 0.25 s | 1.36 s |
+| Go heap after open | 842 MiB | 16.5 MiB | 16.4 MiB | 16.6 MiB |
+| Go heap after the queries (64 MiB cache full) | 555 MiB | 116.2 MiB | 113.6 MiB | 131.9 MiB |
+| `_id eq` (point lookup) | 1 µs (at 100k) | 35 µs | 14 µs | 316 µs |
+| no filter, `limit 10` (`_id` order) | 372 ms | 18 µs | 6 µs | 9 µs |
+| indexed `eq` (1%), `limit 10` | 1.2 ms | 68 µs | 35 µs | 250 µs |
+| array `has` (2%), `limit 10` | — | 46 µs | 26 µs | 104 µs |
+| indexed 50% match (`has even`), `limit 10` | 95 ms | 43 µs | 20 µs | 39 µs |
+| range with matching sort, `limit 10` | 7.3 s | 65 µs | 42 µs | 167 µs |
+| sort desc, `limit 10` | 7.5 s | 36 µs | 14 µs | 19 µs |
+| range (1%), `limit 10`, `_id` order | 7.3 s | 3.3 ms | 1.7 ms | 38 ms |
+| count, one indexed `eq` (1%) | < 1 µs (at 100k) | 0.91 ms | 0.63 ms | 68 ms |
+| count, two indexed filters | 106 ms | 93 ms | 62 ms | 6.5 s |
+| `contains` (full scan, no match) | 7.3–7.5 s | 10.3 s | 6.5 s | 154 s |
+| Cold cache: reopen | — | 0.64 s | 0.61 s | 1.95 s |
+| Cold cache: `_id eq` / `limit 10` / `eq` / range+sort / sort | — | 1.0 / 0.7 / 5.1 / 6.4 / 4.8 ms | 1.0 / 2.5 / 5.7 / 9.4 / 5.2 ms | 2.2 / 1.2 / 8.2 / 8.8 / 7.9 ms |
+| Flush, random updates, every 1 s | — | 6,755 docs in 0.97 s (150 µs/doc) | 5,747 docs in 1.61 s (285 µs/doc) | 18,011 docs in 43.0 s (1,349 µs/doc) |
+| Flush, random updates, every 5 s | — | 26,030 docs in 3.04 s (96 µs/doc) | 25,332 docs in 3.48 s (127 µs/doc) | 16,359 docs in 27.8 s (1,698 µs/doc) |
+
+Every §11 target is met at 1M with both id kinds (the five sub-millisecond
+queries at 6–68 µs, heap after open 16.4–16.5 MiB, reopen 0.25–0.55 s). The
+heap after open is mostly the process's own (the shared zstd encoder, the
+test binary): it was 14–16 MiB before the open; the engine itself adds
+1–2 MiB (bbolt's free list, per-collection state), also at 10M.
+
+At 10M the heap stays flat (16.6 MiB after open; 131.9 MiB after the
+queries, the 64 MiB document cache included) and the five queries stay
+under 1 ms with a warm page cache (9–316 µs). Queries that read
+documents not read before (`_id eq` on a new id each run, a new range
+bound each run) cost 0.2–0.3 ms per document: the data segments (2.7 GB)
+and `index.db` (3.6–5.2 GB) no longer fit this 16 GB laptop's page cache
+together. Reopen took 1.36 s: the WAL had reached its 1 GiB retention cap
+(a 3M run with the same WAL size reopened in 1.7 s), so a database of any
+size whose WAL is at the cap reopens in about 1.2–1.7 s here; the 1 s
+target holds only while the retained WAL is below about 600 MiB. A first
+10M run of the same program (before a fix that made the benchmark drop
+its loading engine before measuring the heap) gave: load 1,300 s,
+`index.db` 4,094.7 MiB (429 B/doc) after the load and 4,775.6 MiB after
+the updates, reopen 1.23 s, flushes of 5,145 and 24,506 random updates in
+14.4 s and 24.2 s; its heap figure (169 MiB) included the closed loading
+engine and is not valid. The UUID column comes from a run
+before the heap fix described below (its heap figures may include up to
+2 MiB of the closed loading engine). An earlier sequential 1M run, whose
+update phase ran right after the cold-cache eviction, flushed 19,854 and
+25,499 random updates in 9.3 s and 2.7 s: a cold index costs about three
+times as much per update. Reopen time follows
+the retained WAL, which `Open` reads and CRC-checks in full (340–390 MiB
+here, at most `WALRetentionSize`, 1 GiB, by default), not the document
+count. A full scan costs 6–15 µs per document (segment read, zstd, JSON;
+the upper end at 10M, where the segments are read from disk). Counts that cannot be answered from one index read the
+candidates of the smaller filter.
+
+What the runs answered (plan 013 open questions):
+
+- **Fill percent.** Kept bbolt's default 0.5 for the flush transactions,
+  whose keys land at random places in the trees (random ids, random
+  numbers), and 0.9 for index builds, which write sorted keys
+  (`buildIndexes`). The alternative, 0.9 for the flushes too, was measured
+  at 1M with UUID ids (a scratch build, not in the repository): the index
+  file reached 1,014 MiB after the load (1,064 B/doc, against 534 MiB and
+  560 B/doc at 0.5), the load took 359 s instead of 244 s, and flushes of
+  random updates cost 320 and 231 µs per document instead of 285 and 127.
+  A page filled to 90% splits again on the next random insert, so a high
+  fill only pays for append-ordered keys.
+- **Transaction size.** Kept one `index.db` transaction per flush, as large
+  as the memtable it flushes (at most `MemtableSize`, 16 MiB, about 50,000
+  documents of this size; usually what one `FlushInterval` collected). The
+  cost per document falls as transactions grow, because a page touched by
+  several documents is written once and the fsync is shared: at 1M with
+  UUID ids, 5,747 random updates took 1.61 s (285 µs each) and 25,332 took
+  3.48 s (127 µs each). bbolt copies every page a transaction touches, so
+  the file must hold one transaction's copies as free pages, and larger
+  transactions grow it more (575 MiB after the 1 s flushes, 701 MiB after
+  the 5 s flushes, from 534 MiB). Splitting a flush into several
+  transactions would bound that growth but would cost more per document
+  and would need a checkpoint per part; it was not needed for the targets.
+- **Index bytes per document with UUID ids** (three indexes, four entries
+  per document): 560 B after the load (418 B with the 11-byte sequential
+  ids; the prototype of investigation 004 measured 454 B at 1M with short
+  ids). Every key-table key and index entry stores the id, so the 25 extra
+  bytes of a UUID cost about 28 B per entry (five per document here). After random updates the file also holds free pages: 735 B per
+  document after the update phase of the UUID run.
+- **A few hundred collections** (`BenchmarkScaleCollections`, 300
+  collections of 1,000 documents with three indexes each): creating them
+  took 74 s (900 `CreateIndex` calls, each holding the database lock and
+  fsyncing), loading 300,000 documents 28 s. The 300 index files hold
+  197.5 MiB (674 KiB each; a small file is mostly allocation slack). Close
+  took 0.31 s and reopen 0.10 s; the heap after open was 18.3 MiB (10.5
+  KiB per collection over the 15.2 MiB baseline); the process kept one
+  open file per collection (its `index.db`; data segments open on first
+  read) and a virtual size of 1.5 GiB from the 300 bbolt maps (address
+  space, not memory). The first indexed query took 84 µs per collection;
+  one flush pass with one changed document in each of the 300 collections
+  took 416 ms with the default 4 flush workers. Each collection costs a
+  file descriptor and a map, so thousands of collections need a raised
+  `ulimit -n`.
+- **Cold page cache** (measured without root: after a clean close every
+  file of the directory is evicted with `posix_fadvise(DONTNEED)`, then the
+  engine reopens): at 1M the reopen takes 0.5–0.6 s and the first `limit
+  10` queries 0.7–9 ms instead of 6–71 µs (a disk read per B+tree level
+  and per document); a 1% range in `_id` order 12–37 ms; a count of two
+  indexed filters 2.3–2.4 s (it reads 10,000 documents from disk).
+  At 10M: reopen 1.95 s; the first `limit 10` queries 1.0–8.8 ms; a 1%
+  range in `_id` order 186 ms; a count of two indexed filters 25.6 s
+  (100,000 documents read from disk).
+- **Flush under sustained random updates at 10M.** With 64 writers
+  updating `n` and `cat` of random documents (about 4,000 updates/s into
+  the WAL), the flushes took 43.0 s for 18,011 documents and 27.8 s for
+  16,359 (1.3–1.7 ms per document; 0.99–2.8 ms in the first run), about
+  600–1,700 documents per second through the index, against 96–285 µs
+  per document at 1M. Each random update dirties about five leaf pages
+  (key table, two entries in each of two indexes) that a 10M tree no
+  longer shares between updates, every page is copied and written at
+  commit, and pages missing from the page cache are read one at a time
+  inside the transaction. A writer faster than that fills the memtables
+  until `MaxPendingBytes` makes it wait, so sustained random updates of
+  indexed fields at this size run at the index's pace, well below the
+  about 5,000 per second assumed when the design was accepted. Inserts in
+  id order are much cheaper (the load averaged 7,300 documents per
+  second).
 
 ### Manual and MCP testing
 
@@ -353,6 +540,7 @@ tag). Keep `DOCKERHUB.md` under 25,000 bytes (Docker Hub's limit).
 | `github.com/modelcontextprotocol/go-sdk` | v1.8.0 | MCP server/client SDK |
 | `github.com/google/jsonschema-go` | v0.4.3 | Tool input/output schemas (the SDK's schema package) |
 | `github.com/klauspost/compress` | v1.20.4 | zstd for data segments |
+| `go.etcd.io/bbolt` | v1.5.0 | B+tree file `index.db` (key table and indexes); imported only by `pkg/db/internal/idxstore`, pulls in only `golang.org/x/sys` |
 | `github.com/spf13/cobra` | v1.10.2 | CLI framework |
 
 Document ids come from the standard `uuid` package (UUID v7) and the
@@ -363,26 +551,42 @@ environment configuration from `os.Getenv`; neither needs a module.
 1. An idle collection pins the WAL replay start at its last checkpoint
    (`cachydb.metacp` bounds only the metadata records).
 2. `create_index` blocks writes to the whole database while it builds.
-3. Only `eq`, `has`, `has_any`, and `has_all` use indexes; `contains`,
-   range filters, `any` groups, and unindexed fields scan every document
-   (from the memtable, the decoded-document cache, or disk). Sorting by a
-   field other than `_id` reads every match.
-4. No multi-document transactions; no range, unique, full-text, or
-   nested-field indexes; no dot-notation in queries. `copy_collection` is
-   not atomic.
-5. `update_schema` and `create_index` hold the database's metadata lock
+3. Indexes serve `eq`, `in`, `has*`, ranges, `starts_with`, `exists`, OR
+   groups whose every group is served, and a single-key sort on an indexed
+   field without arrays, objects, or cut strings. `contains`, `ne`,
+   unindexed fields, and `_id` ranges walk the key table and read every
+   document (a full scan: about 10 s at 1M documents, see
+   [Scale benchmark](#scale-benchmark)). A multi-key sort, or a sort the
+   index cannot drive, reads every match. Counts with two indexed filters
+   read the candidates of the smaller one.
+4. No multi-document transactions; no compound or full-text indexes; no
+   array positions in field paths. `copy_collection` is not atomic.
+5. `index.db` costs disk and write throughput: 380–560 bytes per document
+   with three indexes after a load (more with long ids or values), more
+   than the compressed documents, and up to about 750 with the free pages
+   random updates leave. A flush applies its changes in one bbolt
+   transaction, which copies every page it touches, so the file keeps
+   about one transaction's worth of free pages and never shrinks (deleted
+   documents free pages for reuse, not disk space). Random updates of indexed
+   fields go through the index at a few thousand documents per second at
+   1M and under 2,000 at 10M (laptop figures, see
+   [Scale benchmark](#scale-benchmark)); faster writers wait on
+   `MaxPendingBytes`. Query speed depends on the OS
+   page cache: an uncached lookup costs a disk read per tree level.
+6. Document ids are at most 31,742 bytes (65,535 before format 3).
+7. `update_schema` and `create_index` hold the database's metadata lock
    while they read every document. `rename_collection` flushes the
    collection under it.
-6. The exact object `{"$now": true}` cannot be stored literally (it
+8. The exact object `{"$now": true}` cannot be stored literally (it
    becomes a timestamp).
-7. No authentication or TLS on the HTTP transport (`/mcp` and `/healthz`).
+9. No authentication or TLS on the HTTP transport (`/mcp` and `/healthz`).
    `utils export` and `client export` hold a whole collection's documents
    in memory at once (offline) or page with `skip` (client).
-8. Single node only. The data-directory lock needs `flock` (Linux, macOS,
-   the BSDs); elsewhere (Windows, Solaris, illumos, AIX) it is a no-op with
-   a logged warning, and Windows is unsupported at runtime.
-9. A single durable insert is fsync-bound (a few ms); throughput comes
-   from concurrent writers sharing fsyncs. There is no relaxed-durability
-   mode.
-10. stdio: closing stdin exits 0, but the SDK drops the responses of
+10. Single node only. The data-directory lock needs `flock` (Linux, macOS,
+    the BSDs); elsewhere (Windows, Solaris, illumos, AIX) it is a no-op with
+    a logged warning, and Windows is unsupported at runtime.
+11. A single durable insert is fsync-bound (a few ms); throughput comes
+    from concurrent writers sharing fsyncs. There is no relaxed-durability
+    mode.
+12. stdio: closing stdin exits 0, but the SDK drops the responses of
     requests still in flight.

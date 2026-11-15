@@ -4,8 +4,8 @@
 
 CachyDB is a lightweight document database with a built-in Model Context
 Protocol (MCP) server. It stores JSON documents in collections inside
-databases, supports optional schema validation and multi-value secondary
-indexes, and exposes everything as MCP tools for AI assistants. It ships as
+databases, supports optional schema validation and ordered secondary
+indexes kept on disk (unique and nested-path ones too), and exposes everything as MCP tools for AI assistants. It ships as
 one Go binary; `pkg/db` is also usable as an embedded Go library.
 
 Supported platforms: **Linux and macOS** (the BSDs also get the
@@ -47,13 +47,14 @@ server instructions, and `cachydb://docs/<topic>` resources.
 │ pkg/db  Engine → Database → Collection                       │
 │  validate → docLock → WAL append+fsync (commit) → memtable   │
 │  ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌────────────────┐  │
-│  │ query /  │ │ schema    │ │ indexes  │ │ LRU cache      │  │
-│  │ compare  │ │ validation│ │ (multi)  │ │ (decoded docs) │  │
+│  │ query /  │ │ schema    │ │ plans /  │ │ LRU cache      │  │
+│  │ compare  │ │ validation│ │ unique   │ │ (decoded docs) │  │
 │  └──────────┘ └───────────┘ └──────────┘ └────────────────┘  │
 │  background: flusher · compactor · WAL retention             │
 │  internal/wal       group-commit log, retention              │
-│  internal/segment   append-only zstd data segments, hints,   │
-│                     index snapshots                          │
+│  internal/segment   append-only zstd data segments           │
+│  internal/idxstore  index.db (bbolt): key table, indexes,    │
+│                     count, checkpoint (one per collection)   │
 │  internal/fsutil    atomic writes, dir fsync, flock          │
 │  internal/cache     byte-bounded LRU                         │
 └──────────────────────────────────────────────────────────────┘
@@ -77,22 +78,25 @@ cachydb/
 │   ├── engine.go            # Engine, Open/Close, database create/drop
 │   ├── database.go          # Database, collection create/drop/rename/copy
 │   ├── collection.go        # Collection state, CreateIndex/DropIndex, Schema/Indexes, UpdateSchema
-│   ├── document.go          # write path (UpdateWith, Replace, DeleteWith, conditions), read path, candidates
-│   ├── query.go             # Find (OR groups, sort, projection), CountDocuments, Distinct
-│   ├── flush.go             # parallel flusher, checkpoint markers, low-water mark
+│   ├── document.go          # write path (UpdateWith, Replace, DeleteWith, conditions), read path
+│   ├── query.go plan.go     # Find (OR groups, sort, projection), CountDocuments, Distinct; snapshots, plans
+│   ├── unique.go            # unique indexes (striped value locks, pending values)
+│   ├── flush.go             # parallel flusher, index transaction, checkpoint, low-water mark
 │   ├── backpressure.go      # MaxPendingBytes write backpressure
 │   ├── metacp.go            # cachydb.metacp metadata checkpoint
-│   ├── recovery.go          # load at Open, idempotent WAL replay
+│   ├── recovery.go          # load at Open (index.db, segment alignment, rebuild), idempotent WAL replay
+│   ├── upgrade.go           # format 2 -> 3 upgrade at Open
 │   ├── compact.go           # background compaction
-│   ├── compare.go index.go  # operators, $now, multi-value index with per-element keys
+│   ├── compare.go index.go  # compiled operators, $now; index entries and builds
 │   ├── types.go schema.go   # Document, Schema, Query; validation
 │   ├── meta.go format.go    # db.meta / coll.meta, cachydb.format
 │   ├── migration.go         # schema-version migrations
 │   ├── options.go errors.go names.go hooks.go
 │   ├── bench_test.go        # performance benchmarks
+│   ├── scale_bench_test.go  # opt-in 1M/10M scale benchmark (CACHYDB_SCALE_DOCS)
 │   ├── model_test.go        # randomized test against a reference model
 │   ├── testdata/compat/     # upgrade fixtures written by v0.0.4, v0.0.5, ...
-│   └── internal/{wal,segment,fsutil,cache}/
+│   └── internal/{wal,segment,idxstore,fsutil,cache}/
 ├── examples/
 │   ├── basic/main.go        # embed pkg/db as a library
 │   └── mcp-client/main.go   # drive the binary over stdio MCP
@@ -104,7 +108,7 @@ cachydb/
 │   └── compat/              # upgrade-fixture generator (gen/) and helpers
 └── .github/workflows/
     ├── test.yml             # PR/master CI: lint, race tests, cross-builds, coverage floor
-    ├── nightly.yml          # stress, kill test, long model run, fuzzing
+    ├── nightly.yml          # stress, kill test, long model run, fuzzing, 1M scale benchmark
     └── docker.yml           # PR smoke test; v* tags publish hovhannespalyan/cachydb
 ```
 
@@ -117,13 +121,16 @@ cachydb/
    is applied in memory or acknowledged. Writes are visible only once
    durable.
 3. **Group commit**: concurrent writers share one fsync; no artificial delay.
-4. **Append-only data**: flushes append only changed documents plus a
-   checkpoint marker; the cost scales with the change, not the collection.
+4. **Append-only data**: flushes append only changed documents, then
+   apply the key table, index entries, and checkpoint in one `index.db`
+   transaction; the cost scales with the change, not the collection.
 5. **Last writer wins by WAL offset**: every record carries its WAL offset,
-   so loading and replay are order-independent and idempotent.
-6. **Bounded RAM**: only keys, indexes, memtables, and the LRU cache live in
-   memory; documents are read from disk. Unflushed memtable bytes are
-   bounded by `MaxPendingBytes` (writers wait while over it).
+   so rebuilds and replay are order-independent and idempotent.
+6. **Bounded RAM**: keys and indexes live on disk in `index.db` (served by
+   the OS page cache); only memtables, the LRU cache, and small
+   per-collection state live in memory, so the heap does not grow with the
+   document count. Unflushed memtable bytes are bounded by
+   `MaxPendingBytes` (writers wait while over it).
 7. **Clean lifecycle**: exclusive data-directory lock, graceful shutdown
    with a final flush, only MCP traffic on stdout (logs go to stderr via
    `slog`).
@@ -137,22 +144,26 @@ MCP handler → Collection.Insert(ctx, doc)
   0. wait while unflushed bytes >= MaxPendingBytes (ctx-aware, no lock held)
   1. Database.mu (shared) → docLock(id) → read current version
   2. check the "if" condition, build after-image, JSON round-trip, schema validation
-  3. WAL append; group commit fsync                 ← commit point
-  4. apply under Collection.mu: memtable, indexes, cache invalidation, count
-  5. return id
+  3. unique indexes: stripe locks, check overlay + index.db
+  4. WAL append; group commit fsync                 ← commit point
+  5. apply under Collection.mu: memtable, pending unique values, cache invalidation, count
+  6. return id
 background flusher (every 1s, memtable > 16 MiB, or writers waiting;
 up to FlushWorkers collections in parallel):
-  memtable → active data segment + checkpoint marker, one fsync → keydir
+  memtable → active data segment, one fsync
+  → one index.db transaction: key table, index entries, count, checkpoint
 ```
 
 ### Read (e.g. `find_documents`)
 
 ```
 Collection.Find(ctx, query)
-  candidates: smallest index-backed set (eq, has, has_any, has_all), else all live ids; sorted by _id
-  per id: memtable → flushing → LRU cache (decoded) → keydir → ReadAt + zstd + JSON
-  filter (AND + OR groups); _id order: skip, stop at skip+limit;
-  other sort: bounded heap of skip+limit; project fields; return deep copies
+  compile filters once; capture the overlay (memtable + flushing), open one index.db read transaction
+  driver: _id lookup | index (eq, in, has*, exists) | index range (ranges, starts_with)
+          | OR union | index sort walk | key-table walk  (smallest capped estimate)
+  stream ids merged with the overlay; documents from LRU cache (decoded) or ReadAt + zstd + JSON
+  re-check every filter; stop at skip+limit when the driver gives the order,
+  else bounded heap of skip+limit; project fields; return deep copies
 ```
 
 ### Startup
@@ -161,7 +172,8 @@ Collection.Find(ctx, query)
 cmd.Execute → config.Init → cobra → runApp
   app.Builder.Build → db.Open
      lock cachydb.lock → check cachydb.format → open WAL (torn-tail fix)
-     → load meta, keydirs, indexes → replay WAL from
+     → load meta → (format 2: upgrade, build every index.db)
+     → open each index.db, align segments (rebuild if missing/damaged) → replay WAL from
        min(cachydb.metacp + 1, collection floors) → write cachydb.metacp
        → start flusher, compactor, retention
   → mcp.NewServer (creates the default database, -d/--db or DB_NAME,
@@ -174,14 +186,19 @@ cmd.Execute → config.Init → cobra → runApp
 ```
 SIGINT/SIGTERM (or stdin EOF for stdio) → transport returns
   → App.Stop (10s timeout): close MCP sessions → Engine.Close
-     (final flush, index snapshots, WAL close, lock release)
+     (final flush, close segments, index files, and WAL, lock release)
 ```
 
 ## Compatibility
 
+- Data directories of format 2 (v0.0.4–v0.0.6) are **upgraded** to format
+  3 on the first `Open`: each collection's `index.db` is built from its data
+  segments, then the hint files and index snapshots are deleted. No document
+  is rewritten, and the upgrade is one-way (copy or export first). See
+  [STORAGE.md](STORAGE.md#format-file-and-old-data-directories).
 - Data directories from the earlier storage format (JSON / `.data`+`.idx`
-  files, `wal.checkpoint`) are **not readable**. `Open` fails with
-  `ErrIncompatibleDataDir` and asks to move or delete the directory; there
-  is no converter.
+  files, `wal.checkpoint`, before v0.0.4) are **not readable**. `Open` fails
+  with `ErrIncompatibleDataDir` and asks to move or delete the directory;
+  there is no converter.
 - The old Go API (`DatabaseManager`, `StorageManager`, `WALManager`,
   `MigrationManager`) is gone; use `db.Open` and the `*Engine` methods.
