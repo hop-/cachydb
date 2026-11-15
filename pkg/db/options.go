@@ -83,6 +83,13 @@ type Options struct {
 	// testSegWriter, when set (tests only), wraps every active data
 	// segment writer the flusher opens, to inject slow or failing I/O.
 	testSegWriter func(segmentWriter) segmentWriter
+	// testIndexCommit, when set (tests only; set from export_test.go), is
+	// called by the index transaction of a flush and of a compaction swap
+	// (site indexCommitFlush or indexCommitCompact): inside the transaction
+	// before its commit (committed false; an error rolls it back) and after
+	// it committed (committed true; an error is handled as a commit error
+	// after bbolt may already have written the transaction).
+	testIndexCommit func(site string, committed bool) error
 }
 
 // withDefaults fills zero fields with defaults and validates the result.

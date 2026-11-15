@@ -23,6 +23,25 @@ const (
 	hookUpgradeBeforeFormat hookPoint = "upgrade-before-format-write"       // format upgrade 2 -> 3 (Open): after the format-2 files were removed, before cachydb.format is rewritten
 )
 
+// Index-commit sites: the index transactions Options.testIndexCommit can
+// fail without a crash.
+const (
+	indexCommitFlush   = "flush"   // the index transaction of a flush
+	indexCommitCompact = "compact" // the swap transaction of a compaction
+)
+
+// indexCommitHook returns the error opts.testIndexCommit injects at site:
+// with committed false it is called inside the index transaction just
+// before the commit, with committed true just after the transaction
+// committed. It is a no-op (nil) when testIndexCommit is nil, which is
+// always the case outside tests.
+func (e *Engine) indexCommitHook(site string, committed bool) error {
+	if e.opts.testIndexCommit == nil {
+		return nil
+	}
+	return e.opts.testIndexCommit(site, committed)
+}
+
 // errSimulatedCrash is returned (possibly wrapped) by hook when the test
 // hook asks for a crash.
 var errSimulatedCrash = errors.New("simulated crash")

@@ -397,9 +397,17 @@ func (c *Collection) flush() error {
 		if err := c.applyFlush(u, defs, entries, locs, cp, covered); err != nil {
 			return err
 		}
+		if err := e.indexCommitHook(indexCommitFlush, false); err != nil {
+			return err // tests only: the transaction rolls back
+		}
 		committing = true
 		return nil
 	})
+	if err == nil {
+		// Tests only: a commit error after the transaction was written
+		// (committing is true), handled as a real one below.
+		err = e.indexCommitHook(indexCommitFlush, true)
+	}
 	if err != nil {
 		c.afterFailedIndexCommit(st, covered, pre, committing)
 		return fmt.Errorf("flushing collection %q: %w", c.name, c.storeErr(err))

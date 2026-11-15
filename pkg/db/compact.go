@@ -481,9 +481,17 @@ func (c *Collection) runCompaction(ctx context.Context, plan compactPlan) error 
 				return err
 			}
 		}
+		if err := e.indexCommitHook(indexCommitCompact, false); err != nil {
+			return err // tests only: the transaction rolls back
+		}
 		committing = true
 		return nil
 	})
+	if err == nil {
+		// Tests only: a commit error after the transaction was written
+		// (committing is true), handled as a real one below.
+		err = e.indexCommitHook(indexCommitCompact, true)
+	}
 	if err != nil {
 		err = c.storeErr(err)
 		if committing && c.maybeRegistered(st, plan.out) {
