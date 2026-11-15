@@ -274,9 +274,3 @@ func TestReaderRetireWithMissingFileIsNotAnError(t *testing.T) {
 	}
 	r.RetireWith(func(err error) { t.Errorf("unexpected error: %v", err) })
 }
-
-func TestHintPath(t *testing.T) {
-	if got, want := HintPath("/d", 7), hintPath("/d", 7); got != want {
-		t.Errorf("HintPath = %s, want %s", got, want)
-	}
-}

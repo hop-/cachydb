@@ -624,27 +624,9 @@ func TestSegmentRoll(t *testing.T) {
 		t.Fatalf("hook points = %v, want %v", gotPoints, want)
 	}
 
-	// Segment 1 is sealed: hint and snapshot written, segment 2 open.
-	hint, err := segment.ReadHint(c.dir, 1)
-	if err != nil {
-		t.Fatalf("ReadHint(1): %v", err)
-	}
-	if len(hint) != 2 || hint[0].ID != "d" || hint[0].Type != segment.TypePut || hint[1].Type != segment.TypeCheckpoint {
-		t.Errorf("hint of segment 1 = %+v", hint)
-	}
-	fi, err := os.Stat(segment.DataPath(c.dir, 1))
-	if err != nil {
+	// Segment 1 is sealed, segment 2 open.
+	if _, err := os.Stat(segment.DataPath(c.dir, 1)); err != nil {
 		t.Fatal(err)
-	}
-	snap, err := segment.ReadIndexSnapshot(c.dir, "byv")
-	if err != nil {
-		t.Fatalf("ReadIndexSnapshot: %v", err)
-	}
-	if snap.Field != "v" || snap.CoversSeg != 1 || snap.CoversPos != uint64(fi.Size()) || snap.CoversWAL != checkpointOf(c) {
-		t.Errorf("snapshot header = %+v (segment size %d, checkpoint %d)", snap, fi.Size(), checkpointOf(c))
-	}
-	if ids := snap.Keys["s:one"]; !slices.Equal(ids, []string{"d"}) {
-		t.Errorf("snapshot keys = %v", snap.Keys)
 	}
 	if _, err := os.Stat(segment.DataPath(c.dir, 2)); err != nil {
 		t.Errorf("next segment not created: %v", err)
@@ -654,12 +636,6 @@ func TestSegmentRoll(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustFlush(t, c)
-	if _, err := segment.ReadHint(c.dir, 2); err != nil {
-		t.Errorf("ReadHint(2): %v", err)
-	}
-	if snap, err := segment.ReadIndexSnapshot(c.dir, "byv"); err != nil || snap.CoversSeg != 2 || len(snap.Keys["s:two"]) != 1 || len(snap.Keys["s:one"]) != 0 {
-		t.Errorf("snapshot after second roll = %+v, %v", snap, err)
-	}
 	_, deadBytes := segAccounting(t, c)
 	dead1 := deadBytes[1]
 	if dead1 == 0 {
@@ -776,9 +752,15 @@ func TestDeadBytes(t *testing.T) {
 	}
 	mustFlush(t, c)
 
-	var hint []segment.HintEntry // the active segment's records
+	type hintEntry struct { // a record's header and location
+		ID        string
+		Type      segment.RecordType
+		WALOffset uint64
+		Loc       segment.Location
+	}
+	var hint []hintEntry // the active segment's records
 	if _, err := segment.ScanHeaders(c.dir, 1, func(r segment.Record, loc segment.Location) error {
-		hint = append(hint, segment.HintEntry{ID: r.ID, Type: r.Type, WALOffset: r.WALOffset, Loc: loc})
+		hint = append(hint, hintEntry{ID: r.ID, Type: r.Type, WALOffset: r.WALOffset, Loc: loc})
 		return nil
 	}); err != nil {
 		t.Fatal(err)

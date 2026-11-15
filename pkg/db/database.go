@@ -99,7 +99,7 @@ func (d *Database) loadCollection(name string) (*Collection, error) {
 		d.renamePending[name] = c
 	}
 	for _, def := range m.Indexes {
-		c.indexes[def.Name] = newIndex(def.Name, def.Field)
+		c.indexes[def.Name] = def
 	}
 	return c, nil
 }

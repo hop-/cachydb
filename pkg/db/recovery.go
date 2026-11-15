@@ -30,15 +30,17 @@ import (
 //     interrupted between its segment fsync and its index commit leaves
 //     behind). An index file that is missing, damaged, or does not match
 //     the segments is rebuilt from them with a header-only scan
-//     (rebuildIndex), with a warning. The secondary indexes, still in
-//     memory, are built by reading the live documents.
+//     (rebuildIndex), with a warning, secondary indexes included. Index
+//     entries without a definition in coll.meta are dropped, and
+//     definitions without complete entries are built (syncIndexes).
 //  3. Check that the WAL reaches past every offset the data references.
 //  4. Replay the WAL sequentially from the oldest offset any metadata file
 //     or collection may still be missing, applying each record
 //     idempotently (replayRecord). Replayed document changes land in the
 //     memtables and are flushed by the normal flusher.
 //
-// Open does not scan the data segments unless it rebuilds an index file.
+// Open does not scan the data segments unless it rebuilds an index file
+// or builds an index.
 // WAL retention and the flusher start only after replay (see Open).
 
 // recoveryStats counts what recovery did. They are logged and read by
@@ -114,7 +116,7 @@ func (e *Engine) recover(ctx context.Context) error {
 }
 
 // loadCollections opens the index file of every collection, brings its
-// data segments in line with it, and builds its secondary indexes, in
+// data segments and secondary indexes in line with it, in
 // parallel, bounded by GOMAXPROCS. It returns the largest WAL offset the
 // index files reflect.
 func (e *Engine) loadCollections(ctx context.Context) (uint64, error) {
@@ -196,9 +198,9 @@ func readIndexState(st *idxstore.Store) (indexState, error) {
 // is missing, damaged, or does not match them (with a warning); removes
 // what an interrupted flush or compaction left in the directory
 // (alignSegments); takes the checkpoint, the count, and the segment
-// bookkeeping from the index file; and builds the secondary indexes. It
-// returns the largest WAL offset the index file reflects. Callers have
-// not published c yet.
+// bookkeeping from the index file; and brings the index buckets in line
+// with the index definitions (syncIndexes). It returns the largest WAL
+// offset the index file reflects. Callers have not published c yet.
 func (c *Collection) load(ctx context.Context) (uint64, error) {
 	st, is, err := c.openIndex(ctx)
 	if err != nil {
@@ -209,7 +211,7 @@ func (c *Collection) load(ctx context.Context) (uint64, error) {
 	c.checkpoint = is.checkpoint
 	c.mu.Unlock()
 	c.count.Store(is.count)
-	if err := c.buildMemIndexes(ctx); err != nil {
+	if err := c.syncIndexes(ctx, st); err != nil {
 		return 0, fmt.Errorf("loading indexes of collection %q: %w", c.name, err)
 	}
 	return max(is.maxWAL, is.checkpoint), nil
@@ -305,10 +307,6 @@ func (c *Collection) alignSegments(st *idxstore.Store) (is indexState, mismatch 
 		}
 		path := segment.DataPath(c.dir, seg)
 		logger.Info("cachydb: removing a data segment the index file does not register (an interrupted flush or compaction)", "file", path)
-		// A hint file an older version wrote for the segment goes with it.
-		if err := os.Remove(segment.HintPath(c.dir, seg)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return is, "", fmt.Errorf("removing %s: %w", segment.HintPath(c.dir, seg), err)
-		}
 		if err := os.Remove(path); err != nil {
 			return is, "", fmt.Errorf("removing unregistered data segment: %w", err)
 		}
@@ -352,12 +350,14 @@ type rebuildEntry struct {
 // segments and returns it open (approach-index-and-query §8 step 2 and §9
 // step 1). It scans every segment with the header-only scan; per id the
 // record with the highest WAL offset wins and a tombstone removes the id.
-// It writes the key table in ascending id order, in batches, then the
-// count (kept by the index file itself), the per-segment byte accounting,
-// the covered position (the end of the newest segment), the highest WAL
-// offset seen, and the checkpoint: the newest checkpoint marker an older
-// version left in the segments, 0 if there is none. WAL replay then
-// starts at the collection's replay floor and applies what is newer.
+// It writes the key table in ascending id order, in batches (the count is
+// kept by the index file itself), then builds every secondary index of
+// coll.meta from the live documents (buildIndexes), and last the
+// per-segment byte accounting, the covered position (the end of the newest
+// segment), the highest WAL offset seen, and the checkpoint: the newest
+// checkpoint marker an older version left in the segments, 0 if there is
+// none. WAL replay then starts at the collection's replay floor and
+// applies what is newer.
 //
 // The file is created incomplete and marked complete by its last
 // transaction, so a crash in between leaves a file the next Open rebuilds
@@ -456,12 +456,12 @@ func (c *Collection) rebuildIndex(ctx context.Context) (_ *idxstore.Store, err e
 	}
 	newest = nil // release it before the writes
 	slices.SortFunc(live, func(a, b liveKey) int { return cmp.Compare(a.id, b.id) })
-	for len(live) > rebuildBatch {
+	for len(live) > 0 {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		batch := live[:rebuildBatch]
-		live = live[rebuildBatch:]
+		batch := live[:min(len(live), rebuildBatch)]
+		live = live[len(batch):]
 		err := st.Update(func(u *idxstore.WTx) error {
 			for _, k := range batch {
 				if err := u.PutKey(k.id, k.ke); err != nil {
@@ -474,12 +474,10 @@ func (c *Collection) rebuildIndex(ctx context.Context) (_ *idxstore.Store, err e
 			return nil, err
 		}
 	}
+	if err := c.buildIndexes(ctx, st, sortedIndexDefs(c.indexes)); err != nil {
+		return nil, fmt.Errorf("building indexes: %w", err)
+	}
 	err = st.Update(func(u *idxstore.WTx) error {
-		for _, k := range live {
-			if err := u.PutKey(k.id, k.ke); err != nil {
-				return err
-			}
-		}
 		for _, seg := range segs {
 			if err := u.SetSegment(idxstore.SegmentStats{Seg: seg, RecordBytes: total[seg], DeadBytes: total[seg] - liveBytes[seg]}); err != nil {
 				return err
@@ -501,41 +499,6 @@ func (c *Collection) rebuildIndex(ctx context.Context) (_ *idxstore.Store, err e
 	}
 	e.recov.indexFilesRebuilt.Add(1)
 	return st, nil
-}
-
-// buildMemIndexes fills the collection's (empty) secondary indexes by
-// reading every document the key table lists. This is temporary: the
-// indexes are still in memory and no longer have snapshots; they move
-// into the index file next. WAL replay then updates them like any write.
-// Callers have not published c yet.
-func (c *Collection) buildMemIndexes(ctx context.Context) error {
-	if len(c.indexes) == 0 {
-		return nil
-	}
-	st, err := c.indexStore()
-	if err != nil {
-		return err
-	}
-	return st.View(func(tx *idxstore.Tx) error {
-		n := 0
-		cur := tx.KeyCursor()
-		for k, ke, ok := cur.First(); ok; k, ke, ok = cur.Next() {
-			if n++; n%findCtxCheckEvery == 0 {
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-			}
-			id := string(k)
-			doc, err := c.readStored(id, ke)
-			if err != nil {
-				return err
-			}
-			for _, ix := range c.indexes {
-				ix.add(id, doc)
-			}
-		}
-		return cur.Err()
-	})
 }
 
 // replayStart returns the first WAL offset replay must read (§7.2 step 6).
@@ -786,9 +749,11 @@ func (e *Engine) removeAway(dir string, off uint64) error {
 }
 
 // replayIndexOp applies a create_index or drop_index record whose effect
-// coll.meta does not reflect yet. A created index is built from the
-// collection's current state (data segments plus the changes replayed so
-// far); later replayed writes keep it up to date.
+// coll.meta does not reflect yet. A created index is built in the index
+// file from the documents its key table lists, unless the collection
+// already has it on the same field; the replayed changes in the memtable
+// reach it with their flush, which reads the replaced versions' keys from
+// the data segments (forgetBaseLocked). A dropped index loses its entries.
 func (c *Collection) replayIndexOp(ctx context.Context, r wal.Record) error {
 	defs := c.indexDefs()
 	switch r.Op {
@@ -800,11 +765,13 @@ func (c *Collection) replayIndexOp(ctx context.Context, r wal.Record) error {
 		if err := ValidateName("index", def.Name); err != nil {
 			return err
 		}
-		ix, ok := c.indexes[def.Name]
-		if !ok || ix.field != def.Field {
-			var err error
-			if ix, err = c.buildIndex(ctx, def.Name, def.Field); err != nil {
+		if cur, ok := c.indexes[def.Name]; !ok || cur.Field != def.Field {
+			st, err := c.indexStore()
+			if err != nil {
 				return err
+			}
+			if err := c.buildIndexes(ctx, st, []indexDef{def}); err != nil {
+				return fmt.Errorf("building index %q: %w", def.Name, err)
 			}
 		}
 		defs[def.Name] = def
@@ -812,7 +779,8 @@ func (c *Collection) replayIndexOp(ctx context.Context, r wal.Record) error {
 			return err
 		}
 		c.mu.Lock()
-		c.indexes[def.Name] = ix
+		c.indexes[def.Name] = def
+		c.forgetBaseLocked(def.Name)
 		c.metaOffset = r.Offset
 		c.mu.Unlock()
 	case wal.OpDropIndex:
@@ -826,11 +794,14 @@ func (c *Collection) replayIndexOp(ctx context.Context, r wal.Record) error {
 		}
 		c.mu.Lock()
 		delete(c.indexes, p.Name)
+		c.forgetBaseLocked(p.Name)
 		c.metaOffset = r.Offset
 		c.mu.Unlock()
-		if err := segment.RemoveIndexSnapshot(c.dir, p.Name); err != nil {
-			c.db.e.logger.Warn("cachydb: removing snapshot of dropped index", "collection", c.name, "index", p.Name, "err", err)
+		st, err := c.indexStore()
+		if err != nil {
+			return err
 		}
+		c.dropIndexEntries(st, p.Name)
 	}
 	return nil
 }
@@ -922,7 +893,8 @@ func (d *Database) finishRename(c *Collection, newName string, off uint64) error
 
 // replayDoc applies a put_doc or delete_doc record to the memtable iff its
 // offset is above the current version's (the memtable's, else the key
-// table's), updating the indexes and count like a write (§7.3). Callers
+// table's), updating the count like a write and capturing the replaced
+// version's index keys, read from its data segment (§7.3). Callers
 // have checked the offset against the collection's replay floor.
 //
 // A delete of an id that is in neither is skipped: the delete is already
@@ -947,15 +919,15 @@ func (c *Collection) replayDoc(r wal.Record) (bool, error) {
 	// during replay).
 	c.mu.RLock()
 	me, inMem := c.memtable[r.ID]
-	needPrev := len(c.indexes) > 0
 	c.mu.RUnlock()
 	var (
 		curOff  uint64
 		existed bool
-		prev    *Document
+		base    indexBase // the replaced version's keys (memEntry.base)
+		baseOff uint64
 	)
 	if inMem {
-		curOff, existed, prev = me.walOffset, me.doc != nil, me.doc
+		curOff, existed = me.walOffset, me.doc != nil // applyLocked keeps the entry's base
 	} else {
 		ke, ok, err := c.storedEntry(r.ID)
 		if err != nil {
@@ -965,11 +937,13 @@ func (c *Collection) replayDoc(r wal.Record) (bool, error) {
 			return false, nil
 		}
 		if ok {
-			curOff, existed = ke.WALOffset, true
-			if r.Offset > curOff && needPrev {
-				if prev, err = c.readStored(r.ID, ke); err != nil {
+			curOff, existed, baseOff = ke.WALOffset, true, ke.WALOffset
+			if r.Offset > curOff && len(c.indexes) > 0 {
+				prev, err := c.readStored(r.ID, ke)
+				if err != nil {
 					return false, err
 				}
+				base = c.indexKeysAll(prev)
 			}
 		}
 	}
@@ -979,7 +953,7 @@ func (c *Collection) replayDoc(r wal.Record) (bool, error) {
 
 	size := int64(len(r.ID)+len(r.Payload)) + memEntryOverhead
 	c.mu.Lock()
-	c.applyLocked(r.ID, existed, prev, next, r.Offset, size)
+	c.applyLocked(r.ID, existed, base, baseOff, next, r.Offset, size)
 	c.mu.Unlock()
 	return true, nil
 }

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -57,7 +56,8 @@ func (m model) dump() string {
 
 // captureModel reads the whole logical state of e. It also checks that
 // every collection's Count and every secondary index agree with its
-// documents (an index must equal one rebuilt from scratch).
+// documents (the index file's entries must equal those rebuilt from
+// scratch; see checkIndexEntries).
 func captureModel(t *testing.T, e *Engine) model {
 	t.Helper()
 	ctx := context.Background()
@@ -79,18 +79,7 @@ func captureModel(t *testing.T, e *Engine) model {
 				t.Errorf("%s/%s: Count = %d, Find returned %d documents", dn, cn, c.Count(), len(docs))
 			}
 			d.mu.RLock()
-			c.mu.RLock()
-			for name, ix := range c.indexes {
-				mc.indexes[name] = ix.field
-				want := newIndex(name, ix.field)
-				for _, doc := range docs {
-					want.add(doc.ID, doc)
-				}
-				if got, w := ix.snapshotKeys(), want.snapshotKeys(); !reflect.DeepEqual(got, w) {
-					t.Errorf("%s/%s: index %s = %v, rebuilt from the documents = %v", dn, cn, name, got, w)
-				}
-			}
-			c.mu.RUnlock()
+			mc.indexes = checkIndexEntries(t, c, docs)
 			d.mu.RUnlock()
 			m[dn][cn] = mc
 		}

@@ -22,7 +22,9 @@ import (
 // Write: Database.mu (shared, held to the end) → docLock(id) → read the
 // current version → build and validate the after-image → register
 // inflight → WAL append (the commit point) → hookAfterWALSync → apply to
-// the memtable, indexes, cache, and count under Collection.mu.
+// the memtable (with the replaced version's index keys, memEntry.base),
+// cache, and count under Collection.mu. The secondary indexes in the index
+// file change with the flush.
 //
 // Read: memtable → flushing → key table (a read transaction on the index
 // file) → cache or data segment. Documents stored in the memtable and the
@@ -317,7 +319,7 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 	lk.Lock()
 	defer lk.Unlock()
 
-	cur, _, err := c.current(id)
+	cur, curOff, err := c.currentVersion(id)
 	if err != nil {
 		return nil, err
 	}
@@ -359,7 +361,10 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 	if err := e.hook(hookAfterWALSync); err != nil {
 		return nil, err // simulated crash: no cleanup
 	}
-	c.apply(id, cur, next, off, lb, size)
+	// The index keys of the version this write replaces, for the flush
+	// (memEntry.base); computed outside mu. The index set cannot change:
+	// Database.mu is held shared.
+	c.apply(id, cur != nil, c.indexKeysAll(cur), curOff, next, off, lb, size)
 	return next, nil
 }
 
@@ -390,24 +395,25 @@ func (c *Collection) removeInflightLocked(lb uint64) {
 	}
 }
 
-// apply makes a durable write visible (§5.2 step 5). prev is the version
-// the write replaced (nil if none); next is the after-image (nil for a
-// delete); size is the entry's approximate size for the MemtableSize
-// flush trigger. Memory only.
-func (c *Collection) apply(id string, prev, next *Document, off, lb uint64, size int64) {
+// apply makes a durable write visible (§5.2 step 5). existed reports
+// whether the write replaced a live version; base and baseOff are that
+// version's index keys and WAL offset (nil and 0 if there was none); next
+// is the after-image (nil for a delete); size is the entry's approximate
+// size for the MemtableSize flush trigger. Memory only.
+func (c *Collection) apply(id string, existed bool, base indexBase, baseOff uint64, next *Document, off, lb uint64, size int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.removeInflightLocked(lb)
-	c.applyLocked(id, prev != nil, prev, next, off, size)
+	c.applyLocked(id, existed, base, baseOff, next, off, size)
 }
 
 // applyLocked is apply without the inflight bookkeeping, shared with WAL
 // replay. existed reports whether a live version of id existed before the
-// write (decided from the overlay first, then the key table); prev is
-// that version when the caller has it (needed only to update the indexes,
-// so replay passes nil when the collection has none). Callers hold mu
-// exclusively.
-func (c *Collection) applyLocked(id string, existed bool, prev, next *Document, off uint64, size int64) {
+// write (decided from the overlay first, then the key table). base and
+// baseOff describe the version the write replaced (see memEntry); they
+// are used only when id has no memtable entry yet, since an existing entry
+// keeps the base it captured first. Callers hold mu exclusively.
+func (c *Collection) applyLocked(id string, existed bool, base indexBase, baseOff uint64, next *Document, off uint64, size int64) {
 	me, ok := c.memtable[id]
 	if ok && me.walOffset >= off {
 		return // never happens under the doc lock; replay relies on the same rule
@@ -416,6 +422,7 @@ func (c *Collection) applyLocked(id string, existed bool, prev, next *Document, 
 	if ok {
 		c.memBytes -= me.size
 		delta -= me.size
+		base, baseOff = me.base, me.baseOff
 	}
 	c.db.e.pending.add(delta)
 	// memMin stays a lower bound of the memtable's offsets: an overwritten
@@ -424,18 +431,10 @@ func (c *Collection) applyLocked(id string, existed bool, prev, next *Document, 
 	if len(c.memtable) == 0 || off < c.memMin {
 		c.memMin = off
 	}
-	c.memtable[id] = memEntry{doc: next, walOffset: off, size: size}
+	c.memtable[id] = memEntry{doc: next, walOffset: off, size: size, base: base, baseOff: baseOff}
 	c.memBytes += size
 	if c.memBytes > c.db.e.opts.MemtableSize {
 		c.db.e.kickFlush()
-	}
-	for _, ix := range c.indexes {
-		if prev != nil {
-			ix.remove(id, prev)
-		}
-		if next != nil {
-			ix.add(id, next)
-		}
 	}
 	c.db.e.cache.Invalidate(c.cacheKey(id))
 	switch {
@@ -454,39 +453,49 @@ func (c *Collection) applyLocked(id string, existed bool, prev, next *Document, 
 // currently returns shared documents, so callers clone only what they
 // hand out.)
 func (c *Collection) current(id string) (doc *Document, owned bool, err error) {
+	doc, _, err = c.currentVersion(id)
+	return doc, false, err
+}
+
+// currentVersion is current that also returns the WAL offset of the
+// version it found (0 when the document does not exist). The document is
+// shared, as current's with owned false.
+func (c *Collection) currentVersion(id string) (*Document, uint64, error) {
 	for attempt := 0; ; attempt++ {
 		// The overlay first, under mu; the read transaction only after it
 		// (the snapshot rule above).
 		c.mu.RLock()
 		if c.dropped {
 			c.mu.RUnlock()
-			return nil, false, c.errDropped()
+			return nil, 0, c.errDropped()
 		}
-		if me, ok := c.memtable[id]; ok {
-			c.mu.RUnlock()
-			return me.doc, false, nil
-		}
-		if me, ok := c.flushing[id]; ok {
-			c.mu.RUnlock()
-			return me.doc, false, nil
+		me, ok := c.memtable[id]
+		if !ok {
+			me, ok = c.flushing[id]
 		}
 		c.mu.RUnlock()
+		if ok {
+			if me.doc == nil {
+				return nil, 0, nil // deleted
+			}
+			return me.doc, me.walOffset, nil
+		}
 
 		ke, ok, err := c.storedEntry(id)
 		if err != nil {
-			return nil, false, err
+			return nil, 0, err
 		}
 		if !ok {
-			return nil, false, nil
+			return nil, 0, nil
 		}
 		doc, err := c.readStored(id, ke)
 		if errors.Is(err, errSegmentRetired) && attempt < maxReadRetries {
 			continue // compaction moved it; look it up again
 		}
 		if err != nil {
-			return nil, false, err
+			return nil, 0, err
 		}
-		return doc, false, nil
+		return doc, ke.WALOffset, nil
 	}
 }
 
@@ -619,96 +628,91 @@ func decodeDocument(id string, data []byte) (*Document, error) {
 	return doc, nil
 }
 
-// candidates returns, sorted, the ids Find must examine for filters: the
-// smallest candidate set among eq filters on _id and the index-backed
-// filters on an indexed field (eq and has with an indexable value; has_any,
-// the union of its values' sets; has_all, their intersection), otherwise
-// every live id. Candidates are a superset of the matches: Find re-checks
-// every filter.
+// candidates returns, sorted, the ids Find must examine for filters: for
+// an eq filter on _id, that id; otherwise the smallest candidate set among
+// the filters on an indexed field that can use the index (eq and has with
+// an indexable value; has_any, the union of its values' entries; has_all,
+// their intersection; see usesIndex), otherwise every live id. Candidates
+// are a superset of the matches: Find re-checks every filter.
+//
+// Index candidates follow the snapshot rule: the overlay is captured
+// first, the index entries of its ids are skipped, and its live documents
+// whose entries make them candidates by the same rule are merged in.
 func (c *Collection) candidates(filters []QueryFilter) ([]string, error) {
+	for _, f := range filters {
+		if f.Field == "_id" && f.Operator == "eq" {
+			// The key table and the memtable are the primary index. A
+			// non-string value equals no id.
+			if s, ok := f.Value.(string); ok {
+				return []string{s}, nil
+			}
+			return nil, nil
+		}
+	}
+
+	type plan struct {
+		f   QueryFilter
+		def indexDef
+	}
 	c.mu.RLock()
 	if c.dropped {
 		c.mu.RUnlock()
 		return nil, c.errDropped()
 	}
-	ids, ok := c.indexedCandidatesLocked(filters)
-	c.mu.RUnlock()
-	if ok {
-		return ids, nil
-	}
-	return c.liveIDs()
-}
-
-// indexedCandidatesLocked returns the smallest index-backed candidate set
-// for filters (see candidates), or false if no filter can use an index.
-// Callers hold mu.
-func (c *Collection) indexedCandidatesLocked(filters []QueryFilter) ([]string, bool) {
-	var best []string
-	found := false
+	var plans []plan
 	for _, f := range filters {
-		ids, ok := c.filterCandidatesLocked(f)
-		if ok && (!found || len(ids) < len(best)) {
-			best, found = ids, true
+		if f.Field == "_id" || !usesIndex(f) {
+			continue
+		}
+		if def, ok := c.indexOnLocked(f.Field); ok {
+			plans = append(plans, plan{f: f, def: def})
 		}
 	}
-	return best, found
-}
+	c.mu.RUnlock()
+	if len(plans) == 0 {
+		return c.liveIDs()
+	}
 
-// filterCandidatesLocked returns the sorted ids that may match f through
-// the primary key or a secondary index, or false if f cannot use one.
-// Callers hold mu.
-func (c *Collection) filterCandidatesLocked(f QueryFilter) ([]string, bool) {
-	if f.Field == "_id" {
-		if f.Operator != "eq" {
-			return nil, false
-		}
-		// The key table and the memtable are the primary index. A
-		// non-string value equals no id.
-		if s, ok := f.Value.(string); ok {
-			return []string{s}, true
-		}
-		return nil, true
+	overlay, st, err := c.captureOverlay()
+	if err != nil {
+		return nil, err
 	}
-	switch f.Operator {
-	case "eq", "has", "has_any", "has_all":
-	default:
-		return nil, false
-	}
-	ix := c.indexOnLocked(f.Field)
-	if ix == nil {
-		return nil, false
-	}
-	switch f.Operator {
-	case "has_any":
-		vals, ok := listValues(f.Value)
-		if !ok {
-			return nil, true // matches nothing
+	var (
+		best      []string
+		bestExtra []string // the overlay's part of best
+		found     bool
+	)
+	err = st.View(func(tx *idxstore.Tx) error {
+		for _, p := range plans {
+			ids, err := indexCandidates(tx, p.def.Name, p.f, overlay)
+			if err != nil {
+				return err
+			}
+			var extra []string // the overlay's candidates, by the same rule
+			for id, doc := range overlay {
+				if doc != nil && entriesCandidate(indexKeysOf(doc, p.def.Field), p.f) {
+					extra = append(extra, id)
+				}
+			}
+			if !found || len(ids)+len(extra) < len(best)+len(bestExtra) {
+				best, bestExtra, found = ids, extra, true
+			}
 		}
-		return ix.lookupAny(vals)
-	case "has_all":
-		vals, ok := listValues(f.Value)
-		if !ok {
-			return nil, true // matches nothing
-		}
-		return ix.lookupAll(vals)
-	default: // eq, has
-		if _, ok := indexKey(f.Value); !ok {
-			return nil, false // objects/arrays/NaN: not indexed, scan
-		}
-		return ix.lookup(f.Value), true
+		return nil
+	})
+	used := make([]indexDef, len(plans))
+	for i, p := range plans {
+		used[i] = p.def
 	}
-}
+	switch {
+	case errors.Is(err, idxstore.ErrNoIndex), err == nil && !c.indexesUnchanged(used):
+		return c.liveIDs() // an index was dropped meanwhile: scan
+	case err != nil:
+		return nil, c.storeErr(err)
+	}
 
-// indexOnLocked returns an index on field (the one with the smallest name
-// if there are several), or nil. Callers hold mu.
-func (c *Collection) indexOnLocked(field string) *index {
-	var best *index
-	for _, ix := range c.indexes {
-		if ix.field == field && (best == nil || ix.name < best.name) {
-			best = ix
-		}
-	}
-	return best
+	slices.Sort(bestExtra)
+	return mergeSorted(best, bestExtra), nil
 }
 
 // captureOverlay returns the overlay M of the snapshot rule (see the top
@@ -787,30 +791,4 @@ func (c *Collection) liveIDs() ([]string, error) {
 		return nil, c.storeErr(err)
 	}
 	return ids, nil
-}
-
-// buildIndex builds the index name on field from every live document.
-// Callers hold Database.mu exclusively, so no document write runs.
-func (c *Collection) buildIndex(ctx context.Context, name, field string) (*index, error) {
-	ids, err := c.liveIDs()
-	if err != nil {
-		return nil, err
-	}
-
-	ix := newIndex(name, field)
-	for i, id := range ids {
-		if i%findCtxCheckEvery == 0 {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-		}
-		doc, _, err := c.current(id)
-		if err != nil {
-			return nil, err
-		}
-		if doc != nil {
-			ix.add(id, doc)
-		}
-	}
-	return ix, nil
 }

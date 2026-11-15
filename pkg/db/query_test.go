@@ -117,45 +117,6 @@ func TestFindElementOperatorsAndAny(t *testing.T) {
 	}
 }
 
-func TestIndexElementKeys(t *testing.T) {
-	ix := newIndex("by_tags", "tags")
-	ix.add("a", idxDoc("a", map[string]any{"tags": []any{"x", "y", "x", 1.0, map[string]any{"o": 1.0}, []any{"n"}}}))
-	ix.add("b", idxDoc("b", map[string]any{"tags": []any{"y", "z"}}))
-	ix.add("c", idxDoc("c", map[string]any{"tags": "x"}))
-	ix.add("d", idxDoc("d", map[string]any{"tags": []any{}}))
-
-	keys := slices.Sorted(func(yield func(string) bool) {
-		for k := range ix.keys {
-			if !yield(k) {
-				return
-			}
-		}
-	})
-	if want := []string{"a:", "n:1", "s:x", "s:y", "s:z", "u:"}; !slices.Equal(keys, want) {
-		t.Errorf("keys = %v, want %v (nested objects and arrays only marked)", keys, want)
-	}
-	if got := ix.lookup("x"); !slices.Equal(got, []string{"a", "c"}) {
-		t.Errorf("lookup(x) = %v", got)
-	}
-	if got, ok := ix.lookupAny([]any{"x", "z"}); !ok || !slices.Equal(got, []string{"a", "b", "c"}) {
-		t.Errorf("lookupAny(x, z) = %v, %v", got, ok)
-	}
-	if _, ok := ix.lookupAny([]any{"x", map[string]any{}}); ok {
-		t.Error("lookupAny with an unindexable value used the index")
-	}
-	if got, ok := ix.lookupAll([]any{"y", "x", map[string]any{}}); !ok || !slices.Equal(got, []string{"a"}) {
-		t.Errorf("lookupAll(y, x, {}) = %v, %v", got, ok)
-	}
-	if _, ok := ix.lookupAll([]any{map[string]any{}}); ok {
-		t.Error("lookupAll without an indexable value used the index")
-	}
-
-	ix.remove("a", idxDoc("a", map[string]any{"tags": []any{"x", "y", "x", 1.0, map[string]any{"o": 1.0}, []any{"n"}}}))
-	if _, ok := ix.keys["n:1"]; ok || ix.keys[unindexedMarker] != nil || !slices.Equal(ix.lookup("x"), []string{"c"}) {
-		t.Errorf("remove left element keys behind: %v", ix.keys)
-	}
-}
-
 func TestFindElementOperatorsUseIndex(t *testing.T) {
 	ctx := context.Background()
 	_, c := newTestColl(t, nil, nil)

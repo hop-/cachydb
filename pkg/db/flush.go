@@ -24,9 +24,9 @@ import (
 // A flush swaps a collection's memtable into the immutable flushing
 // table, appends the changed documents and tombstones (sorted by WAL
 // offset) to the active data segment, fsyncs once, and then applies them
-// to the index file in one transaction: the key-table changes, the live
-// count, the per-segment byte accounting, the position the index now
-// covers, and the checkpoint. Collection.mu is held only for the two
+// to the index file in one transaction: the key-table changes, the
+// secondary index entries and counters, the live count, the per-segment
+// byte accounting, the position the index now covers, and the checkpoint. Collection.mu is held only for the two
 // memory-only swaps, never during segment or index I/O. A failed flush
 // keeps flushing (reads still see it) and the old checkpoint, and the
 // next flush retries with flushing ∪ memtable.
@@ -352,6 +352,9 @@ func (c *Collection) flush() error {
 	c.memtable, c.memMin, c.memBytes = make(map[string]memEntry), 0, 0
 	cp := c.flushCheckpointLocked()
 	flushing := c.flushing // immutable while set; only the flusher replaces it
+	// The index set cannot change before this flush ends: CreateIndex and
+	// DropIndex hold flushMu.
+	defs := sortedIndexDefs(c.indexes)
 	c.mu.Unlock()
 
 	// 2. Write the records, one fsync.
@@ -385,13 +388,13 @@ func (c *Collection) flush() error {
 	}
 
 	// 3. One index transaction (no collection lock is held): the key
-	// table, count, segment accounting, covered position, and checkpoint
-	// change together or not at all.
+	// table, index entries, count, segment accounting, covered position,
+	// and checkpoint change together or not at all.
 	covered := idxstore.Position{Seg: w.Seg(), End: uint64(w.Size())}
 	committing := false
 	err = st.Update(func(u *idxstore.WTx) error {
 		committing = false
-		if err := applyFlush(u, entries, locs, cp, covered); err != nil {
+		if err := c.applyFlush(u, defs, entries, locs, cp, covered); err != nil {
 			return err
 		}
 		committing = true
@@ -451,18 +454,22 @@ func flushRecords(flushing map[string]memEntry) ([]flushEntry, []segment.Record,
 
 // applyFlush is the index transaction of a flush (approach-index-and-query
 // §4 step 3). entries were appended to the active segment at locs (same
-// order). For each entry it reads the key-table entry of the id: if that
-// one is not older (WAL replay over data that is already flushed), the new
-// record is dead on arrival; otherwise the entry replaces it, or removes
-// the id for a tombstone, and the old record becomes dead. Then it adds the
-// record and dead bytes to the segment accounting (registering the active
-// segment on its first flush) and stores the covered position and the
-// checkpoint. The live count follows the key table by itself (idxstore).
+// order); defs is the collection's index set. For each entry it reads the
+// key-table entry of the id: if that one is not older (WAL replay over data
+// that is already flushed), the new record is dead on arrival; otherwise
+// the entry replaces it, or removes the id for a tombstone, and the old
+// record becomes dead. The index entries of the old version (oldIndexKeys)
+// are replaced by those of the new one, and each index's complex counter
+// follows. Then it adds the record and dead bytes to the segment accounting
+// (registering the active segment on its first flush) and stores the
+// covered position and the checkpoint. The live count and the truncated
+// counters follow the key table and the entries by themselves (idxstore).
 //
 // The ids are applied in ascending order, not WAL-offset order: an id
 // occurs once per flush, so the result is the same, and bbolt takes keys
-// in order far faster (see the idxstore package comment).
-func applyFlush(u *idxstore.WTx, entries []flushEntry, locs []segment.Location, cp uint64, covered idxstore.Position) error {
+// in order far faster (see the idxstore package comment). For the same
+// reason each index's changes are sorted by key before they are applied.
+func (c *Collection) applyFlush(u *idxstore.WTx, defs []indexDef, entries []flushEntry, locs []segment.Location, cp uint64, covered idxstore.Position) error {
 	order := make([]int, len(entries))
 	for i := range order {
 		order[i] = i
@@ -471,6 +478,8 @@ func applyFlush(u *idxstore.WTx, entries []flushEntry, locs []segment.Location, 
 
 	recBytes := make(map[uint32]int64, 1)
 	deadBytes := make(map[uint32]int64, 2)
+	ixOps := make([][]indexOp, len(defs))
+	complexDelta := make([]int64, len(defs))
 	var maxOff uint64
 	for _, i := range order {
 		en, loc := entries[i], locs[i]
@@ -485,6 +494,20 @@ func applyFlush(u *idxstore.WTx, entries []flushEntry, locs []segment.Location, 
 			deadBytes[loc.Seg] += size // already superseded on disk
 			continue
 		}
+		if len(defs) > 0 {
+			oldKeys, err := c.oldIndexKeys(en, defs, old, had)
+			if err != nil {
+				return err
+			}
+			for j, def := range defs {
+				var next docIndexKeys
+				if en.me.doc != nil {
+					next = indexKeysOf(en.me.doc, def.Field)
+				}
+				ixOps[j] = appendIndexDiff(ixOps[j], en.id, oldKeys[def.Name].entries, next.entries)
+				complexDelta[j] += boolInt(next.complex) - boolInt(oldKeys[def.Name].complex)
+			}
+		}
 		if had {
 			deadBytes[old.Seg] += int64(old.Size)
 		}
@@ -496,6 +519,21 @@ func applyFlush(u *idxstore.WTx, entries []flushEntry, locs []segment.Location, 
 			continue
 		}
 		if err := u.PutKey(en.id, locationEntry(loc, en.me.walOffset)); err != nil {
+			return err
+		}
+	}
+	for j, def := range defs {
+		if len(ixOps[j]) == 0 && complexDelta[j] == 0 {
+			continue
+		}
+		w, err := u.Index(def.Name)
+		if err != nil {
+			return err
+		}
+		if err := applyIndexOps(w, ixOps[j]); err != nil {
+			return err
+		}
+		if err := w.AddComplex(complexDelta[j]); err != nil {
 			return err
 		}
 	}
@@ -522,6 +560,47 @@ func applyFlush(u *idxstore.WTx, entries []flushEntry, locs []segment.Location, 
 		return err // checkpoints only grow
 	}
 	return u.SetCheckpoint(cp)
+}
+
+// oldIndexKeys returns the index keys, per index of defs, of the version of
+// en's document that the key table holds (old, if had): the keys captured
+// on the write path (memEntry.base) when they describe that version and
+// cover every index, otherwise the keys of the version read from its data
+// segment. The second case follows an index created or dropped since the
+// capture, and a flush retried after a commit that failed late but reached
+// the file.
+func (c *Collection) oldIndexKeys(en flushEntry, defs []indexDef, old idxstore.Entry, had bool) (indexBase, error) {
+	if !had {
+		return nil, nil // no version in the index file, so no entries
+	}
+	if en.me.baseOff == old.WALOffset {
+		complete := true
+		for _, def := range defs {
+			if _, ok := en.me.base[def.Name]; !ok {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			return en.me.base, nil
+		}
+	}
+	doc, err := c.readStored(en.id, old)
+	if err != nil {
+		return nil, fmt.Errorf("reading the replaced version of %q for its index keys: %w", en.id, err)
+	}
+	keys := make(indexBase, len(defs))
+	for _, def := range defs {
+		keys[def.Name] = indexKeysOf(doc, def.Field)
+	}
+	return keys, nil
+}
+
+func boolInt(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // afterFailedIndexCommit cleans up the active segment after the index

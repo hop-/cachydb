@@ -896,9 +896,7 @@ func TestCreateIndexOnPopulatedCollection(t *testing.T) {
 		t.Fatal(err)
 	}
 	lookup := func(v any) []string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		return c.indexes["by_g"].lookup(v)
+		return indexLookup(t, c, "by_g", v)
 	}
 	if got, want := lookup("a"), []string{"m1", "m2", "s1"}; !slices.Equal(got, want) {
 		t.Errorf("index a = %v, want %v", got, want)

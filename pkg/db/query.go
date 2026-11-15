@@ -1,14 +1,18 @@
 package db
 
 import (
+	"bytes"
 	"cmp"
 	"container/heap"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
 )
 
 // Query execution (plan 004 §2): candidates from the primary key or a
@@ -411,28 +415,55 @@ func (c *Collection) countFast(p *preparedQuery) (int, bool, error) {
 		return 1, true, nil
 	}
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 	if c.dropped {
+		c.mu.RUnlock()
 		return 0, false, c.errDropped()
 	}
 	if len(p.filters) == 0 {
+		c.mu.RUnlock()
 		return c.Count(), true, nil
 	}
 	f := p.filters[0]
-	if f.Operator != "eq" && f.Operator != "has" {
+	def, indexed := c.indexOnLocked(f.Field)
+	c.mu.RUnlock()
+	if !indexed || (f.Operator != "eq" && f.Operator != "has") {
 		return 0, false, nil
 	}
-	if _, ok := indexKey(f.Value); !ok {
+	// Exact from the entries only when no truncated entry can share the
+	// value's encoding: the value itself is not cut, and it is shorter than
+	// any cut value (MaxValueLen-1 or MaxValueLen bytes).
+	enc, truncated, ok := idxstore.AppendValue(nil, f.Value)
+	if !ok || truncated || len(enc) >= idxstore.MaxValueLen-1 {
 		return 0, false, nil
 	}
-	ix := c.indexOnLocked(f.Field)
-	if ix == nil {
-		return 0, false, nil
+
+	// The snapshot rule: the overlay first, then the read transaction;
+	// entries of overlay ids are skipped and the overlay counted itself.
+	overlay, st, err := c.captureOverlay()
+	if err != nil {
+		return 0, false, err
 	}
-	if f.Operator == "eq" {
-		return ix.countEq(f.Value), true, nil
+	n := 0
+	err = st.View(func(tx *idxstore.Tx) error {
+		cur, err := tx.IndexCursor(def.Name)
+		if err != nil {
+			return err
+		}
+		n = countValue(cur, enc, f.Operator == "has", overlay)
+		return cur.Err()
+	})
+	switch {
+	case errors.Is(err, idxstore.ErrNoIndex), err == nil && !c.indexesUnchanged([]indexDef{def}):
+		return 0, false, nil // the index was dropped meanwhile: count by reading
+	case err != nil:
+		return 0, false, c.storeErr(err)
 	}
-	return ix.countHas(f.Value), true, nil
+	for _, doc := range overlay {
+		if doc != nil && matchesFilter(doc, f) {
+			n++
+		}
+	}
+	return n, true, nil
 }
 
 // live reports whether the document id exists: the overlay decides if it
@@ -506,27 +537,8 @@ func (c *Collection) distinct(ctx context.Context, field string, q *Query) ([]an
 		return nil, 0, err
 	}
 	seen := make(map[string]any)
-	add := func(v any) {
-		key, ok := indexKey(v)
-		if !ok {
-			key = "j:" + canonicalJSON(v)
-		}
-		if _, dup := seen[key]; !dup {
-			seen[key] = deepCopy(v)
-		}
-	}
 	examined, err := c.scan(ctx, ids, p, func(doc *Document, _ bool) bool {
-		v, ok := doc.GetValue(field)
-		if !ok {
-			return true
-		}
-		if elems, isList := listValues(v); isList {
-			for _, el := range elems {
-				add(el)
-			}
-		} else {
-			add(v)
-		}
+		addDistinctValues(seen, doc, field)
 		return true
 	})
 	if err != nil {
@@ -555,16 +567,103 @@ func (c *Collection) distinctFast(field string) ([]any, bool, error) {
 		return out, true, nil
 	}
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 	if c.dropped {
+		c.mu.RUnlock()
 		return nil, false, c.errDropped()
 	}
-	ix := c.indexOnLocked(field)
-	if ix == nil {
+	def, indexed := c.indexOnLocked(field)
+	c.mu.RUnlock()
+	if !indexed {
 		return nil, false, nil
 	}
-	vals, ok := ix.distinctValues()
-	return vals, ok, nil
+
+	// The snapshot rule: the overlay first, then the read transaction. The
+	// entries hold every value of the documents outside the overlay when
+	// the index has no complex document and no truncated entry; the
+	// overlay's documents contribute their own values.
+	overlay, st, err := c.captureOverlay()
+	if err != nil {
+		return nil, false, err
+	}
+	for _, doc := range overlay {
+		if indexKeysOf(doc, field).complex {
+			// A value without an entry, as on disk: read the documents,
+			// so the answer does not depend on what is flushed.
+			return nil, false, nil
+		}
+	}
+	seen := make(map[string]any)
+	exact := false
+	err = st.View(func(tx *idxstore.Tx) error {
+		stats, ok, err := tx.IndexStats(def.Name)
+		if err != nil || !ok || stats.Complex > 0 || stats.Truncated > 0 {
+			return err
+		}
+		cur, err := tx.IndexCursor(def.Name)
+		if err != nil {
+			return err
+		}
+		var last []byte // the last value taken; valid within the transaction
+		for e, ok := cur.First(); ok; e, ok = cur.Next() {
+			if e.Value[0] == idxstore.TagMissing || (last != nil && bytes.Equal(e.Value, last)) {
+				continue
+			}
+			if _, in := overlay[string(e.ID)]; in {
+				continue
+			}
+			v, _, err := idxstore.DecodeValue(e.Value)
+			if err != nil {
+				return err
+			}
+			seen["v"+string(e.Value)] = v
+			last = e.Value
+		}
+		if err := cur.Err(); err != nil {
+			return err
+		}
+		exact = true
+		return nil
+	})
+	switch {
+	case errors.Is(err, idxstore.ErrNoIndex), err == nil && !c.indexesUnchanged([]indexDef{def}):
+		return nil, false, nil // the index was dropped meanwhile: read the documents
+	case err != nil:
+		return nil, false, c.storeErr(err)
+	case !exact:
+		return nil, false, nil
+	}
+	for _, doc := range overlay {
+		if doc != nil {
+			addDistinctValues(seen, doc, field)
+		}
+	}
+	vals := make([]any, 0, len(seen))
+	for _, v := range seen {
+		vals = append(vals, v)
+	}
+	return vals, true, nil
+}
+
+// addDistinctValues adds the values doc holds in field (each element of an
+// array) to seen, keyed by distinctKey, copying the ones it adds.
+func addDistinctValues(seen map[string]any, doc *Document, field string) {
+	v, ok := doc.GetValue(field)
+	if !ok {
+		return
+	}
+	add := func(v any) {
+		key := distinctKey(v)
+		if _, dup := seen[key]; !dup {
+			seen[key] = deepCopy(v)
+		}
+	}
+	if elems, isList := listValues(v); isList {
+		for _, el := range elems {
+			add(el)
+		}
+		return
+	}
+	add(v)
 }
 
 // sortDistinct sorts vals in the sort order of Find (ascending) and

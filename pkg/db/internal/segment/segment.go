@@ -1,9 +1,8 @@
 // Package segment implements the append-only data segment files of a
 // cachydb collection (approach §4): a record codec with per-record zstd
 // compression and CRC32C checksums, the active-segment Writer, a shared
-// ref-counted Reader, sequential Scan and its header-only variant
-// ScanHeaders, and the hint (§4.2) and index snapshot (§8) sidecar files
-// (sidecar.go, hint.go, snapshot.go).
+// ref-counted Reader, and sequential Scan and its header-only variant
+// ScanHeaders.
 //
 // Segment files are named seg-<n, at least 6 digits>.data and start with a
 // 16-byte header: magic "CDBD" · u16 format version · u8 codec · 9

@@ -573,10 +573,9 @@ func (c *Collection) liveEntries(st *idxstore.Store, seg uint32, dropTombs bool)
 }
 
 // removeSegmentFiles deletes the data file of segment seg: at once, or
-// through r (an open reader of it) once the last read releases it. A hint
-// file an older version wrote for the segment goes first. Errors are
-// logged; a leftover data file is not registered in the index file, and
-// Open removes it.
+// through r (an open reader of it) once the last read releases it. Errors
+// are logged; a leftover data file is not registered in the index file,
+// and Open removes it.
 func (c *Collection) removeSegmentFiles(seg uint32, r *segment.Reader) {
 	logger := c.db.e.logger
 	logErr := func(err error) {
@@ -587,7 +586,6 @@ func (c *Collection) removeSegmentFiles(seg uint32, r *segment.Reader) {
 			logErr(err)
 		}
 	}
-	remove(segment.HintPath(c.dir, seg))
 	if r != nil {
 		r.RetireWith(logErr)
 		return

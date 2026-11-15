@@ -1,7 +1,6 @@
 package db
 
 import (
-	"bytes"
 	"encoding/json"
 	"math"
 	"os"
@@ -24,18 +23,6 @@ var fuzzJSONSeeds = []string{
 func decodeJSONValue(data []byte) (any, bool) {
 	var v any
 	if err := json.Unmarshal(data, &v); err != nil {
-		return nil, false
-	}
-	return v, true
-}
-
-// decodeJSONNumber decodes data with json.Number numbers, a second
-// representation the query code accepts.
-func decodeJSONNumber(data []byte) (any, bool) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	var v any
-	if err := dec.Decode(&v); err != nil {
 		return nil, false
 	}
 	return v, true
@@ -125,72 +112,6 @@ func FuzzDecodeDocument(f *testing.F) {
 		}
 		if !reflect.DeepEqual(doc, doc.Clone()) {
 			t.Fatalf("Clone differs from the document")
-		}
-	})
-}
-
-// FuzzIndexKey checks that the index key of every indexable JSON value
-// decodes back to an equal value with the same key, that a value's key
-// does not depend on its numeric representation, and that equal values
-// (valuesEqual) get equal keys.
-func FuzzIndexKey(f *testing.F) {
-	for _, a := range fuzzJSONSeeds {
-		f.Add([]byte(a), []byte(`1`))
-	}
-	f.Add([]byte(`0`), []byte(`-0`))
-	f.Add([]byte(`1`), []byte(`1.0`))
-	f.Add([]byte(`100`), []byte(`1e2`))
-	f.Add([]byte(`"1"`), []byte(`1`))
-
-	f.Fuzz(func(t *testing.T, ra, rb []byte) {
-		a, ok := decodeJSONValue(ra)
-		if !ok {
-			return
-		}
-		key, indexable := indexKey(a)
-		if indexable {
-			if isMarkerKey(key) {
-				t.Fatalf("value %#v has the marker key %q", a, key)
-			}
-			v, ok := decodeIndexKey(key)
-			if !ok {
-				t.Fatalf("decodeIndexKey(%q) failed for value %#v", key, a)
-			}
-			if !valuesEqual(a, v) {
-				t.Fatalf("key %q of %#v decodes to unequal %#v", key, a, v)
-			}
-			if k2, _ := indexKey(v); k2 != key {
-				t.Fatalf("decoded value %#v has key %q, want %q", v, k2, key)
-			}
-		}
-		if an, ok := decodeJSONNumber(ra); ok {
-			if !valuesEqual(a, an) {
-				t.Fatalf("float64 and json.Number decodings of %s are not equal", ra)
-			}
-			if k2, ok2 := indexKey(an); ok2 != indexable || k2 != key {
-				t.Fatalf("json.Number decoding of %s has key %q (%v), want %q (%v)", ra, k2, ok2, key, indexable)
-			}
-		}
-		// Every key of the value (array elements included) decodes.
-		for _, k := range valueKeys(a) {
-			if isMarkerKey(k) {
-				continue
-			}
-			if _, ok := decodeIndexKey(k); !ok {
-				t.Fatalf("valueKeys(%#v) produced undecodable key %q", a, k)
-			}
-		}
-
-		b, ok := decodeJSONValue(rb)
-		if !ok {
-			return
-		}
-		kb, bIndexable := indexKey(b)
-		if valuesEqual(a, b) && (indexable != bIndexable || key != kb) {
-			t.Fatalf("equal values %#v and %#v have keys %q and %q", a, b, key, kb)
-		}
-		if indexable && bIndexable && key == kb && !valuesEqual(a, b) {
-			t.Fatalf("unequal values %#v and %#v share key %q", a, b, key)
 		}
 	})
 }

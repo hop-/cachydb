@@ -332,17 +332,13 @@ func TestCompactionRecords(t *testing.T) {
 				t.Fatalf("segments %v -> %v: want one new output segment with a higher id", before, after)
 			}
 			for _, s := range tt.wantRun {
-				if slices.Contains(after, s) || fileExistsT(t, segment.HintPath(c.dir, s)) {
+				if slices.Contains(after, s) {
 					t.Errorf("files of compacted segment %d still exist", s)
 				}
 			}
 			outRecs := segmentRecords(t, c.dir, out[0])
 			if got := recordKinds(outRecs); !slices.Equal(got, tt.wantOut) {
 				t.Errorf("output records = %v, want %v", got, tt.wantOut)
-			}
-			hint, err := segment.ReadHint(c.dir, out[0])
-			if err != nil || len(hint) != len(outRecs) {
-				t.Errorf("output hint = %d entries, %v; want %d", len(hint), err, len(outRecs))
 			}
 			_, deadBytes := segAccounting(t, c)
 			outDead := deadBytes[out[0]]
@@ -438,11 +434,14 @@ func TestCompactionSwapIsCompareAndSwap(t *testing.T) {
 	if hasC {
 		t.Error("c deleted during compaction is back in the keydir")
 	}
-	hint, err := segment.ReadHint(c.dir, out)
-	if err != nil {
+	var hint []segment.Location // the output's records
+	if _, err := segment.ScanHeaders(c.dir, out, func(_ segment.Record, loc segment.Location) error {
+		hint = append(hint, loc)
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if want := int64(hint[0].Loc.Size + hint[1].Loc.Size); dead != want {
+	if want := int64(hint[0].Size + hint[1].Size); dead != want {
 		t.Errorf("deadBytes[output] = %d, want %d (stale copies of b and c)", dead, want)
 	}
 	want := docsModel(nil, map[string]map[string]any{"a": {"v": "a2"}, "b": {"v": "new"}, "z": {"v": "z"}})
@@ -481,7 +480,7 @@ func TestCompactionRetiredSegmentReads(t *testing.T) {
 	if !fileExistsT(t, segment.DataPath(c.dir, 1)) {
 		t.Error("segment 1 removed while a read holds it")
 	}
-	if fileExistsT(t, segment.HintPath(c.dir, 1)) || fileExistsT(t, segment.DataPath(c.dir, 2)) {
+	if fileExistsT(t, segment.DataPath(c.dir, 2)) {
 		t.Error("retired files not removed")
 	}
 	if _, err := c.acquireReader(1); !errors.Is(err, errSegmentRetired) {
