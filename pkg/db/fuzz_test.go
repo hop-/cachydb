@@ -244,6 +244,12 @@ func FuzzMatchFilter(f *testing.F) {
 	f.Add([]byte(`{"_id":"d","n":5}`), "n", uint8(6), []byte(`[1,5]`))
 	f.Add([]byte(`{"_id":"d","n":5}`), "_id", uint8(2), []byte(`"c"`))
 	f.Add([]byte(`{"_id":"d"}`), "missing", uint8(1), []byte(`null`))
+	// Dotted fields are paths: nested, a literal top-level key that wins,
+	// a path through an array (missing), and empty path segments.
+	f.Add([]byte(`{"_id":"d","o":{"k":1}}`), "o.k", uint8(1), []byte(`2`))
+	f.Add([]byte(`{"_id":"d","o.k":"lit","o":{"k":1}}`), "o.k", uint8(0), []byte(`"lit"`))
+	f.Add([]byte(`{"_id":"d","t":[{"k":1}]}`), "t.k", uint8(1), []byte(`2`))
+	f.Add([]byte(`{"_id":"d","":{"":0}}`), ".", uint8(1), []byte(`1`))
 
 	f.Fuzz(func(t *testing.T, rawDoc []byte, field string, op uint8, rawValue []byte) {
 		doc := &Document{}
@@ -260,7 +266,9 @@ func FuzzMatchFilter(f *testing.F) {
 		operator := fuzzOperators[int(op)%len(fuzzOperators)]
 		got := m(operator, value)
 
-		_, exists := doc.GetValue(field)
+		// Filters resolve field as a path (approach §6), so "missing"
+		// is decided by GetPath, not the top-level GetValue.
+		_, exists := doc.GetPath(field)
 		if !exists {
 			if got {
 				t.Fatalf("%s on a missing field matched", operator)

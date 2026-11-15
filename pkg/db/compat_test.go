@@ -145,9 +145,11 @@ func checkIndexesLikeScan(t *testing.T, e *db.Engine, expected []byte) {
 			}
 			for _, ix := range c.Indexes() {
 				// Every value the field holds (array elements included).
+				// The field is resolved as the engine resolves index
+				// fields: a nested path (Document.GetPath).
 				var vals []any
 				for _, doc := range all {
-					v, ok := doc.Data[ix.Field]
+					v, ok := doc.GetPath(ix.Field)
 					if !ok {
 						continue
 					}
@@ -162,7 +164,8 @@ func checkIndexesLikeScan(t *testing.T, e *db.Engine, expected []byte) {
 						f := db.QueryFilter{Field: ix.Field, Operator: op, Value: v}
 						var want []string
 						for _, doc := range all {
-							if matches(doc.Data[ix.Field], op, v) {
+							// A missing field matches nothing, not even eq null.
+							if fv, ok := doc.GetPath(ix.Field); ok && matches(fv, op, v) {
 								want = append(want, doc.ID)
 							}
 						}
