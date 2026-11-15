@@ -287,7 +287,7 @@ One driver produces the candidates of the documents in `index.db`
 | `index` | `eq`, `has`, `exists false`, `in`, `has_any`, `has_all` on an indexed field | `_id` (several values: merged union, or intersection for `has_all`) |
 | `index range` | `gt`/`gte`/`lt`/`lte`, `starts_with` (prefix range), `exists true` (only while the index's `complex` and `arrays` counters are 0) | value, then `_id` |
 | `or union` | every `Any` group has a served filter | `_id` (value-ordered groups are collected first) |
-| `index sort` | `Sort` is one key on an indexed field, the index's `complex`, `truncated`, and `arrays` counters are 0, and no filter is served (or the query has a limit and the best filter is large) | the requested order, both directions |
+| `index sort` | `Sort` is one key on an indexed field, the index's `complex`, `truncated`, and `arrays` counters are 0, and no filter is served, or the best filter is a range or `starts_with` on the sort key's field (it then bounds the walk, together with the other range filters on that field), or the query has a limit and the best filter is large | the requested order, both directions |
 | `keydir` (a walk of the key table) | none of the above | `_id`, both directions |
 | `none` | an AND filter can match nothing | — |
 

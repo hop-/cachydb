@@ -556,6 +556,9 @@ type planOption struct {
 	byValue  bool       // the source yields value order, not _id order
 	never    bool       // nothing can match: no source
 	sortWalk bool       // the source yields the query's sort order (driverIndexSort)
+	// ranged is the range or starts_with filter whose value range of one
+	// index this option walks (driverRange), or nil.
+	ranged *compiledFilter
 	// open builds the source on the snapshot's transaction; desc asks a
 	// key-table walk, an id list, or an index sort walk for the reverse
 	// order.
@@ -818,7 +821,11 @@ func (c *Collection) filterOption(s *querySnap, f *compiledFilter) (*planOption,
 		if !ok {
 			return nil, nil
 		}
-		return rangeOption(s, def, r, flagsScalar, f)
+		o, err := rangeOption(s, def, r, flagsScalar, f)
+		if o != nil {
+			o.ranged = f
+		}
+		return o, err
 	}
 	return nil, nil
 }
@@ -957,8 +964,11 @@ func (c *Collection) sortOption(s *querySnap, key SortKey, filters []compiledFil
 // the OR groups as a whole) that the primary key or an index can serve,
 // the smallest estimate wins, an id lookup always. For Find with a single
 // sort key whose index can drive the sort, the index sort walk wins when
-// no filter is served, or when the query has a limit and the best filter
-// is large. Without any of these, the key table is walked.
+// no filter is served, when the best filter is a range or starts_with on
+// the sort key's field (the walk is then bounded by it, so it reads the
+// same entries in the requested order and stops at skip + limit), or when
+// the query has a limit and the best filter is large. Without any of
+// these, the key table is walked.
 func (c *Collection) choosePlan(s *querySnap, cq *compiledQuery, forFind bool) (*planOption, error) {
 	if cq.never {
 		return &planOption{driver: driverNone, never: true}, nil
@@ -982,13 +992,31 @@ func (c *Collection) choosePlan(s *querySnap, cq *compiledQuery, forFind bool) (
 			best = o
 		}
 	}
-	if forFind && len(cq.sort) == 1 && (best == nil || cq.limit > 0 && best.driver != driverIDs && best.est >= planEstimateCap) {
-		o, err := c.sortOption(s, cq.sort[0], cq.filters)
-		if err != nil {
-			return nil, err
+	if forFind && len(cq.sort) == 1 {
+		walk, bounds := false, cq.filters
+		switch {
+		case best != nil && best.ranged != nil && best.ranged.field == cq.sort[0].Field:
+			// The best filter goes first, so that it bounds the walk
+			// whatever the other filters on the field are.
+			walk = true
+			bounds = make([]compiledFilter, 0, len(cq.filters))
+			bounds = append(bounds, *best.ranged)
+			for i := range cq.filters {
+				if &cq.filters[i] != best.ranged {
+					bounds = append(bounds, cq.filters[i])
+				}
+			}
+		case best == nil, cq.limit > 0 && best.driver != driverIDs && best.est >= planEstimateCap:
+			walk = true
 		}
-		if o != nil {
-			return o, nil
+		if walk {
+			o, err := c.sortOption(s, cq.sort[0], bounds)
+			if err != nil {
+				return nil, err
+			}
+			if o != nil {
+				return o, nil
+			}
 		}
 	}
 	if best == nil {
