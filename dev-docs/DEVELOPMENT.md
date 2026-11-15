@@ -97,14 +97,24 @@ Follow the Go conventions used throughout the code:
 
 ### Adding a query operator
 
-1. Add a case to `matchesFilter` in `pkg/db/compare.go`, using `compare` /
-   `valuesEqual` for type-aware semantics.
-2. Index use is decided in `filterCandidatesLocked` (`document.go`): `eq`,
-   `has`, `has_any`, `has_all` can; candidates are always re-checked, so
-   they only need to be a superset. Decide whether the new operator can.
-3. Add it to `Operators` in `internal/mcp/tools.go` (the schema enum) and
+1. Add an `opCode`, its name in `operatorNames` and `operatorCodes`, and
+   its compilation in `compileFilter` (`pkg/db/compare.go`): normalize the
+   value once into `compiledFilter`, and return an error for a value the
+   operator cannot take. If some values can match no document at all,
+   report it in `compiledFilter.never`.
+2. Add its case to `compiledFilter.match`, comparing through
+   `filterValue.equals` / `compareTo` for type-aware semantics. Only
+   `exists` looks at a missing field; keep that rule.
+3. Decide whether an index can serve it in `filterOption`
+   (`pkg/db/plan.go`): a value group (`probeOption`) or a value range
+   (`rangeOption`, `rangeOf`). Candidates are always re-checked, so they
+   only need to be a superset; the overlay rule (`planOption.cand`) must
+   pick the same documents as the entries would. If counts can be exact
+   from the entries, add it to `countExact` (`pkg/db/query.go`).
+4. Add it to `Operators` in `internal/mcp/tools.go` (the schema enum) and
    to the `query` docs topic.
-4. Add cases to `compare_test.go` / `query_test.go`.
+5. Add cases to `compare_test.go` / `query_test.go` and to the reference
+   model (`model_test.go`: `modelOps`, `mMatch`).
 
 ### Adding a field type
 

@@ -84,6 +84,7 @@ on-disk format versions this build reads and writes.
 | `Insert(ctx, *Document) (string, error)` | Empty `doc.ID` gets a UUID v7 (generated ids sort in creation order); `ErrExists`; `ErrSchemaValidation` (schema, or `"_id"` key in `Data`) |
 | `Get(ctx, id) (*Document, error)` | Deep copy; `ErrNotFound` |
 | `Find(ctx, *Query) ([]*Document, error)` | See [Queries](#queries) |
+| `FindWithPlan(ctx, *Query) ([]*Document, QueryPlan, error)` | `Find` plus the plan it ran: driver, index, whether the order was provided, examined and returned counts (for `explain`) |
 | `CountDocuments(ctx, *Query) (int, error)` | Filters and `Any` only; fast paths below |
 | `Distinct(ctx, field, *Query) ([]any, error)` | Arrays contribute each element; deduplicated like `eq`, sorted by the sort order |
 | `Update(ctx, id, set map[string]any) (*Document, error)` | `UpdateWith` with only `Set` |
@@ -195,7 +196,7 @@ type Query struct {
 type SortKey struct { Field, Order string } // "asc" (default) | "desc"
 ```
 
-Semantics (`compare.go`, `query.go`, `document.go`):
+Semantics (`compare.go`, `query.go`, `plan.go`):
 
 - All `Filters` must match (AND), and when `Any` is set every filter of at
   least one group. `Field` is a **top-level** field name or `_id`; there
@@ -204,59 +205,123 @@ Semantics (`compare.go`, `query.go`, `document.go`):
   (case-insensitive substring of a string or of a string array element;
   `""` matches any string or array), `has` (an array element equals the
   value), `has_any`, `has_all` (some / every value of the array value is
-  an element). Unknown operators match nothing. `eq`/`ne`/`in` compare
-  arrays as whole values.
+  an element), `exists` (value `true`: the field is present, `null`
+  included; `false`: it is missing), `starts_with` (a string field begins
+  with the value; case-sensitive, byte-wise; array elements do not count).
+  `eq`/`ne`/`in` compare arrays as whole values.
+- **Compilation.** Each call compiles its filters once (`compileQuery`,
+  `compileFilter`): the operator becomes an `opCode`, the value is
+  normalized (`filterValue`: scalars compare directly, objects and arrays
+  through `reflect.DeepEqual` after `normalize`), `$now` is resolved. An
+  unknown operator, `exists` with a non-boolean value, and `starts_with`
+  with a non-string value are errors from `Find`, `CountDocuments`,
+  `Distinct`, and conditional writes (`if`), before anything is read or
+  written. Other ill-typed values match nothing (`in`/`has_any`/`has_all`
+  with a non-array, `contains` with a non-string, a range with a value that
+  does not order); a query with such an AND filter reads nothing (driver
+  `none`).
 - Comparison is type-aware: every numeric kind (and `json.Number`) compares
   as `float64`; strings compare lexically with strings; bools and `null`
   support equality only; objects and arrays support equality (deep, with
   numbers normalized). Values of different types never order:
   `gt/gte/lt/lte` and `eq` are false, `ne` is true.
 - **A document missing the filtered field matches no operator, including
-  `ne`.** This differs from MongoDB's `$ne` and is intentional.
+  `ne`,** except `exists false`. This differs from MongoDB's `$ne` and is
+  intentional.
 - `in` takes an array; it matches when the field equals any element.
-- Order: `Sort` keys, then `_id` ascending. Without `Sort` (or with exactly
-  `_id asc`), ids are walked in order and the scan stops once `Skip+Limit`
-  matches are found (`_id desc` walks them backwards). Any other sort
-  reads every match and keeps the best `Skip+Limit` in a bounded heap
-  (`sortHeap`), using a total order: missing < null < false < true <
+- Order: `Sort` keys, then `_id` ascending (also for `desc` keys: ties keep
+  ascending `_id`), using a total order: missing < null < false < true <
   numbers < strings < arrays < objects (arrays and objects by canonical
-  JSON); `desc` reverses it. `Skip` matches are skipped, then at most
-  `Limit` are returned (0 or negative = no limit). Paging is
-  deterministic. An invalid order or empty sort field is an error.
+  JSON). Without `Sort` (or with exactly `_id asc`) the order is `_id`
+  ascending; `_id desc` alone is `_id` descending. `Skip` matches are
+  skipped, then at most `Limit` are returned (0 or negative = no limit).
+  Paging is deterministic. An invalid order or empty sort field is an
+  error.
 - `Fields` is applied after filtering and sorting; `_id` is always kept.
-- Candidates: the smallest id set among `eq` on `_id`, and `eq`/`has`
-  (one key), `has_any` (union), `has_all` (intersection of its indexable
-  values) on an indexed field. Without one, every live document is
-  scanned (read from the memtable, cache, or disk). Candidates are always
-  re-checked against every filter. `contains`, ranges, and `Any` groups
-  never use an index.
-- `CountDocuments`: no filter → `Count()`; exactly one `eq` or `has` on an
-  indexed field (or `eq` on `_id`) and no `Any` → answered from the index
-  without reading documents (exact, through the marker keys below);
-  otherwise like `Find` without materializing results.
-- `Distinct`: without filters on `_id` or an indexed field, decoded from
-  the index keys (unless the unindexable marker is non-empty); otherwise
-  scanned.
+
+### Snapshot and plans (`plan.go`)
+
+A query runs in one snapshot: it captures the overlay (the memtable and
+`flushing`: id → document or tombstone) and the index definitions under
+`Collection.mu`, then opens one read transaction on `index.db`
+(`openSnap`). An id in the overlay is evaluated from the overlay only;
+the drivers skip its entries. The query holds no collection lock across
+the transaction and opens no second one (bbolt would deadlock against a
+flush that grows the file). When a segment it reads was retired by
+compaction, or an index it chose was dropped or re-created meanwhile, the
+query starts over in a new snapshot (`errQueryRetry`, up to 8 times; after
+4 it ignores indexes).
+
+One driver produces the candidates of the documents in `index.db`
+(`choosePlan`):
+
+| Driver (`QueryPlan.Driver`) | Used when | Order produced |
+|---|---|---|
+| `id lookup` | `eq` or `in` on `_id` (always preferred) | `_id` |
+| `index` | `eq`, `has`, `exists false`, `in`, `has_any`, `has_all` on an indexed field | `_id` (several values: merged union, or intersection for `has_all`) |
+| `index range` | `gt`/`gte`/`lt`/`lte`, `starts_with` (prefix range), `exists true` (only while the index's `complex` and `arrays` counters are 0) | value, then `_id` |
+| `or union` | every `Any` group has a served filter | `_id` (value-ordered groups are collected first) |
+| `index sort` | `Sort` is one key on an indexed field, the index's `complex`, `truncated`, and `arrays` counters are 0, and no filter is served (or the query has a limit and the best filter is large) | the requested order, both directions |
+| `keydir` | none of the above | `_id`, both directions |
+| `none` | an AND filter can match nothing | — |
+
+Among served filters the smallest estimate wins: a cursor count of the
+entries capped at 1,000 (`planEstimateCap`) plus the overlay documents
+that are candidates. The overlay's documents are candidates by the same
+rule as the entries (`planOption.cand`: the entry rule for
+`eq`/`has`/`in`/`has_any`/`has_all`, the filter itself for ranges,
+`starts_with`, `exists`), so examined counts do not depend on what is
+flushed. Every candidate is re-checked against every filter and group.
+
+Execution: when the driver yields the requested order, the query streams,
+merging the overlay's candidates sorted the same way, and stops at
+`Skip+Limit` matches (`findByID`, `findBySortWalk`). In `_id` order with a
+value-ordered driver (a range), the candidate ids are collected from the
+index without reading documents, sorted, then read in order with the same
+early stop. A sort the driver does not provide reads every candidate into
+a bounded heap of `Skip+Limit` (`findByHeap`, `sortHeap`). A descending
+index sort walks value groups backwards and each group forwards.
+
+`Collection.FindWithPlan` returns the `QueryPlan` (driver, index name,
+whether the order was provided, examined and returned counts); the
+internal `find` returns the examined count for tests.
+
+- `CountDocuments`: no filter → `Count()`; a single filter that the key
+  table or an index answers exactly (`countExact`: `eq`/`in` on `_id`;
+  `eq`, `has`, `in` on values shorter than 1,023 encoded bytes,
+  `exists false`, ranges and `starts_with` on an indexed field) and no
+  `Any` → counted from the entries without reading documents (overlay ids
+  left out, overlay documents matched); otherwise the candidates of the
+  plan `Find` would choose (without the sort walk) are read and matched.
+- `Distinct`: without filters on `_id`, or on an indexed field whose
+  `complex` and `truncated` counters are 0 and no overlay document is
+  complex, decoded from the index entries; otherwise the plan's
+  candidates are read.
 
 ## Indexes (`index.go`)
 
-- Multi-value hash indexes: canonical key → set of document ids. Duplicate
-  values are fully supported; deleting one document removes only its id.
-- Keys are type-tagged: `n:<float>` (numbers, `-0` folded into `0`),
-  `s:<string>`, `b:t`/`b:f`, `z:` (null). So the number `1` and the string
-  `"1"` are different keys.
-- An array value is indexed under the key of **each** scalar element
-  (plan 004). Objects, nested arrays, and NaN are not indexed; `eq`
-  filters on such values scan.
-- Two marker keys make counts and distinct values exact: `a:` holds the
-  ids whose field is an array, `u:` those whose value (or an element) is
-  not indexable. `countEq` = |key set| − |key set ∩ `a:`|; `countHas` =
-  |key set ∩ `a:`|.
-- `eq`, `has`, `has_any`, and `has_all` use an index; per-element keys
-  can make `eq` candidates a superset, which the re-check removes. The
-  `_id` lookup uses the keydir (no separate `_id` index exists).
-- Indexes are kept in memory, persisted as snapshots, and rebuilt when a
-  snapshot is missing or invalid (see [STORAGE.md](STORAGE.md)).
+- Every index is a bucket `ix/<name>` in the collection's `index.db`,
+  maintained by the flusher in the same transaction as the key table. An
+  entry is `encoded value · 0x00 0x00 · document id → flags`; the value
+  encoding (`idxstore` `AppendValue`) is order-preserving, so the byte
+  order is the engine's sort order missing < null < false < true <
+  numbers < strings, and within one value entries are in `_id` order.
+  Numbers fold `-0` into `0`; so `1` and `"1"` are different values.
+- Per document version (`indexKeysOf`): a missing field has one entry
+  under the `missing` value; an indexable scalar one entry (flags 0); an
+  array one entry per distinct indexable element (`FlagElement`). Objects,
+  NaN, and non-indexable elements get no entry and count the document in
+  the index's `complex` counter. Strings encoded longer than 1,024 bytes
+  are cut (`FlagTruncated`, counted in `truncated` by idxstore) and are
+  candidates only. Every array value (empty ones included) counts the
+  document in `arrays`.
+- `eq` uses the entries without `FlagElement`, `has`/`has_any`/`has_all`
+  those with it; ranges and `starts_with` use entries without it. An index
+  drives a sort only while `complex`, `truncated`, and `arrays` are all 0:
+  then every document has exactly one entry, ordered as `Find` sorts.
+- The `_id` lookup uses the key table (no separate `_id` index exists).
+- Unflushed changes are not in `index.db`; readers apply the snapshot rule
+  above. See [STORAGE.md](STORAGE.md) for the file.
 
 ## Migrations
 

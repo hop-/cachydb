@@ -459,8 +459,8 @@ func flushRecords(flushing map[string]memEntry) ([]flushEntry, []segment.Record,
 // that is already flushed), the new record is dead on arrival; otherwise
 // the entry replaces it, or removes the id for a tombstone, and the old
 // record becomes dead. The index entries of the old version (oldIndexKeys)
-// are replaced by those of the new one, and each index's complex counter
-// follows. Then it adds the record and dead bytes to the segment accounting
+// are replaced by those of the new one, and each index's complex and
+// arrays counters follow. Then it adds the record and dead bytes to the segment accounting
 // (registering the active segment on its first flush) and stores the
 // covered position and the checkpoint. The live count and the truncated
 // counters follow the key table and the entries by themselves (idxstore).
@@ -480,6 +480,7 @@ func (c *Collection) applyFlush(u *idxstore.WTx, defs []indexDef, entries []flus
 	deadBytes := make(map[uint32]int64, 2)
 	ixOps := make([][]indexOp, len(defs))
 	complexDelta := make([]int64, len(defs))
+	arraysDelta := make([]int64, len(defs))
 	var maxOff uint64
 	for _, i := range order {
 		en, loc := entries[i], locs[i]
@@ -506,6 +507,7 @@ func (c *Collection) applyFlush(u *idxstore.WTx, defs []indexDef, entries []flus
 				}
 				ixOps[j] = appendIndexDiff(ixOps[j], en.id, oldKeys[def.Name].entries, next.entries)
 				complexDelta[j] += boolInt(next.complex) - boolInt(oldKeys[def.Name].complex)
+				arraysDelta[j] += boolInt(next.array) - boolInt(oldKeys[def.Name].array)
 			}
 		}
 		if had {
@@ -523,7 +525,7 @@ func (c *Collection) applyFlush(u *idxstore.WTx, defs []indexDef, entries []flus
 		}
 	}
 	for j, def := range defs {
-		if len(ixOps[j]) == 0 && complexDelta[j] == 0 {
+		if len(ixOps[j]) == 0 && complexDelta[j] == 0 && arraysDelta[j] == 0 {
 			continue
 		}
 		w, err := u.Index(def.Name)
@@ -534,6 +536,9 @@ func (c *Collection) applyFlush(u *idxstore.WTx, defs []indexDef, entries []flus
 			return err
 		}
 		if err := w.AddComplex(complexDelta[j]); err != nil {
+			return err
+		}
+		if err := w.AddArrays(arraysDelta[j]); err != nil {
 			return err
 		}
 	}

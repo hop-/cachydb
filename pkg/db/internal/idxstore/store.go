@@ -15,8 +15,8 @@
 // highest WAL offset of any change the file reflects), "count"
 // (live documents, kept by PutKey and DeleteKey), "covered" (the data
 // position the index reflects), one "seg:<id>" per live data segment
-// (record bytes, dead bytes), and one "ix:<name>" per index (its complex
-// and truncated counters and whether it is ready). All integers in the
+// (record bytes, dead bytes), and one "ix:<name>" per index (its complex,
+// truncated, and arrays counters and whether it is ready). All integers in the
 // file are big-endian.
 //
 // Everything changes through Store.Update, one bbolt transaction: either
@@ -66,8 +66,9 @@ const FileName = "index.db"
 const (
 	fileMode = 0o644
 
-	// formatVersion is the layout version stored under "format".
-	formatVersion = 1
+	// formatVersion is the layout version stored under "format". Version 2
+	// added the arrays counter to the index meta entries.
+	formatVersion = 2
 
 	// minFileSize is the size of the smallest file bbolt writes: four
 	// pages of the smallest page size. Anything shorter is damaged.

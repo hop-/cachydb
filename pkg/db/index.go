@@ -2,7 +2,6 @@ package db
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -35,6 +34,11 @@ import (
 //     entry. The document is then counted in the index's complex counter
 //     (at most once), so readers know that the entries miss a value.
 //
+// An array value (empty ones included) also counts the document in the
+// index's arrays counter: an index may drive a sort only while no document
+// has an array, a complex value, or a truncated entry, because only then
+// does every document have exactly one entry, ordered as Find sorts.
+//
 // The truncated counter is kept by idxstore. eq uses the entries without
 // FlagElement, has those with it; every candidate is re-checked against
 // every filter, so an index only has to return a superset.
@@ -46,10 +50,12 @@ type indexEntry struct {
 }
 
 // docIndexKeys is what one document version contributes to one index: its
-// entries, and whether it holds a value that has no entry (complex).
+// entries, whether it holds a value that has no entry (complex), and
+// whether the value is an array.
 type docIndexKeys struct {
 	entries []indexEntry
 	complex bool
+	array   bool
 }
 
 // indexBase holds, per index name, the keys of one document version. A
@@ -83,7 +89,7 @@ func indexKeysOf(doc *Document, field string) docIndexKeys {
 		return docIndexKeys{complex: true}
 	}
 	var (
-		out  docIndexKeys
+		out  = docIndexKeys{array: true}
 		seen map[string]int // enc -> position in out.entries, for long arrays
 	)
 	if len(elems) > dedupLinearMax {
@@ -213,7 +219,7 @@ const indexBuildBatch = 50_000
 // document its key table lists (approach-index-and-query §10, and the
 // rebuild of §8/§9): an existing bucket of the same name is dropped, the
 // new one is created not ready, the entries are sorted by key and written
-// in batches, and the last batch stores the complex counters and marks the
+// in batches, and the last batch stores the complex and arrays counters and marks the
 // indexes ready. An interrupted build leaves an index that is not ready,
 // which the next Open builds again (syncIndexes).
 //
@@ -225,6 +231,7 @@ func (c *Collection) buildIndexes(ctx context.Context, st *idxstore.Store, defs 
 	}
 	ops := make([][]indexOp, len(defs))
 	complexN := make([]int64, len(defs))
+	arraysN := make([]int64, len(defs))
 	err := st.View(func(tx *idxstore.Tx) error {
 		n := 0
 		cur := tx.KeyCursor()
@@ -243,6 +250,9 @@ func (c *Collection) buildIndexes(ctx context.Context, st *idxstore.Store, defs 
 				keys := indexKeysOf(doc, def.Field)
 				if keys.complex {
 					complexN[i]++
+				}
+				if keys.array {
+					arraysN[i]++
 				}
 				for _, en := range keys.entries {
 					ops[i] = append(ops[i], indexOp{enc: en.enc, id: id, flags: en.flags})
@@ -309,6 +319,9 @@ func (c *Collection) buildIndexes(ctx context.Context, st *idxstore.Store, defs 
 				return err
 			}
 			if err := w.AddComplex(complexN[i]); err != nil {
+				return err
+			}
+			if err := w.AddArrays(arraysN[i]); err != nil {
 				return err
 			}
 			if err := w.SetReady(); err != nil {
@@ -424,163 +437,6 @@ func valueIDs(cur *idxstore.IndexCursor, enc []byte, element bool, skip map[stri
 		dst = append(dst, string(e.ID))
 	}
 	return dst
-}
-
-// countValue returns the number of entries of value enc whose FlagElement
-// equals element and that are not truncated, leaving out the ids in skip.
-func countValue(cur *idxstore.IndexCursor, enc []byte, element bool, skip map[string]*Document) int {
-	n := 0
-	for e, ok := cur.Seek(idxstore.ValuePrefix(enc)); ok && bytes.Equal(e.Value, enc); e, ok = cur.Next() {
-		if (e.Flags&idxstore.FlagElement != 0) != element || e.Flags&idxstore.FlagTruncated != 0 {
-			continue
-		}
-		if _, in := skip[string(e.ID)]; in {
-			continue
-		}
-		n++
-	}
-	return n
-}
-
-// usesIndex reports whether the filter f on a field with an index can take
-// its candidates from it (see indexCandidates), with today's rules: eq and
-// has with an indexable value, has_any with indexable values (or a value
-// that is not an array, which matches nothing), and has_all with at least
-// one indexable value (or a value that is not an array).
-func usesIndex(f QueryFilter) bool {
-	switch f.Operator {
-	case "eq", "has":
-		_, _, ok := idxstore.AppendValue(nil, f.Value)
-		return ok
-	case "has_any":
-		vals, ok := listValues(f.Value)
-		if !ok {
-			return true
-		}
-		for _, v := range vals {
-			if _, _, ok := idxstore.AppendValue(nil, v); !ok {
-				return false // such a value could match an element without an entry
-			}
-		}
-		return true
-	case "has_all":
-		vals, ok := listValues(f.Value)
-		if !ok {
-			return true
-		}
-		for _, v := range vals {
-			if _, _, ok := idxstore.AppendValue(nil, v); ok {
-				return true
-			}
-		}
-		return false
-	}
-	return false
-}
-
-// indexCandidates returns, sorted, the ids of the index name's entries that
-// may match f (usesIndex(f) holds), leaving out the ids in skip: eq takes
-// the entries of the value without FlagElement, has those with it, has_any
-// the union over its values, and has_all the intersection over its
-// indexable values. A has_any or has_all value that is not an array
-// matches nothing.
-func indexCandidates(tx *idxstore.Tx, name string, f QueryFilter, skip map[string]*Document) ([]string, error) {
-	cur, err := tx.IndexCursor(name)
-	if err != nil {
-		return nil, err
-	}
-	switch f.Operator {
-	case "eq", "has":
-		enc, _, _ := idxstore.AppendValue(nil, f.Value)
-		ids := valueIDs(cur, enc, f.Operator == "has", skip, nil)
-		return ids, cur.Err()
-	}
-	vals, ok := listValues(f.Value)
-	if !ok {
-		return nil, nil
-	}
-	var lists [][]string
-	for _, v := range vals {
-		enc, _, ok := idxstore.AppendValue(nil, v)
-		if !ok {
-			continue // has_all: a superset without it (usesIndex rules out has_any)
-		}
-		lists = append(lists, valueIDs(cur, enc, true, skip, nil))
-	}
-	if err := cur.Err(); err != nil {
-		return nil, err
-	}
-	if f.Operator == "has_any" {
-		var all []string
-		for _, l := range lists {
-			all = append(all, l...)
-		}
-		slices.Sort(all)
-		return slices.Compact(all), nil
-	}
-	// has_all: intersect, smallest list first.
-	if len(lists) == 0 {
-		return nil, nil
-	}
-	slices.SortFunc(lists, func(a, b []string) int { return cmp.Compare(len(a), len(b)) })
-	out := lists[0]
-	for _, l := range lists[1:] {
-		out = intersectSorted(out, l)
-	}
-	return out, nil
-}
-
-// entriesCandidate reports whether a document with the index keys keys is
-// a candidate for f by the rule of indexCandidates. It decides for the
-// documents of the overlay, which have no entries in the index file, so
-// that the candidates do not depend on what is flushed.
-func entriesCandidate(keys docIndexKeys, f QueryFilter) bool {
-	has := func(v any, element bool) (found, indexable bool) {
-		enc, _, ok := idxstore.AppendValue(nil, v)
-		if !ok {
-			return false, false
-		}
-		return slices.ContainsFunc(keys.entries, func(e indexEntry) bool {
-			return (e.flags&idxstore.FlagElement != 0) == element && bytes.Equal(e.enc, enc)
-		}), true
-	}
-	switch f.Operator {
-	case "eq", "has":
-		found, _ := has(f.Value, f.Operator == "has")
-		return found
-	}
-	vals, ok := listValues(f.Value)
-	if !ok {
-		return false
-	}
-	for _, v := range vals {
-		found, indexable := has(v, true)
-		switch {
-		case f.Operator == "has_any" && found:
-			return true
-		case f.Operator == "has_all" && indexable && !found:
-			return false
-		}
-	}
-	return f.Operator == "has_all"
-}
-
-// intersectSorted returns the strings in both ascending lists a and b.
-func intersectSorted(a, b []string) []string {
-	var out []string
-	for i, j := 0, 0; i < len(a) && j < len(b); {
-		switch c := strings.Compare(a[i], b[j]); {
-		case c < 0:
-			i++
-		case c > 0:
-			j++
-		default:
-			out = append(out, a[i])
-			i++
-			j++
-		}
-	}
-	return out
 }
 
 // mergeSorted returns the union of the ascending, duplicate-free lists a

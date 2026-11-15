@@ -3,6 +3,7 @@ package db
 import (
 	"cmp"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"math"
 	"reflect"
@@ -18,7 +19,8 @@ import (
 //   - strings compare lexically (byte order) with strings;
 //   - bools and nil support equality only;
 //   - objects and arrays support equality through reflect.DeepEqual after
-//     numeric normalization;
+//     numeric normalization (scalars are compared directly, see
+//     filterValue);
 //   - values of different types are not comparable: gt/gte/lt/lte and eq
 //     are false for them, ne is true.
 
@@ -137,108 +139,335 @@ func normalize(v any) any {
 	return v
 }
 
-// matchesFilter reports whether doc satisfies f. A document that lacks the
-// filtered field matches no operator. Unknown operators match nothing. For
-// "in", f.Value must be a slice or array; the document matches when its
-// value equals any element. The element operators (plan 004 §2.2) are:
-//
-//   - contains: a string field contains f.Value (a string),
-//     case-insensitively; an array field has a string element that does;
-//   - has: an array field has an element equal to f.Value;
-//   - has_any: an array field has an element equal to some value of the
-//     array f.Value;
-//   - has_all: every value of the array f.Value equals some element of
-//     an array field.
-//
-// eq, ne, and in compare arrays as whole values.
-func matchesFilter(doc *Document, f QueryFilter) bool {
-	value, exists := doc.GetValue(f.Field)
-	if !exists {
-		return false
-	}
+// Operators. A QueryFilter's Operator string is compiled into one of these
+// once per call (compileFilter); an unknown operator is an error.
+type opCode uint8
 
-	switch f.Operator {
-	case "eq":
-		return valuesEqual(value, f.Value)
-	case "ne":
-		return !valuesEqual(value, f.Value)
-	case "gt":
-		c, ok := compare(value, f.Value)
-		return ok && c > 0
-	case "gte":
-		c, ok := compare(value, f.Value)
-		return ok && c >= 0
-	case "lt":
-		c, ok := compare(value, f.Value)
-		return ok && c < 0
-	case "lte":
-		c, ok := compare(value, f.Value)
-		return ok && c <= 0
-	case "in":
+const (
+	opEq opCode = iota + 1
+	opNe
+	opGt
+	opGte
+	opLt
+	opLte
+	opIn
+	opContains
+	opHas
+	opHasAny
+	opHasAll
+	opExists
+	opStartsWith
+)
+
+// operatorNames lists the operators in the order the docs give them.
+var operatorNames = []string{"eq", "ne", "gt", "gte", "lt", "lte", "in", "contains", "has", "has_any", "has_all", "exists", "starts_with"}
+
+// operatorCodes maps an operator name to its code.
+var operatorCodes = map[string]opCode{
+	"eq": opEq, "ne": opNe, "gt": opGt, "gte": opGte, "lt": opLt, "lte": opLte, "in": opIn,
+	"contains": opContains, "has": opHas, "has_any": opHasAny, "has_all": opHasAll,
+	"exists": opExists, "starts_with": opStartsWith,
+}
+
+// valueKind classifies a filter value for equality.
+type valueKind uint8
+
+const (
+	kindNull valueKind = iota
+	kindBool
+	kindNumber
+	kindString
+	kindOther // objects, arrays, and every other type: deep equality after normalize
+)
+
+// filterValue is a filter value normalized once, so that matching a
+// document compares scalars directly instead of through reflect.DeepEqual.
+type filterValue struct {
+	kind  valueKind
+	b     bool
+	n     float64
+	s     string
+	other any // normalize(v), for kindOther
+}
+
+func newFilterValue(v any) filterValue {
+	if v == nil {
+		return filterValue{kind: kindNull}
+	}
+	if f, ok := toFloat(v); ok {
+		return filterValue{kind: kindNumber, n: f}
+	}
+	switch t := v.(type) {
+	case string:
+		return filterValue{kind: kindString, s: t}
+	case bool:
+		return filterValue{kind: kindBool, b: t}
+	}
+	return filterValue{kind: kindOther, other: normalize(v)}
+}
+
+// equals reports whether the document value v equals fv under R5 semantics:
+// exactly valuesEqual(v, the filter value).
+func (fv *filterValue) equals(v any) bool {
+	switch fv.kind {
+	case kindNull:
+		return v == nil
+	case kindBool:
+		b, ok := v.(bool)
+		return ok && b == fv.b
+	case kindNumber:
+		f, ok := toFloat(v)
+		return ok && f == fv.n // NaN equals nothing, as with reflect.DeepEqual
+	case kindString:
+		s, ok := v.(string)
+		return ok && s == fv.s
+	}
+	return reflect.DeepEqual(fv.other, normalize(v))
+}
+
+// compiledFilter is a QueryFilter compiled once per call: the operator as
+// a code and the value normalized for it.
+type compiledFilter struct {
+	field string
+	op    opCode
+	value any // the filter value as given ($now resolved); the index plans encode it
+
+	val    filterValue   // eq, ne, has
+	list   []filterValue // in, has_any, has_all
+	isList bool          // the value is an array (in, has_any, has_all)
+
+	// Ranges (gt, gte, lt, lte): the value orders as a number (n) or a
+	// string (s); otherwise the filter matches nothing.
+	ordered bool
+	num     bool
+	n       float64
+	s       string // also the lowered substring of contains and the prefix of starts_with
+	isStr   bool   // contains: the value is a string
+
+	exists bool // exists: want the field present (true) or missing (false)
+}
+
+// compileFilter compiles f. It fails for an unknown operator, for exists
+// with a value that is not a boolean, and for starts_with with a value that
+// is not a string. Values of the wrong type for the other operators match
+// nothing, as before.
+func compileFilter(f QueryFilter) (compiledFilter, error) {
+	op, ok := operatorCodes[f.Operator]
+	if !ok {
+		return compiledFilter{}, fmt.Errorf("filter on field %q: unknown operator %q (want one of %s)",
+			f.Field, f.Operator, strings.Join(operatorNames, " "))
+	}
+	cf := compiledFilter{field: f.Field, op: op, value: f.Value}
+	switch op {
+	case opEq, opNe, opHas:
+		cf.val = newFilterValue(f.Value)
+	case opIn, opHasAny, opHasAll:
 		vals, ok := listValues(f.Value)
+		cf.isList = ok
+		cf.list = make([]filterValue, len(vals))
+		for i, v := range vals {
+			cf.list[i] = newFilterValue(v)
+		}
+	case opGt, opGte, opLt, opLte:
+		if n, ok := toFloat(f.Value); ok {
+			cf.ordered, cf.num, cf.n = !math.IsNaN(n), true, n
+		} else if s, ok := f.Value.(string); ok {
+			cf.ordered, cf.s = true, s
+		}
+	case opContains:
+		if s, ok := f.Value.(string); ok {
+			cf.isStr, cf.s = true, strings.ToLower(s)
+		}
+	case opExists:
+		b, ok := f.Value.(bool)
 		if !ok {
-			return false
+			return compiledFilter{}, fmt.Errorf("filter on field %q: exists takes a boolean, got %s", f.Field, describeValue(f.Value))
 		}
-		for _, v := range vals {
-			if valuesEqual(value, v) {
-				return true
-			}
+		cf.exists = b
+	case opStartsWith:
+		s, ok := f.Value.(string)
+		if !ok {
+			return compiledFilter{}, fmt.Errorf("filter on field %q: starts_with takes a string, got %s", f.Field, describeValue(f.Value))
 		}
-		return false
-	case "contains":
-		return matchContains(value, f.Value)
-	case "has":
-		elems, ok := listValues(value)
-		return ok && containsEqual(elems, f.Value)
-	case "has_any":
-		elems, ok := listValues(value)
-		want, wok := listValues(f.Value)
-		if !ok || !wok {
-			return false
+		cf.s = s
+	}
+	return cf, nil
+}
+
+// describeValue names the JSON type of v for error messages.
+func describeValue(v any) string {
+	if v == nil {
+		return "null"
+	}
+	if _, ok := toFloat(v); ok {
+		return "a number"
+	}
+	switch v.(type) {
+	case string:
+		return "a string"
+	case bool:
+		return "a boolean"
+	}
+	if _, ok := listValues(v); ok {
+		return "an array"
+	}
+	return "an object"
+}
+
+// compileFilters compiles every filter of fs (nil for none).
+func compileFilters(fs []QueryFilter) ([]compiledFilter, error) {
+	if len(fs) == 0 {
+		return nil, nil
+	}
+	out := make([]compiledFilter, len(fs))
+	for i, f := range fs {
+		cf, err := compileFilter(f)
+		if err != nil {
+			return nil, err
 		}
-		for _, w := range want {
-			if containsEqual(elems, w) {
-				return true
-			}
-		}
-		return false
-	case "has_all":
-		elems, ok := listValues(value)
-		want, wok := listValues(f.Value)
-		if !ok || !wok {
-			return false
-		}
-		for _, w := range want {
-			if !containsEqual(elems, w) {
-				return false
-			}
-		}
-		return true
+		out[i] = cf
+	}
+	return out, nil
+}
+
+// never reports whether f matches no document at all, whatever the data:
+// a range whose value does not order, in or has_any without values or with
+// a value that is not an array, has_all with a value that is not an array,
+// contains with a value that is not a string, and eq on _id with a value
+// that is not a string.
+func (f *compiledFilter) never() bool {
+	switch f.op {
+	case opGt, opGte, opLt, opLte:
+		return !f.ordered
+	case opIn, opHasAny:
+		return len(f.list) == 0
+	case opHasAll:
+		return !f.isList
+	case opContains:
+		return !f.isStr
+	case opEq:
+		return f.field == "_id" && f.val.kind != kindString
 	}
 	return false
 }
 
-// matchContains implements "contains": value is a string containing sub
-// case-insensitively, or an array with such a string element. sub must be
-// a string; the empty string matches every string and array field.
-func matchContains(value, sub any) bool {
-	s, ok := sub.(string)
-	if !ok {
+// match reports whether doc satisfies f. A document that lacks the
+// filtered field matches no operator except exists false. For "in", the
+// value must be an array; the document matches when its value equals any
+// element. The element operators (plan 004 §2.2) are:
+//
+//   - contains: a string field contains the value (a string),
+//     case-insensitively; an array field has a string element that does;
+//   - has: an array field has an element equal to the value;
+//   - has_any: an array field has an element equal to some value of the
+//     array value;
+//   - has_all: every value of the array value equals some element of an
+//     array field.
+//
+// exists true matches a document that has the field (null included),
+// exists false one that does not. starts_with matches a string field that
+// begins with the value (case-sensitive, byte-wise). eq, ne, and in compare
+// arrays as whole values.
+func (f *compiledFilter) match(doc *Document) bool {
+	value, exists := doc.GetValue(f.field)
+	if f.op == opExists {
+		return exists == f.exists
+	}
+	if !exists {
 		return false
 	}
-	s = strings.ToLower(s)
+	switch f.op {
+	case opEq:
+		return f.val.equals(value)
+	case opNe:
+		return !f.val.equals(value)
+	case opGt, opGte, opLt, opLte:
+		c, ok := f.compareTo(value)
+		if !ok {
+			return false
+		}
+		switch f.op {
+		case opGt:
+			return c > 0
+		case opGte:
+			return c >= 0
+		case opLt:
+			return c < 0
+		}
+		return c <= 0
+	case opIn:
+		for i := range f.list {
+			if f.list[i].equals(value) {
+				return true
+			}
+		}
+		return false
+	case opContains:
+		return f.isStr && matchContains(value, f.s)
+	case opHas:
+		elems, ok := listValues(value)
+		return ok && containsEqual(elems, &f.val)
+	case opHasAny, opHasAll:
+		if !f.isList {
+			return false
+		}
+		elems, ok := listValues(value)
+		if !ok {
+			return false
+		}
+		for i := range f.list {
+			found := containsEqual(elems, &f.list[i])
+			if f.op == opHasAny && found {
+				return true
+			}
+			if f.op == opHasAll && !found {
+				return false
+			}
+		}
+		return f.op == opHasAll
+	case opStartsWith:
+		s, ok := value.(string)
+		return ok && strings.HasPrefix(s, f.s)
+	}
+	return false
+}
+
+// compareTo orders the document value v against a range filter's value,
+// as compare(v, value) does; ok is false when the pair has no ordering.
+func (f *compiledFilter) compareTo(v any) (int, bool) {
+	if !f.ordered {
+		return 0, false
+	}
+	if f.num {
+		n, ok := toFloat(v)
+		if !ok || math.IsNaN(n) {
+			return 0, false
+		}
+		return cmp.Compare(n, f.n), true
+	}
+	s, ok := v.(string)
+	if !ok {
+		return 0, false
+	}
+	return strings.Compare(s, f.s), true
+}
+
+// matchContains implements "contains": value is a string containing the
+// lowered substring sub case-insensitively, or an array with such a string
+// element. The empty string matches every string and array field.
+func matchContains(value any, sub string) bool {
 	if v, ok := value.(string); ok {
-		return strings.Contains(strings.ToLower(v), s)
+		return strings.Contains(strings.ToLower(v), sub)
 	}
 	elems, ok := listValues(value)
 	if !ok {
 		return false
 	}
-	if s == "" {
+	if sub == "" {
 		return true
 	}
 	for _, e := range elems {
-		if v, ok := e.(string); ok && strings.Contains(strings.ToLower(v), s) {
+		if v, ok := e.(string); ok && strings.Contains(strings.ToLower(v), sub) {
 			return true
 		}
 	}
@@ -246,9 +475,9 @@ func matchContains(value, sub any) bool {
 }
 
 // containsEqual reports whether some element of elems equals v.
-func containsEqual(elems []any, v any) bool {
+func containsEqual(elems []any, v *filterValue) bool {
 	for _, e := range elems {
-		if valuesEqual(e, v) {
+		if v.equals(e) {
 			return true
 		}
 	}
@@ -277,32 +506,55 @@ func listValues(v any) ([]any, bool) {
 	return out, true
 }
 
-// matchesAll reports whether doc satisfies every filter.
-func matchesAll(doc *Document, filters []QueryFilter) bool {
-	for _, f := range filters {
-		if !matchesFilter(doc, f) {
+// matchAll reports whether doc satisfies every filter.
+func matchAll(doc *Document, filters []compiledFilter) bool {
+	for i := range filters {
+		if !filters[i].match(doc) {
 			return false
 		}
 	}
 	return true
 }
 
-// matchesQuery reports whether doc matches every filter of filters and,
+// matchQuery reports whether doc matches every filter of filters and,
 // when anyOf is not empty, every filter of at least one of its groups
 // (plan 004 §2.1).
-func matchesQuery(doc *Document, filters []QueryFilter, anyOf [][]QueryFilter) bool {
-	if !matchesAll(doc, filters) {
+func matchQuery(doc *Document, filters []compiledFilter, anyOf [][]compiledFilter) bool {
+	if !matchAll(doc, filters) {
 		return false
 	}
 	if len(anyOf) == 0 {
 		return true
 	}
 	for _, g := range anyOf {
-		if matchesAll(doc, g) {
+		if matchAll(doc, g) {
 			return true
 		}
 	}
 	return false
+}
+
+// matchesFilter compiles f and matches doc against it; a filter that does
+// not compile matches nothing. The engine compiles once per call instead.
+func matchesFilter(doc *Document, f QueryFilter) bool {
+	cf, err := compileFilter(f)
+	return err == nil && cf.match(doc)
+}
+
+// matchesQuery is matchQuery for filters that are not compiled yet; a
+// filter that does not compile matches nothing.
+func matchesQuery(doc *Document, filters []QueryFilter, anyOf [][]QueryFilter) bool {
+	cfs, err := compileFilters(filters)
+	if err != nil {
+		return false
+	}
+	groups := make([][]compiledFilter, len(anyOf))
+	for i, g := range anyOf {
+		if groups[i], err = compileFilters(g); err != nil {
+			return false
+		}
+	}
+	return matchQuery(doc, cfs, groups)
 }
 
 // $now values (plan 004 §1.1). In document data and in filter values, a

@@ -172,7 +172,10 @@ func (c *Collection) UpdateWith(ctx context.Context, id string, u UpdateSpec) (d
 	}
 	ts := nowString(time.Now())
 	set := resolveNowData(u.Set, ts)
-	cond := resolveNowFilters(u.If, ts)
+	cond, err := compileFilters(resolveNowFilters(u.If, ts))
+	if err != nil {
+		return nil, false, fmt.Errorf("updating document %q: if: %w", id, err)
+	}
 	next, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
 		upserted = false
 		if err := c.checkCondition(id, cur, cond); err != nil {
@@ -221,9 +224,12 @@ func (c *Collection) Replace(ctx context.Context, id string, doc *Document, cond
 	}
 	ts := nowString(time.Now())
 	data := resolveNowData(doc.Data, ts)
-	cond = resolveNowFilters(cond, ts)
+	ccond, err := compileFilters(resolveNowFilters(cond, ts))
+	if err != nil {
+		return nil, fmt.Errorf("replacing document %q: if: %w", id, err)
+	}
 	next, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
-		if err := c.checkCondition(id, cur, cond); err != nil {
+		if err := c.checkCondition(id, cur, ccond); err != nil {
 			return nil, err
 		}
 		if cur == nil {
@@ -248,9 +254,12 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 // and the document does not match it or is absent, and with ErrNotFound
 // if cond is empty and the document is absent.
 func (c *Collection) DeleteWith(ctx context.Context, id string, cond Condition) error {
-	cond = resolveNowFilters(cond, nowString(time.Now()))
-	_, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
-		if err := c.checkCondition(id, cur, cond); err != nil {
+	ccond, err := compileFilters(resolveNowFilters(cond, nowString(time.Now())))
+	if err != nil {
+		return fmt.Errorf("deleting document %q: if: %w", id, err)
+	}
+	_, err = c.write(ctx, id, func(cur *Document) (*Document, error) {
+		if err := c.checkCondition(id, cur, ccond); err != nil {
 			return nil, err
 		}
 		if cur == nil {
@@ -263,8 +272,8 @@ func (c *Collection) DeleteWith(ctx context.Context, id string, cond Condition) 
 
 // checkCondition returns ErrConditionFailed if cond is not empty and cur
 // (the stored version of id, nil if absent) does not match all of it.
-func (c *Collection) checkCondition(id string, cur *Document, cond Condition) error {
-	if len(cond) == 0 || (cur != nil && matchesAll(cur, cond)) {
+func (c *Collection) checkCondition(id string, cur *Document, cond []compiledFilter) error {
+	if len(cond) == 0 || (cur != nil && matchAll(cur, cond)) {
 		return nil
 	}
 	return fmt.Errorf("%w: document %s no longer matches if", ErrConditionFailed, id)
@@ -628,93 +637,6 @@ func decodeDocument(id string, data []byte) (*Document, error) {
 	return doc, nil
 }
 
-// candidates returns, sorted, the ids Find must examine for filters: for
-// an eq filter on _id, that id; otherwise the smallest candidate set among
-// the filters on an indexed field that can use the index (eq and has with
-// an indexable value; has_any, the union of its values' entries; has_all,
-// their intersection; see usesIndex), otherwise every live id. Candidates
-// are a superset of the matches: Find re-checks every filter.
-//
-// Index candidates follow the snapshot rule: the overlay is captured
-// first, the index entries of its ids are skipped, and its live documents
-// whose entries make them candidates by the same rule are merged in.
-func (c *Collection) candidates(filters []QueryFilter) ([]string, error) {
-	for _, f := range filters {
-		if f.Field == "_id" && f.Operator == "eq" {
-			// The key table and the memtable are the primary index. A
-			// non-string value equals no id.
-			if s, ok := f.Value.(string); ok {
-				return []string{s}, nil
-			}
-			return nil, nil
-		}
-	}
-
-	type plan struct {
-		f   QueryFilter
-		def indexDef
-	}
-	c.mu.RLock()
-	if c.dropped {
-		c.mu.RUnlock()
-		return nil, c.errDropped()
-	}
-	var plans []plan
-	for _, f := range filters {
-		if f.Field == "_id" || !usesIndex(f) {
-			continue
-		}
-		if def, ok := c.indexOnLocked(f.Field); ok {
-			plans = append(plans, plan{f: f, def: def})
-		}
-	}
-	c.mu.RUnlock()
-	if len(plans) == 0 {
-		return c.liveIDs()
-	}
-
-	overlay, st, err := c.captureOverlay()
-	if err != nil {
-		return nil, err
-	}
-	var (
-		best      []string
-		bestExtra []string // the overlay's part of best
-		found     bool
-	)
-	err = st.View(func(tx *idxstore.Tx) error {
-		for _, p := range plans {
-			ids, err := indexCandidates(tx, p.def.Name, p.f, overlay)
-			if err != nil {
-				return err
-			}
-			var extra []string // the overlay's candidates, by the same rule
-			for id, doc := range overlay {
-				if doc != nil && entriesCandidate(indexKeysOf(doc, p.def.Field), p.f) {
-					extra = append(extra, id)
-				}
-			}
-			if !found || len(ids)+len(extra) < len(best)+len(bestExtra) {
-				best, bestExtra, found = ids, extra, true
-			}
-		}
-		return nil
-	})
-	used := make([]indexDef, len(plans))
-	for i, p := range plans {
-		used[i] = p.def
-	}
-	switch {
-	case errors.Is(err, idxstore.ErrNoIndex), err == nil && !c.indexesUnchanged(used):
-		return c.liveIDs() // an index was dropped meanwhile: scan
-	case err != nil:
-		return nil, c.storeErr(err)
-	}
-
-	slices.Sort(bestExtra)
-	return mergeSorted(best, bestExtra), nil
-}
-
 // captureOverlay returns the overlay M of the snapshot rule (see the top
 // of this file): every id with a change that is not in the index file yet,
 // with its document (nil = deleted; the memtable wins over flushing), and
@@ -725,14 +647,8 @@ func (c *Collection) captureOverlay() (map[string]*Document, *idxstore.Store, er
 	c.mu.RLock()
 	st, err := c.storeLocked()
 	var overlay map[string]*Document
-	if n := len(c.memtable) + len(c.flushing); err == nil && n > 0 {
-		overlay = make(map[string]*Document, n)
-		for id, me := range c.flushing {
-			overlay[id] = me.doc
-		}
-		for id, me := range c.memtable {
-			overlay[id] = me.doc
-		}
+	if err == nil {
+		overlay = c.overlayLocked()
 	}
 	c.mu.RUnlock()
 	if err != nil {
@@ -746,6 +662,24 @@ func (c *Collection) captureOverlay() (map[string]*Document, *idxstore.Store, er
 		}
 	}
 	return overlay, st, nil
+}
+
+// overlayLocked returns the overlay: every id of the memtable and
+// flushing with its document (nil = deleted; the memtable wins), or nil
+// when both are empty. Callers hold mu.
+func (c *Collection) overlayLocked() map[string]*Document {
+	n := len(c.memtable) + len(c.flushing)
+	if n == 0 {
+		return nil
+	}
+	overlay := make(map[string]*Document, n)
+	for id, me := range c.flushing {
+		overlay[id] = me.doc
+	}
+	for id, me := range c.memtable {
+		overlay[id] = me.doc
+	}
+	return overlay
 }
 
 // liveIDs returns every live id in ascending order: an ordered walk of

@@ -41,7 +41,9 @@ type Schema struct {
 type QueryFilter struct {
 	Field string `json:"field"`
 	// Operator is one of "eq", "ne", "gt", "gte", "lt", "lte", "in",
-	// "contains", "has", "has_any", "has_all".
+	// "contains", "has", "has_any", "has_all", "exists" (Value is a
+	// boolean), "starts_with" (Value is a string). Any other operator is an
+	// error.
 	Operator string `json:"operator"`
 	Value    any    `json:"value"`
 }

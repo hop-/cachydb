@@ -22,7 +22,7 @@ var (
 	keyCount      = []byte("count")      // u64 live documents
 	keyCovered    = []byte("covered")    // u32 segment · u64 end position
 	segKeyPrefix  = []byte("seg:")       // + u32 segment id -> i64 record bytes · i64 dead bytes
-	ixKeyPrefix   = []byte("ix:")        // + index name -> i64 complex · i64 truncated · u8 ready
+	ixKeyPrefix   = []byte("ix:")        // + index name -> i64 complex · i64 truncated · i64 arrays · u8 ready
 
 	ixBucketPrefix = []byte("ix/") // + index name: the index's bucket
 
@@ -37,7 +37,7 @@ const (
 	entrySize      = 4 + 8 + 4 + 8
 	coveredSize    = 4 + 8
 	segStatsSize   = 8 + 8
-	indexStatsSize = 8 + 8 + 1
+	indexStatsSize = 8 + 8 + 8 + 1
 )
 
 // Entry is a key-table entry: where the live version of a document is in
@@ -87,13 +87,16 @@ type SegmentStats struct {
 // IndexStats describes one index. Complex is the number of documents
 // whose value has no entry because it is not indexable; the caller
 // maintains it with IndexWriter.AddComplex. Truncated is the number of
-// entries carrying FlagTruncated; the store maintains it. Ready is false
-// from CreateIndex until IndexWriter.SetReady: an index that is not ready
-// is still being built, or its build was interrupted.
+// entries carrying FlagTruncated; the store maintains it. Arrays is the
+// number of documents whose value is an array (empty ones included); the
+// caller maintains it with IndexWriter.AddArrays. Ready is false from
+// CreateIndex until IndexWriter.SetReady: an index that is not ready is
+// still being built, or its build was interrupted.
 type IndexStats struct {
 	Name      string
 	Complex   int64
 	Truncated int64
+	Arrays    int64
 	Ready     bool
 }
 
@@ -102,6 +105,7 @@ func encodeIndexStats(st IndexStats) []byte {
 	b := make([]byte, 0, indexStatsSize)
 	b = be.AppendUint64(b, uint64(st.Complex))
 	b = be.AppendUint64(b, uint64(st.Truncated))
+	b = be.AppendUint64(b, uint64(st.Arrays))
 	if st.Ready {
 		return append(b, 1)
 	}
@@ -109,11 +113,17 @@ func encodeIndexStats(st IndexStats) []byte {
 }
 
 func decodeIndexStats(name string, v []byte) (IndexStats, bool) {
-	if len(v) != indexStatsSize || v[16] > 1 {
+	if len(v) != indexStatsSize || v[24] > 1 {
 		return IndexStats{}, false
 	}
 	be := binary.BigEndian
-	return IndexStats{Name: name, Complex: int64(be.Uint64(v)), Truncated: int64(be.Uint64(v[8:])), Ready: v[16] == 1}, true
+	return IndexStats{
+		Name:      name,
+		Complex:   int64(be.Uint64(v)),
+		Truncated: int64(be.Uint64(v[8:])),
+		Arrays:    int64(be.Uint64(v[16:])),
+		Ready:     v[24] == 1,
+	}, true
 }
 
 func segKey(seg uint32) []byte {
@@ -542,9 +552,9 @@ func (w *IndexWriter) Put(enc []byte, id string, flags Flags) error {
 	}
 	switch now := flags&FlagTruncated != 0; {
 	case now && !was:
-		return w.add(0, 1)
+		return w.add(0, 1, 0)
 	case was && !now:
-		return w.add(0, -1)
+		return w.add(0, -1, 0)
 	}
 	return nil
 }
@@ -561,7 +571,7 @@ func (w *IndexWriter) Delete(enc []byte, id string) error {
 		return w.u.writeErr(err)
 	}
 	if truncated {
-		return w.add(0, -1)
+		return w.add(0, -1, 0)
 	}
 	return nil
 }
@@ -588,7 +598,11 @@ func (w *IndexWriter) seek(enc []byte, id string) ([]byte, error) {
 
 // AddComplex adds delta (which may be negative) to the index's count of
 // documents whose value is not indexable and so has no entry.
-func (w *IndexWriter) AddComplex(delta int64) error { return w.add(delta, 0) }
+func (w *IndexWriter) AddComplex(delta int64) error { return w.add(delta, 0, 0) }
+
+// AddArrays adds delta (which may be negative) to the index's count of
+// documents whose value is an array.
+func (w *IndexWriter) AddArrays(delta int64) error { return w.add(0, 0, delta) }
 
 // SetReady marks the index as completely built (see IndexStats).
 func (w *IndexWriter) SetReady() error {
@@ -611,8 +625,8 @@ func (w *IndexWriter) stats() (IndexStats, error) {
 	return st, nil
 }
 
-func (w *IndexWriter) add(complexDelta, truncatedDelta int64) error {
-	if complexDelta == 0 && truncatedDelta == 0 {
+func (w *IndexWriter) add(complexDelta, truncatedDelta, arraysDelta int64) error {
+	if complexDelta == 0 && truncatedDelta == 0 && arraysDelta == 0 {
 		return nil
 	}
 	st, err := w.stats()
@@ -621,6 +635,7 @@ func (w *IndexWriter) add(complexDelta, truncatedDelta int64) error {
 	}
 	st.Complex += complexDelta
 	st.Truncated += truncatedDelta
+	st.Arrays += arraysDelta
 	return w.u.putMeta(w.statsKey, encodeIndexStats(st))
 }
 

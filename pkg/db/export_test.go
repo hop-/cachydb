@@ -105,9 +105,9 @@ func docEntryStrings(doc *Document, field string) ([]string, bool) {
 //
 //   - the index file holds exactly one ready bucket per index definition;
 //   - each bucket holds exactly the entries of the versions the key table
-//     points at (none missing, none extra, same flags), and its complex
-//     and truncated counters equal the number of complex documents and
-//     truncated entries among them;
+//     points at (none missing, none extra, same flags), and its complex,
+//     truncated, and arrays counters equal the number of complex
+//     documents, truncated entries, and array values among them;
 //   - the entries of the ids outside the overlay plus the entries of the
 //     overlay's documents equal the entries of docs: what a reader sees;
 //   - idxstore's own consistency check finds nothing.
@@ -192,12 +192,15 @@ func checkIndexEntries(t testing.TB, c *Collection, docs []*Document) map[string
 			t.Errorf("%s: index %s is not ready", c.name, name)
 		}
 		var want []string
-		var complexN, truncatedN int64
+		var complexN, truncatedN, arraysN int64
 		for _, doc := range stored {
 			es, cx := docEntryStrings(doc, field)
 			want = append(want, es...)
 			if cx {
 				complexN++
+			}
+			if indexKeysOf(doc, field).array {
+				arraysN++
 			}
 			for _, en := range indexKeysOf(doc, field).entries {
 				if en.flags&idxstore.FlagTruncated != 0 {
@@ -210,9 +213,9 @@ func checkIndexEntries(t testing.TB, c *Collection, docs []*Document) map[string
 		if !slices.Equal(gotEntries, want) {
 			t.Errorf("%s: index %s holds\n  %v\nthe key table's documents give\n  %v", c.name, name, gotEntries, want)
 		}
-		if b.stats.Complex != complexN || b.stats.Truncated != truncatedN {
-			t.Errorf("%s: index %s counters complex=%d truncated=%d, want %d and %d",
-				c.name, name, b.stats.Complex, b.stats.Truncated, complexN, truncatedN)
+		if b.stats.Complex != complexN || b.stats.Truncated != truncatedN || b.stats.Arrays != arraysN {
+			t.Errorf("%s: index %s counters complex=%d truncated=%d arrays=%d, want %d, %d and %d",
+				c.name, name, b.stats.Complex, b.stats.Truncated, b.stats.Arrays, complexN, truncatedN, arraysN)
 		}
 
 		// What a reader sees: the entries outside the overlay, plus the

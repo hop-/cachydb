@@ -86,8 +86,8 @@ func (r *reader) checkLayout() error {
 // of entries; for every segment, record bytes less dead bytes equals the
 // bytes the key table references; every index entry is well formed and
 // belongs to a document in the key table; every truncated counter equals
-// the number of truncated entries; every complex counter is between 0 and
-// count.
+// the number of truncated entries; every complex and arrays counter is
+// between 0 and count.
 //
 // Check reads the whole file and holds the update lock while it does, so
 // its cost grows with the file and updates wait for it. It is meant for
@@ -233,5 +233,8 @@ func (r *reader) verifyIndex(p *problemList, ix IndexStats, b *bolt.Bucket, keys
 	}
 	if ix.Complex < 0 || ix.Complex > keys {
 		p.add("index %q: complex counter is %d with %d documents", ix.Name, ix.Complex, keys)
+	}
+	if ix.Arrays < 0 || ix.Arrays > keys {
+		p.add("index %q: arrays counter is %d with %d documents", ix.Name, ix.Arrays, keys)
 	}
 }

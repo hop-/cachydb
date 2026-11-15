@@ -44,7 +44,7 @@ Start with `dev-docs/PROJECT.md`, then `dev-docs/DEVELOPMENT.md`. User-facing do
 |------|------|
 | `pkg/db/engine.go` | `Engine`, `Open`/`Close`, database operations |
 | `pkg/db/document.go` | Document write path (WAL commit point; `UpdateWith`, `Replace`, `DeleteWith`, conditions), read path, candidate selection |
-| `pkg/db/query.go`, `compare.go`, `index.go` | `Find` (OR groups, sort, projection), `CountDocuments`, `Distinct`; operators and `$now`; hash indexes with per-element keys |
+| `pkg/db/query.go`, `plan.go`, `compare.go`, `index.go` | `Find` (OR groups, sort, projection), `CountDocuments`, `Distinct`; query plans and snapshots; compiled operators and `$now`; index entries |
 | `pkg/db/collection.go`, `database.go` | Schema/index metadata ops incl. `UpdateSchema` (WAL op 9), `RenameCollection` (WAL op 10), `CopyCollection` |
 | `pkg/db/flush.go`, `recovery.go`, `compact.go` | Parallel flusher and checkpoints, recovery and replay, compaction (incl. small-segment merges) |
 | `pkg/db/backpressure.go`, `metacp.go` | `MaxPendingBytes` write backpressure; `cachydb.metacp` metadata checkpoint |
