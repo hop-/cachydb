@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
 	"github.com/hop-/cachydb/pkg/db/internal/segment"
 )
 
@@ -171,6 +172,25 @@ func segRecords(t *testing.T, dir string) []segment.Record {
 	return out
 }
 
+// storedCheckpoint returns the checkpoint stored in c's index file: the
+// durable checkpoint since checkpoint marker records are no longer written
+// (approach-index-and-query §4).
+func storedCheckpoint(t *testing.T, c *Collection) uint64 {
+	t.Helper()
+	st, err := c.indexStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cp uint64
+	if err := st.View(func(tx *idxstore.Tx) error {
+		cp, err = tx.Checkpoint()
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return cp
+}
+
 func markers(recs []segment.Record) []uint64 {
 	var out []uint64
 	for _, r := range recs {
@@ -315,10 +335,16 @@ func TestFlushTriggers(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			e, c := newTestColl(t, tt.mod, nil)
 			mustInsert(t, c, "a", map[string]any{"v": 1})
+			a := memOffset(t, c, "a")
 			c = tt.trigger(t, e, c)
+			// The flush writes only the document: the checkpoint is stored in
+			// the index file, in the transaction that indexes the record.
 			recs := segRecords(t, c.dir)
-			if len(recs) != 2 || recs[0].Type != segment.TypePut || recs[0].ID != "a" || recs[1].Type != segment.TypeCheckpoint {
-				t.Fatalf("segment records = %+v, want put a + checkpoint", recs)
+			if len(recs) != 1 || recs[0].Type != segment.TypePut || recs[0].ID != "a" {
+				t.Fatalf("segment records = %+v, want put a only (no checkpoint marker)", recs)
+			}
+			if cp := storedCheckpoint(t, c); cp < a {
+				t.Errorf("index file checkpoint = %d, want >= %d (the offset of a)", cp, a)
 			}
 			if got := mustGet(t, c, "a"); got.Data["v"] != 1.0 {
 				t.Errorf("Get(a) = %+v", got)
@@ -337,11 +363,19 @@ func TestFlushWritesOnlyChanges(t *testing.T) {
 		t.Fatalf("after first flush: %d appends, %d syncs; want 1, 1", n, s)
 	}
 	first := h.appends[0]
-	if len(first) != 4 {
-		t.Fatalf("first flush wrote %d records, want 3 puts + marker", len(first))
+	if len(first) != 3 {
+		t.Fatalf("first flush wrote %d records, want 3 puts (no checkpoint marker)", len(first))
 	}
-	if !slices.IsSortedFunc(first[:3], func(a, b segment.Record) int { return int(a.WALOffset) - int(b.WALOffset) }) {
+	for _, r := range first {
+		if r.Type != segment.TypePut {
+			t.Errorf("first flush wrote a %v record, want puts only", r.Type)
+		}
+	}
+	if !slices.IsSortedFunc(first, func(a, b segment.Record) int { return int(a.WALOffset) - int(b.WALOffset) }) {
 		t.Errorf("records not sorted by WAL offset: %+v", first)
+	}
+	if got, want := storedCheckpoint(t, c), checkpointOf(c); got != want {
+		t.Errorf("index file checkpoint after the first flush = %d, checkpoint = %d", got, want)
 	}
 
 	if _, err := c.Update(context.Background(), "b", map[string]any{"x": 1}); err != nil {
@@ -352,11 +386,11 @@ func TestFlushWritesOnlyChanges(t *testing.T) {
 		t.Fatalf("after second flush: %d appends, %d syncs; want 2, 2", n, s)
 	}
 	second := h.appends[1]
-	if len(second) != 2 || second[0].ID != "b" || second[0].Type != segment.TypePut || second[1].Type != segment.TypeCheckpoint {
-		t.Errorf("second flush wrote %+v, want put b + marker", second)
+	if len(second) != 1 || second[0].ID != "b" || second[0].Type != segment.TypePut {
+		t.Errorf("second flush wrote %+v, want put b only", second)
 	}
-	if got, want := second[1].WALOffset, checkpointOf(c); got != want {
-		t.Errorf("marker = %d, checkpoint = %d", got, want)
+	if got, want := storedCheckpoint(t, c), checkpointOf(c); got != want || got < second[0].WALOffset {
+		t.Errorf("index file checkpoint = %d, checkpoint = %d, want equal and >= %d", got, want, second[0].WALOffset)
 	}
 
 	mustFlush(t, c) // nothing changed
@@ -466,8 +500,11 @@ func TestFlushCheckpointExcludesConcurrentWrites(t *testing.T) {
 	if cp < a || cp >= x || cp >= b {
 		t.Fatalf("checkpoint = %d; want a=%d <= cp < x=%d and < b=%d", cp, a, x, b)
 	}
-	if m := markers(segRecords(t, c.dir)); len(m) != 1 || m[0] != cp {
-		t.Errorf("markers on disk = %v, want [%d]", m, cp)
+	if got := storedCheckpoint(t, c); got != cp {
+		t.Errorf("index file checkpoint = %d, want %d", got, cp)
+	}
+	if m := markers(segRecords(t, c.dir)); len(m) != 0 {
+		t.Errorf("markers on disk = %v, want none (the checkpoint is in the index file)", m)
 	}
 	if !inKeydir(t, c, "a") || inKeydir(t, c, "x") || inKeydir(t, c, "b") {
 		t.Error("keydir after the flush should hold a only")
@@ -531,8 +568,13 @@ func TestFlushFailureKeepsCheckpoint(t *testing.T) {
 			if lw := e.lowWater(); lw > b {
 				t.Errorf("lowWater = %d after failed flush, want <= %d", lw, b)
 			}
-			if m := markers(segRecords(t, c.dir)); len(m) != 1 {
-				t.Errorf("markers on disk after failure = %v, want only the first flush's", m)
+			if got := storedCheckpoint(t, c); got != cp0 {
+				t.Errorf("index file checkpoint after the failed flush = %d, want %d", got, cp0)
+			}
+			// The failed attempt's records were truncated away: the segment
+			// holds only what the index file knows.
+			if recs := segRecords(t, c.dir); len(recs) != 1 || recs[0].ID != "a" || recs[0].Type != segment.TypePut {
+				t.Errorf("segment records after the failed flush = %+v, want only the first flush's put a", recs)
 			}
 
 			mustInsert(t, c, "c", map[string]any{"v": 3})
@@ -547,8 +589,11 @@ func TestFlushFailureKeepsCheckpoint(t *testing.T) {
 			if !idle {
 				t.Error("flushing or memtable not empty after a successful retry")
 			}
-			if m := markers(segRecords(t, c.dir)); len(m) != 2 {
-				t.Errorf("markers on disk = %v, want 2", m)
+			if got, want := storedCheckpoint(t, c), checkpointOf(c); got != want {
+				t.Errorf("index file checkpoint after the retry = %d, want %d", got, want)
+			}
+			if m := markers(segRecords(t, c.dir)); len(m) != 0 {
+				t.Errorf("markers on disk = %v, want none", m)
 			}
 
 			_, c = reopenColl(t, e)
@@ -765,22 +810,33 @@ func TestDeadBytes(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// Records: put a, put b, marker | put a', tombstone b, marker. Only a'
-	// is live.
-	if len(hint) != 6 {
-		t.Fatalf("active segment holds %d records, want 6", len(hint))
+	// Records: put a, put b | put a', tombstone b (no checkpoint markers).
+	// Only a' is live.
+	wantRecs := []string{"put a", "put b", "put a", "tombstone b"}
+	var gotRecs []string
+	for _, h := range hint {
+		gotRecs = append(gotRecs, h.Type.String()+" "+h.ID)
+	}
+	if !slices.Equal(gotRecs, wantRecs) {
+		t.Fatalf("active segment holds %v, want %v", gotRecs, wantRecs)
 	}
 	var total, live int64
 	for i, h := range hint {
 		total += int64(h.Loc.Size)
-		if i == 3 {
+		if i == 2 {
 			live = int64(h.Loc.Size)
 		}
 	}
-	_, deadBytes := segAccounting(t, c)
+	totals, deadBytes := segAccounting(t, c)
 	got := deadBytes[1]
 	if got != total-live {
 		t.Errorf("deadBytes[1] = %d, want %d", got, total-live)
+	}
+	if totals[1] != total {
+		t.Errorf("record bytes of segment 1 = %d, want %d", totals[1], total)
+	}
+	if ke, ok := keyEntryOf(t, c, "a"); !ok || ke.Pos != hint[2].Loc.Pos || ke.Size != hint[2].Loc.Size {
+		t.Errorf("key table entry of a = %+v, %v; want the second put at %+v", ke, ok, hint[2].Loc)
 	}
 
 	_, c = reopenColl(t, e)

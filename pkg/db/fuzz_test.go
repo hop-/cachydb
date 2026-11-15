@@ -1,12 +1,15 @@
 package db
 
 import (
+	"bytes"
 	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
 )
 
 // fuzzJSONSeeds are JSON values of every type, used as seeds by the value
@@ -174,6 +177,34 @@ func FuzzCompare(f *testing.F) {
 				t.Fatalf("a missing field does not sort before %#v", x)
 			}
 		}
+		// The index key encoding orders indexable scalars exactly as the
+		// engine's sort order does, and gives equal values (eq) the same
+		// bytes; the missing value encodes below every value.
+		for _, x := range vals {
+			ex, truncX, okX := idxstore.EncodeValue(x)
+			if okX != indexableScalar(x) {
+				t.Fatalf("EncodeValue(%#v) ok = %v", x, okX)
+			}
+			if !okX || truncX {
+				continue
+			}
+			if bytes.Compare(idxstore.AppendMissing(nil), ex) >= 0 {
+				t.Fatalf("the missing value does not encode below %#v", x)
+			}
+			for _, y := range vals {
+				ey, truncY, okY := idxstore.EncodeValue(y)
+				if !okY || truncY {
+					continue
+				}
+				want := compareSortValues(newSortValue(x, true), newSortValue(y, true))
+				if got := bytes.Compare(ex, ey); got != want {
+					t.Fatalf("encodings of %#v and %#v compare %d, the sort order %d", x, y, got, want)
+				}
+				if (bytes.Equal(ex, ey)) != valuesEqual(x, y) {
+					t.Fatalf("encodings of %#v and %#v equal = %v, valuesEqual = %v", x, y, bytes.Equal(ex, ey), valuesEqual(x, y))
+				}
+			}
+		}
 		// Transitivity over every ordering of the three values.
 		sv := func(x any) sortValue { return newSortValue(x, true) }
 		for _, p := range [][3]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}} {
@@ -184,6 +215,18 @@ func FuzzCompare(f *testing.F) {
 			}
 		}
 	})
+}
+
+// indexableScalar reports whether v has an index value entry: null, a
+// bool, a number other than NaN, or a string.
+func indexableScalar(v any) bool {
+	switch t := v.(type) {
+	case nil, bool, string:
+		return true
+	case float64:
+		return !math.IsNaN(t)
+	}
+	return false
 }
 
 // fuzzOperators are the filter operators, plus an unknown one.
@@ -257,5 +300,18 @@ func FuzzMatchFilter(f *testing.F) {
 		if matchesQuery(doc, qf, nil) != got || matchesQuery(doc, nil, [][]QueryFilter{qf}) != got {
 			t.Fatalf("matchesQuery disagrees with matchesFilter for %s", operator)
 		}
+	})
+}
+
+// FuzzFieldPath resolves random paths in random documents and checks that
+// Document.GetPath (index entries, unique values, distinct) and the
+// compiled field path (filters, sort, projection) agree, and that
+// "exists true" matches exactly when the path resolves.
+func FuzzFieldPath(f *testing.F) {
+	for _, tc := range pathResolveCases {
+		f.Add([]byte(tc.doc), tc.path)
+	}
+	f.Fuzz(func(t *testing.T, doc []byte, path string) {
+		checkPathAgrees(t, string(doc), path)
 	})
 }

@@ -67,8 +67,9 @@ func FuzzSegmentRecordDecode(f *testing.F) {
 }
 
 // FuzzSegmentScan writes random bytes as a data segment and checks that
-// Scan and Reader.Read never panic, fail only with ErrCorrupt, and that
-// every record Scan yields is the CRC-checked record at its location.
+// Scan, ScanHeaders, and Reader.Read never panic, fail only with ErrCorrupt,
+// that every record Scan yields is the CRC-checked record at its location,
+// and that ScanHeaders agrees with Scan.
 func FuzzSegmentScan(f *testing.F) {
 	const seg = 2
 	seedDir := f.TempDir()
@@ -126,6 +127,35 @@ func FuzzSegmentScan(f *testing.F) {
 		}
 		if len(got) > 0 && int64(pos) != end {
 			t.Fatalf("records end at %d, Scan reported %d", pos, end)
+		}
+
+		// ScanHeaders sees a prefix-compatible view: the same records at the
+		// same locations, without documents. It may go further than Scan
+		// only past a put whose document does not decompress.
+		var hdrs []scanned
+		hEnd, hErr := ScanHeaders(dir, seg, func(r Record, l Location) error {
+			hdrs = append(hdrs, scanned{r, l})
+			return nil
+		})
+		if hErr != nil && !errors.Is(hErr, ErrCorrupt) {
+			t.Fatalf("ScanHeaders error %v does not wrap ErrCorrupt", hErr)
+		}
+		if len(hdrs) < len(got) || hEnd < end {
+			t.Fatalf("ScanHeaders saw %d records to byte %d, Scan %d to byte %d", len(hdrs), hEnd, len(got), end)
+		}
+		for i, h := range hdrs {
+			if h.rec.Doc != nil {
+				t.Fatalf("ScanHeaders record %d has a document", i)
+			}
+			if i < len(got) && (h.loc != got[i].loc || h.rec.ID != got[i].rec.ID || h.rec.Type != got[i].rec.Type || h.rec.WALOffset != got[i].rec.WALOffset) {
+				t.Fatalf("ScanHeaders and Scan disagree on record %d", i)
+			}
+		}
+		if len(hdrs) > len(got) && (hdrs[len(got)].rec.Type != TypePut || err == nil) {
+			t.Fatalf("ScanHeaders went past Scan's stop (%v) at a %s record", err, hdrs[len(got)].rec.Type)
+		}
+		if len(hdrs) == len(got) && (hEnd != end || (hErr == nil) != (err == nil)) {
+			t.Fatalf("ScanHeaders = %d, %v; Scan = %d, %v", hEnd, hErr, end, err)
 		}
 
 		r, err := OpenReader(dir, seg)

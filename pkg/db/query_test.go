@@ -134,11 +134,11 @@ func TestFindElementOperatorsUseIndex(t *testing.T) {
 		want     []string
 		examined int
 	}{
-		{"has", QueryFilter{"tags", "has", "storage"}, []string{"k1", "k2"}, 3}, // k4's scalar "storage" is a candidate
+		{"has", QueryFilter{"tags", "has", "storage"}, []string{"k1", "k2"}, 2}, // only element entries: k4's scalar "storage" is not a candidate
 		{"has_any union", QueryFilter{"tags", "has_any", []any{"mcp", "wal"}}, []string{"k1", "k3"}, 2},
 		{"has_all intersection", QueryFilter{"tags", "has_all", []any{"storage", "perf"}}, []string{"k2"}, 1},
 		{"has_all with unindexable values", QueryFilter{"tags", "has_all", []any{"perf", map[string]any{}}}, []string{}, 1},
-		{"eq rechecked", QueryFilter{"tags", "eq", "storage"}, []string{"k4"}, 3},
+		{"eq rechecked", QueryFilter{"tags", "eq", "storage"}, []string{"k4"}, 1}, // only whole-value entries: k1's and k2's elements are not candidates
 		{"has absent", QueryFilter{"tags", "has", "nothing"}, []string{}, 0},
 		{"contains scans", QueryFilter{"tags", "contains", "stor"}, []string{"k1", "k2", "k4"}, 25},
 	}
@@ -281,7 +281,7 @@ func TestCountDocuments(t *testing.T) {
 		{"_id eq", &Query{Filters: []QueryFilter{{"_id", "eq", "k2"}}}, 1, 0},
 		{"_id eq absent", &Query{Filters: []QueryFilter{{"_id", "eq", "zz"}}}, 0, 0},
 		{"unindexed eq scans", &Query{Filters: []QueryFilter{{"type", "eq", "note"}}}, 2, 5},
-		{"two filters use candidates", &Query{Filters: []QueryFilter{{"tags", "has", "storage"}, {"type", "eq", "note"}}}, 1, 3},
+		{"two filters use candidates", &Query{Filters: []QueryFilter{{"tags", "has", "storage"}, {"type", "eq", "note"}}}, 1, 2}, // has reads element entries only (k1, k2)
 		{"any groups", &Query{Any: [][]QueryFilter{{{"type", "eq", "decision"}}, {{"prio", "eq", 1}}}}, 2, 5},
 		{"skip, limit, and sort ignored", &Query{Skip: 3, Limit: 1, Sort: []SortKey{{Field: "prio"}}}, 5, 0},
 	}

@@ -7,9 +7,13 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
+	"github.com/hop-/cachydb/pkg/db/internal/segment"
 )
 
 // openColl opens opts.Dir and returns collection app/c.
@@ -238,19 +242,86 @@ func TestRecoveryRegressionF5OffsetsContinue(t *testing.T) {
 	}
 }
 
+// closedIndexMeta reads the covered position, the checkpoint, and the
+// registered segments of the index file of the collection directory dir,
+// which no engine has open.
+func closedIndexMeta(t *testing.T, dir string) (idxstore.Position, uint64, []idxstore.SegmentStats) {
+	t.Helper()
+	st, err := idxstore.Open(dir, idxstore.Options{})
+	if err != nil {
+		t.Fatalf("opening the index file of %s: %v", dir, err)
+	}
+	defer func() {
+		if err := st.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	var (
+		covered idxstore.Position
+		cp      uint64
+		segs    []idxstore.SegmentStats
+	)
+	if err := st.View(func(tx *idxstore.Tx) (err error) {
+		if covered, err = tx.Covered(); err != nil {
+			return err
+		}
+		if cp, err = tx.Checkpoint(); err != nil {
+			return err
+		}
+		segs, err = tx.Segments()
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return covered, cp, segs
+}
+
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.Size()
+}
+
 // TestCrashRegressionF7SegSyncBeforeKeydir: a crash between the segment
-// fsync and the keydir update recovers exactly, and replaying records that
-// are already in the data segments is a no-op.
+// fsync and the index commit (AC-6, approach-index-and-query §4). The
+// segment then holds records the index file does not know. Open truncates
+// the active segment to the index file's covered position, or deletes a
+// segment file the index file does not register; the checkpoint did not
+// advance, so replay restores the changes from the WAL into the memtable,
+// and the next flush writes them exactly once.
 func TestCrashRegressionF7SegSyncBeforeKeydir(t *testing.T) {
-	for _, markerLost := range []bool{false, true} {
-		t.Run(fmt.Sprintf("marker-lost=%v", markerLost), func(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		newSeg   bool // every flush seals: the crashed flush writes an unregistered segment
+		tornTail bool // the crashed flush's last record is torn as well
+	}{
+		{name: "active segment truncated to covered"},
+		{name: "torn tail truncated to covered", tornTail: true},
+		{name: "unregistered segment deleted", newSeg: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			opts, e, c := newCrashColl(t, nil, nil)
+			opts, e, c := newCrashColl(t, func(o *Options) {
+				if tc.newSeg {
+					o.DataSegmentSize = 1
+				}
+			}, nil)
+			if err := c.CreateIndex(ctx, "by_v", "v"); err != nil {
+				t.Fatal(err)
+			}
 			mustInsert(t, c, "a", map[string]any{"v": 1})
 			mustInsert(t, c, "b", map[string]any{"v": 2})
 			mustFlush(t, c)
 			cp0 := checkpointOf(c)
 			e.abandon()
+			before := segRecordCount(t, c.dir)
+			covered0, storedCP0, segs0 := closedIndexMeta(t, c.dir)
+			if storedCP0 != cp0 {
+				t.Fatalf("index file checkpoint = %d, collection checkpoint = %d", storedCP0, cp0)
+			}
 
 			armed := opts
 			crashAt(t, &armed, hookAfterSegSync)
@@ -266,32 +337,68 @@ func TestCrashRegressionF7SegSyncBeforeKeydir(t *testing.T) {
 				t.Fatalf("flush = %v, want a simulated crash", err)
 			}
 			e.abandon()
-			before := segRecordCount(t, c.dir)
-			if markerLost {
-				// The records are durable in the segment, the marker is not:
-				// replay re-reads them from the WAL.
-				chopTail(t, newestDataSegment(t, c.dir), 3)
-				before--
+
+			// The crashed flush's records are durable in a segment; the index
+			// file is unchanged.
+			if got := segRecordCount(t, c.dir); got != before+3 {
+				t.Fatalf("segments hold %d records after the crashed flush, want %d", got, before+3)
+			}
+			covered, storedCP, segs := closedIndexMeta(t, c.dir)
+			if covered != covered0 || storedCP != cp0 || !slices.Equal(segs, segs0) {
+				t.Fatalf("index file changed by the crashed flush: covered %+v -> %+v, checkpoint %d -> %d, segments %+v -> %+v",
+					covered0, covered, cp0, storedCP, segs0, segs)
+			}
+			newest := newestDataSegment(t, c.dir)
+			registered := false
+			for _, st := range segs {
+				registered = registered || segment.DataPath(c.dir, st.Seg) == newest
+			}
+			if registered == tc.newSeg {
+				t.Fatalf("newest segment %s registered = %v, want %v", newest, registered, !tc.newSeg)
+			}
+			if !tc.newSeg {
+				if size := fileSize(t, newest); uint64(size) <= covered.End || segment.DataPath(c.dir, covered.Seg) != newest {
+					t.Fatalf("active segment %s is %d bytes, covered %+v: want records beyond covered", newest, size, covered)
+				}
+			}
+			if tc.tornTail {
+				chopTail(t, newest, 3)
 			}
 
 			e, c = openColl(t, opts)
-			want := model{"app": {"c": {indexes: map[string]string{}, docs: map[string]map[string]any{"a": {"v": 10}, "c": {"v": 3}}}}}
+			want := model{"app": {"c": {indexes: map[string]string{"by_v": "v"}, docs: map[string]map[string]any{"a": {"v": 10}, "c": {"v": 3}}}}}
 			checkModel(t, e, want)
+			if tc.newSeg {
+				if fileExistsT(t, newest) {
+					t.Errorf("unregistered segment %s kept by open", newest)
+				}
+			} else if size := fileSize(t, newest); uint64(size) != covered.End {
+				t.Errorf("active segment %s is %d bytes after open, want truncated to covered %d", newest, size, covered.End)
+			}
+			if got := segRecordCount(t, c.dir); got != before {
+				t.Errorf("segments hold %d records after open, want %d (the crashed flush's records removed)", got, before)
+			}
 			c.mu.RLock()
 			memLen, cp := len(c.memtable), c.checkpoint
 			c.mu.RUnlock()
-			if memLen != 0 {
-				t.Errorf("memtable holds %d entries after replaying already-flushed records, want 0", memLen)
+			if memLen != 3 {
+				t.Errorf("memtable holds %d entries after replay, want 3 (a, the tombstone of b, c)", memLen)
 			}
-			if markerLost && cp != cp0 {
-				t.Errorf("checkpoint = %d, want the previous marker %d", cp, cp0)
+			if cp != cp0 {
+				t.Errorf("checkpoint = %d, want %d (the crashed flush never committed)", cp, cp0)
 			}
-			if !markerLost && cp <= cp0 {
-				t.Errorf("checkpoint = %d, want above %d (the crashed flush's marker is durable)", cp, cp0)
+			if got := e.recov.replayApplied.Load(); got != 3 {
+				t.Errorf("replay applied %d records, want 3", got)
 			}
-			if got := segRecordCount(t, c.dir); got != before {
-				t.Errorf("open wrote %d segment records", got-before)
+
+			mustFlush(t, c)
+			if got := segRecordCount(t, c.dir); got != before+3 {
+				t.Errorf("flush after replay: segments hold %d records, want %d", got, before+3)
 			}
+			if got := storedCheckpoint(t, c); got <= cp0 {
+				t.Errorf("index file checkpoint after the flush = %d, want above %d", got, cp0)
+			}
+			checkModel(t, e, want)
 			e = reopen(t, e)
 			checkModel(t, e, want)
 		})
@@ -591,8 +698,11 @@ func TestRecoveryReplayToMemtable(t *testing.T) {
 		t.Errorf("replay applied %d records, want 5", got)
 	}
 	mustFlush(t, c)
-	if got := segRecordCount(t, c.dir); got != before+6 {
-		t.Errorf("flush after replay wrote %d records, want 6 (5 documents + marker)", got-before)
+	if got := segRecordCount(t, c.dir); got != before+5 {
+		t.Errorf("flush after replay wrote %d records, want 5 (the documents; no checkpoint marker)", got-before)
+	}
+	if got, want := storedCheckpoint(t, c), checkpointOf(c); got != want {
+		t.Errorf("index file checkpoint after the flush = %d, want %d", got, want)
 	}
 }
 

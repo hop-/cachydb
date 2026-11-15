@@ -407,9 +407,19 @@ func TestCompactionSwapIsCompareAndSwap(t *testing.T) {
 	if _, err := c.Update(ctx, "a", map[string]any{"v": "a2"}); err != nil {
 		t.Fatal(err)
 	}
-	mustFlushSeal(t, c) // 2
+	// x is inserted and deleted before the flush: segment 2 gets its
+	// tombstone, dead bytes that put segment 2 into the compaction run
+	// (without checkpoint markers it would hold no dead bytes at all).
+	mustInsert(t, c, "x", map[string]any{"v": 1})
+	if err := c.Delete(ctx, "x"); err != nil {
+		t.Fatal(err)
+	}
+	mustFlushSeal(t, c) // 2: a2, tomb(x)
+	if got := recordKinds(segmentRecords(t, c.dir, 2)); !slices.Equal(got, []string{"put:a", "tomb:x"}) {
+		t.Fatalf("segment 2 records = %v, want [put:a tomb:x]", got)
+	}
 	mustInsert(t, c, "z", map[string]any{"v": "z"})
-	mustFlushSeal(t, c) // 3 (newest marker)
+	mustFlushSeal(t, c) // 3
 
 	if !mustCompact(t, c) || !fired {
 		t.Fatalf("compaction did not run through the swap (fired %v)", fired)
@@ -1024,10 +1034,17 @@ func TestCompactionMergesSmallSegments(t *testing.T) {
 		t.Fatalf("no compaction of small fully live segments %v", before)
 	}
 	after := listSegs(t, c.dir)
-	// Segments 1-5 merge into one output; 6 holds the newest checkpoint
-	// marker; the empty active segment 7 is removed when it is sealed.
-	if len(after) != 2 || after[0] != 6 || after[1] <= 7 {
-		t.Fatalf("segments %v -> %v, want [6 <output>]", before, after)
+	// Segments 1-6 merge into one output: no segment is kept for a
+	// checkpoint marker any more (the checkpoint is in index.db). The empty
+	// active segment 7 is removed when it is sealed.
+	if !slices.Equal(before, []uint32{1, 2, 3, 4, 5, 6, 7}) {
+		t.Fatalf("segments before compaction = %v, want 1-6 sealed and the active 7", before)
+	}
+	if len(after) != 1 || after[0] <= 7 {
+		t.Fatalf("segments %v -> %v, want [<output>]", before, after)
+	}
+	if total, _ := segAccounting(t, c); len(total) != 1 || total[after[0]] == 0 {
+		t.Errorf("registered segments after the merge = %v, want only the output %d", total, after[0])
 	}
 	checkModel(t, e, docsModel(idx, want))
 	checkKeydirLive(t, c)

@@ -22,7 +22,13 @@ import (
 // plain in-memory reference model whose query semantics are implemented
 // naively and independently of the engine's: every operator, OR groups,
 // the total sort order, projection, count and distinct, and the write
-// semantics (if, unset, upsert, replace, delete, schemas, index metadata).
+// semantics (if, unset, upsert, replace, delete, schemas, index metadata,
+// unique indexes). Fields are also addressed by nested paths ("o.x"), and
+// documents sometimes hold a literal top-level "o.x" key, which wins over
+// the path. Queries include ones shaped for each query plan (an index-served
+// filter, an OR of index-served filters, a sort on an indexed field with a
+// limit), and every state check also compares the index file's entries
+// with the documents (checkIndexEntries).
 // The key and value spaces are small so collisions and edge cases are
 // frequent. Reopens, simulated crashes (crashAt + abandon), flushes and
 // compactions are interleaved; tiny data segments make flushes seal and
@@ -41,9 +47,16 @@ const (
 
 var (
 	modelColls  = []string{"c1", "c2"}
-	modelFields = []string{"a", "b", "t", "o"}
+	modelFields = []string{"a", "b", "t", "o", "o.x"} // "o.x": a literal top-level key that hides the path o.x
 	modelIndex  = []string{"i1", "i2", "i3"}
-	modelOps    = []string{"eq", "ne", "gt", "gte", "lt", "lte", "in", "contains", "has", "has_any", "has_all"}
+	modelOps    = []string{"eq", "ne", "gt", "gte", "lt", "lte", "in", "contains", "has", "has_any", "has_all", "exists", "starts_with"}
+	// modelQueryFields are the fields queries, sorts, projections, distinct,
+	// and indexes use: the top-level fields, the nested path o.x, _id, and a
+	// field no document has.
+	modelQueryFields = []string{"a", "b", "t", "o", "o.x", "_id", "missing"}
+	modelIndexFields = []string{"a", "b", "t", "o", "o.x"}
+	// modelSchemaFields are the fields schemas name (top-level only).
+	modelSchemaFields = []string{"a", "b", "t", "o"}
 )
 
 func envInt(t *testing.T, name string, def int) int {
@@ -95,6 +108,7 @@ func TestModel(t *testing.T) {
 type mColl struct {
 	schema  *Schema
 	indexes map[string]string         // name -> field
+	unique  map[string]bool           // name -> the index is unique
 	docs    map[string]map[string]any // id -> data
 }
 
@@ -107,7 +121,7 @@ func (s mState) clone() mState {
 		for id, d := range c.docs {
 			docs[id] = maps.Clone(d) // values are never mutated in place
 		}
-		out[name] = &mColl{schema: cloneSchema(c.schema), indexes: maps.Clone(c.indexes), docs: docs}
+		out[name] = &mColl{schema: cloneSchema(c.schema), indexes: maps.Clone(c.indexes), unique: maps.Clone(c.unique), docs: docs}
 	}
 	return out
 }
@@ -120,7 +134,7 @@ func (s mState) dump() string {
 		schema, _ := json.Marshal(c.schema) // plain data: cannot fail
 		fmt.Fprintf(&b, "%s schema=%s\n", name, schema)
 		for _, ix := range slices.Sorted(maps.Keys(c.indexes)) {
-			fmt.Fprintf(&b, "%s index %s=%s\n", name, ix, c.indexes[ix])
+			fmt.Fprintf(&b, "%s index %s=%s unique=%v\n", name, ix, c.indexes[ix], c.unique[ix])
 		}
 		for _, id := range slices.Sorted(maps.Keys(c.docs)) {
 			data, _ := json.Marshal(c.docs[id]) // plain data: cannot fail
@@ -130,13 +144,128 @@ func (s mState) dump() string {
 	return b.String()
 }
 
-// mValue returns the value of field in a document (id, data).
+// mValue returns the value of field in a document (id, data): _id, a
+// top-level key equal to the whole name, or else the dotted path through
+// objects (an array or any other value on the way means missing).
 func mValue(id string, data map[string]any, field string) (any, bool) {
 	if field == "_id" {
 		return id, true
 	}
-	v, ok := data[field]
-	return v, ok
+	if v, ok := data[field]; ok {
+		return v, true
+	}
+	parts := strings.Split(field, ".")
+	if len(parts) == 1 {
+		return nil, false
+	}
+	var cur any = data
+	for _, p := range parts {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		if cur, ok = m[p]; !ok {
+			return nil, false
+		}
+	}
+	return cur, true
+}
+
+// mProject returns data limited to fields: a top-level key equal to the
+// field name as it is, otherwise the value of the path nested under the
+// path (merged into an object already there, skipped under a non-object).
+func mProject(id string, data map[string]any, fields []string) map[string]any {
+	p := map[string]any{}
+	for _, f := range fields {
+		if f == "_id" {
+			continue
+		}
+		if v, ok := data[f]; ok {
+			p[f] = v
+			continue
+		}
+		v, ok := mValue(id, data, f)
+		if !ok {
+			continue
+		}
+		parts := strings.Split(f, ".")
+		m := p
+		placed := true
+		for _, part := range parts[:len(parts)-1] {
+			next, ok := m[part]
+			if !ok {
+				child := map[string]any{}
+				m[part] = child
+				m = child
+				continue
+			}
+			child, isObj := next.(map[string]any)
+			if !isObj {
+				placed = false
+				break
+			}
+			// Copy before extending: values in the model are shared.
+			child = maps.Clone(child)
+			m[part] = child
+			m = child
+		}
+		if placed {
+			m[parts[len(parts)-1]] = v
+		}
+	}
+	return p
+}
+
+// mConstrained reports whether a unique index constrains v: null, a bool,
+// a number, or a string.
+func mConstrained(v any) bool {
+	switch v.(type) {
+	case nil, bool, float64, string:
+		return true
+	}
+	return false
+}
+
+// mUniqueViolation reports whether storing data under id would give a
+// unique index's value to two documents.
+func (c *mColl) mUniqueViolation(id string, data map[string]any) bool {
+	for name, field := range c.indexes {
+		if !c.unique[name] {
+			continue
+		}
+		v, ok := mValue(id, data, field)
+		if !ok || !mConstrained(v) {
+			continue
+		}
+		for other, od := range c.docs {
+			if other == id {
+				continue
+			}
+			if ov, ok := mValue(other, od, field); ok && mEqual(ov, v) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// mHasDuplicates reports whether two documents share a constrained value of
+// field (a unique index on it cannot be created).
+func (c *mColl) mHasDuplicates(field string) bool {
+	var seen []any
+	for id, data := range c.docs {
+		v, ok := mValue(id, data, field)
+		if !ok || !mConstrained(v) {
+			continue
+		}
+		for _, s := range seen {
+			if mEqual(s, v) {
+				return true
+			}
+		}
+		seen = append(seen, v)
+	}
+	return false
 }
 
 // mEqual is equality of decoded JSON values (float64, string, bool, nil,
@@ -166,6 +295,13 @@ func mOrder(a, b any) (int, bool) {
 
 func mMatch(id string, data map[string]any, f QueryFilter) bool {
 	v, ok := mValue(id, data, f.Field)
+	switch f.Operator {
+	case "exists":
+		return ok == f.Value.(bool)
+	case "starts_with":
+		s, isStr := v.(string)
+		return ok && isStr && strings.HasPrefix(s, f.Value.(string))
+	}
 	if !ok {
 		return false
 	}
@@ -339,13 +475,7 @@ func (c *mColl) find(q *Query) []*Document {
 	for _, id := range ids {
 		data := c.docs[id]
 		if len(q.Fields) > 0 {
-			p := map[string]any{}
-			for _, f := range q.Fields {
-				if v, ok := data[f]; ok {
-					p[f] = v
-				}
-			}
-			data = p
+			data = mProject(id, data, q.Fields)
 		}
 		out = append(out, &Document{ID: id, Data: maps.Clone(data)})
 	}
@@ -444,13 +574,15 @@ func newModelRun(t *testing.T, seed uint64) *modelRun {
 		if err := d.CreateCollection(context.Background(), name, nil); err != nil {
 			t.Fatal(err)
 		}
-		r.m[name] = &mColl{indexes: map[string]string{}, docs: map[string]map[string]any{}}
+		r.m[name] = &mColl{indexes: map[string]string{}, unique: map[string]bool{}, docs: map[string]map[string]any{}}
 		for _, ix := range modelIndex[:r.pick(3)] {
-			field := modelFields[r.pick(len(modelFields))]
-			if err := mustColl(t, d, name).CreateIndex(context.Background(), ix, field); err != nil {
+			field := modelIndexFields[r.pick(len(modelIndexFields))]
+			unique := r.chance(0.5) // on an empty collection: always possible
+			if err := mustColl(t, d, name).CreateIndex(context.Background(), ix, field, Unique(unique)); err != nil {
 				t.Fatal(err)
 			}
 			r.m[name].indexes[ix] = field
+			r.m[name].unique[ix] = unique
 		}
 	}
 	return r
@@ -501,8 +633,16 @@ func (r *modelRun) array() []any {
 
 func (r *modelRun) value(field string) any {
 	p := r.rng.Float64()
-	if field == "t" {
+	switch field {
+	case "t":
 		p = 1 - p // "t" holds arrays most of the time
+	case "o":
+		if r.chance(0.5) { // "o" holds objects half of the time: the path o.x
+			if r.chance(0.2) {
+				return map[string]any{"x": r.array(), "y": r.scalar()}
+			}
+			return map[string]any{"x": r.scalar()}
+		}
 	}
 	switch {
 	case p < 0.65:
@@ -519,7 +659,11 @@ func (r *modelRun) id() string { return fmt.Sprintf("k%d", r.pick(10)) }
 func (r *modelRun) data() map[string]any {
 	d := map[string]any{}
 	for _, f := range modelFields {
-		if r.chance(0.6) {
+		p := 0.6
+		if f == "o.x" {
+			p = 0.15 // the literal key is rarer than the path
+		}
+		if r.chance(p) {
 			d[f] = r.value(f)
 		}
 	}
@@ -559,10 +703,32 @@ func (r *modelRun) indexedField(cn string) (string, bool) {
 }
 
 func (r *modelRun) filter(cn string) QueryFilter {
-	fields := []string{"a", "b", "t", "o", "_id", "missing"}
-	f := QueryFilter{Field: fields[r.pick(len(fields))], Operator: modelOps[r.pick(len(modelOps))]}
+	f := QueryFilter{Field: modelQueryFields[r.pick(len(modelQueryFields))], Operator: modelOps[r.pick(len(modelOps))]}
 	if field, ok := r.indexedField(cn); ok && r.chance(0.4) {
 		f.Field = field // index-backed candidates
+	}
+	return r.filterValue(f)
+}
+
+// filterOn returns a filter on field with operator op and a fitting value.
+func (r *modelRun) filterOn(field, op string) QueryFilter {
+	return r.filterValue(QueryFilter{Field: field, Operator: op})
+}
+
+// filterValue fills in a value for f: often one a stored document holds.
+func (r *modelRun) filterValue(f QueryFilter) QueryFilter {
+	switch f.Operator {
+	case "exists":
+		f.Value = r.chance(0.5)
+		return f
+	case "starts_with":
+		f.Value = []string{"a", "A", "", "ab", "b", "abc"}[r.pick(6)]
+		if v, ok := r.storedValue(f.Field); ok && r.chance(0.5) {
+			if s, isStr := v.(string); isStr {
+				f.Value = s[:r.pick(len(s)+1)]
+			}
+		}
+		return f
 	}
 	if v, ok := r.storedValue(f.Field); ok && r.chance(0.5) {
 		f.Value = v
@@ -597,6 +763,9 @@ func (r *modelRun) filters(cn string, maxN int) []QueryFilter {
 }
 
 func (r *modelRun) query(cn string) *Query {
+	if r.chance(0.3) {
+		return r.planQuery(cn)
+	}
 	q := &Query{Filters: r.filters(cn, 2)}
 	if r.chance(0.3) {
 		for range 1 + r.pick(2) {
@@ -604,7 +773,7 @@ func (r *modelRun) query(cn string) *Query {
 		}
 	}
 	if r.chance(0.5) {
-		sortFields := []string{"a", "b", "t", "o", "_id", "missing"}
+		sortFields := modelQueryFields
 		for range 1 + r.pick(2) {
 			k := SortKey{Field: sortFields[r.pick(len(sortFields))]}
 			if r.chance(0.5) {
@@ -617,7 +786,7 @@ func (r *modelRun) query(cn string) *Query {
 	}
 	if r.chance(0.3) {
 		for range 1 + r.pick(2) {
-			q.Fields = append(q.Fields, []string{"a", "b", "t", "o", "missing"}[r.pick(5)])
+			q.Fields = append(q.Fields, modelQueryFields[r.pick(len(modelQueryFields))])
 		}
 	}
 	if r.chance(0.3) {
@@ -629,6 +798,49 @@ func (r *modelRun) query(cn string) *Query {
 	return q
 }
 
+// planQuery returns a query shaped for one of the query plans, on an
+// indexed field when the collection has one: a single index-served filter
+// (sometimes with a sort on the same field), an OR of index-served
+// filters, or a single sort key with a limit.
+func (r *modelRun) planQuery(cn string) *Query {
+	field, ok := r.indexedField(cn)
+	if !ok {
+		field = modelIndexFields[r.pick(len(modelIndexFields))]
+	}
+	served := []string{"eq", "in", "gt", "gte", "lt", "lte", "starts_with", "exists", "has", "has_any", "has_all"}
+	q := &Query{}
+	switch r.pick(3) {
+	case 0:
+		q.Filters = []QueryFilter{r.filterOn(field, served[r.pick(len(served))])}
+		if r.chance(0.3) { // a second bound on the same field
+			q.Filters = append(q.Filters, r.filterOn(field, []string{"gt", "gte", "lt", "lte"}[r.pick(4)]))
+		}
+		if r.chance(0.5) {
+			q.Sort = []SortKey{{Field: field, Order: []string{"", "asc", "desc"}[r.pick(3)]}}
+		}
+	case 1:
+		for range 2 + r.pick(2) {
+			g := field
+			if f, ok := r.indexedField(cn); ok {
+				g = f
+			}
+			q.Any = append(q.Any, []QueryFilter{r.filterOn(g, served[r.pick(len(served))])})
+		}
+	default:
+		q.Sort = []SortKey{{Field: field, Order: []string{"", "asc", "desc"}[r.pick(3)]}}
+		if r.chance(0.3) {
+			q.Filters = []QueryFilter{r.filterOn(field, []string{"gt", "gte", "lt", "lte", "starts_with"}[r.pick(5)])}
+		}
+	}
+	if r.chance(0.8) {
+		q.Limit = 1 + r.pick(5)
+	}
+	if r.chance(0.3) {
+		q.Skip = r.pick(4)
+	}
+	return q
+}
+
 func (r *modelRun) schema() *Schema {
 	if r.chance(0.4) {
 		return nil
@@ -636,7 +848,7 @@ func (r *modelRun) schema() *Schema {
 	types := []FieldType{TypeString, TypeNumber, TypeBoolean, TypeArray, TypeObject, TypeDate}
 	s := &Schema{Fields: map[string]Field{}}
 	for range 1 + r.pick(2) {
-		s.Fields[modelFields[r.pick(len(modelFields))]] = Field{Type: types[r.pick(len(types))], Required: r.chance(0.5)}
+		s.Fields[modelSchemaFields[r.pick(len(modelSchemaFields))]] = Field{Type: types[r.pick(len(types))], Required: r.chance(0.5)}
 	}
 	return s
 }
@@ -656,6 +868,7 @@ func errClass(err error) string {
 		name string
 	}{
 		{ErrExists, "exists"}, {ErrNotFound, "not found"}, {ErrConditionFailed, "condition failed"}, {ErrSchemaValidation, "schema"},
+		{ErrUniqueViolation, "unique"},
 	} {
 		if errors.Is(err, s.err) {
 			return s.name
@@ -699,6 +912,8 @@ func (r *modelRun) docWrite() writeOp {
 			want = "exists"
 		case !mValid(mc.schema, data):
 			want = "schema"
+		case mc.mUniqueViolation(id, data):
+			want = "unique"
 		}
 		return writeOp{
 			desc: fmt.Sprintf("insert %s/%s %s", cn, id, js(data)),
@@ -738,6 +953,9 @@ func (r *modelRun) docWrite() writeOp {
 		if want == "ok" && !mValid(mc.schema, next) {
 			want = "schema"
 		}
+		if want == "ok" && mc.mUniqueViolation(id, next) {
+			want = "unique"
+		}
 		return writeOp{
 			desc: fmt.Sprintf("update %s/%s set=%s unset=%v if=%s upsert=%v", cn, id, js(u.Set), u.Unset, js(cond), u.Upsert),
 			run: func(ctx context.Context) error {
@@ -757,6 +975,8 @@ func (r *modelRun) docWrite() writeOp {
 			want = "not found"
 		case !mValid(mc.schema, data):
 			want = "schema"
+		case mc.mUniqueViolation(id, data):
+			want = "unique"
 		}
 		return writeOp{
 			desc: fmt.Sprintf("replace %s/%s %s if=%s", cn, id, js(data), js(cond)),
@@ -790,16 +1010,25 @@ func (r *modelRun) metaWrite() writeOp {
 	switch r.pick(3) {
 	case 0: // create_index
 		name := modelIndex[r.pick(len(modelIndex))]
-		field := []string{"a", "b", "t", "o"}[r.pick(4)]
+		field := modelIndexFields[r.pick(len(modelIndexFields))]
+		unique := r.chance(0.4)
+		if unique && r.chance(0.6) {
+			field = "o.x" // often missing: a unique index on it can be created more often
+		}
 		want := "ok"
 		if _, ok := mc.indexes[name]; ok {
 			want = "exists"
+		} else if unique && mc.mHasDuplicates(field) {
+			want = "unique"
 		}
 		return writeOp{
-			desc:  fmt.Sprintf("create_index %s %s on %s", cn, name, field),
-			run:   func(ctx context.Context) error { return r.coll(cn).CreateIndex(ctx, name, field) },
-			want:  want,
-			apply: func(m mState) { m[cn].indexes[name] = field },
+			desc: fmt.Sprintf("create_index %s %s on %s unique=%v", cn, name, field, unique),
+			run:  func(ctx context.Context) error { return r.coll(cn).CreateIndex(ctx, name, field, Unique(unique)) },
+			want: want,
+			apply: func(m mState) {
+				m[cn].indexes[name] = field
+				m[cn].unique[name] = unique
+			},
 		}
 	case 1: // drop_index
 		name := modelIndex[r.pick(len(modelIndex))]
@@ -808,10 +1037,13 @@ func (r *modelRun) metaWrite() writeOp {
 			want = "not found"
 		}
 		return writeOp{
-			desc:  fmt.Sprintf("drop_index %s %s", cn, name),
-			run:   func(ctx context.Context) error { return r.coll(cn).DropIndex(ctx, name) },
-			want:  want,
-			apply: func(m mState) { delete(m[cn].indexes, name) },
+			desc: fmt.Sprintf("drop_index %s %s", cn, name),
+			run:  func(ctx context.Context) error { return r.coll(cn).DropIndex(ctx, name) },
+			want: want,
+			apply: func(m mState) {
+				delete(m[cn].indexes, name)
+				delete(m[cn].unique, name)
+			},
 		}
 	default: // update_schema
 		s := r.schema()
@@ -865,11 +1097,10 @@ func (r *modelRun) checkCount() {
 	if r.chance(0.5) {
 		// A single eq or has filter: answered from an index when the
 		// field has one.
+		// A single index-servable filter: counted from the index when the
+		// field has one.
 		f := r.filter(cn)
-		f.Operator = []string{"eq", "has"}[r.pick(2)]
-		if v, ok := r.storedValue(f.Field); ok && r.chance(0.7) {
-			f.Value = v
-		}
+		f = r.filterOn(f.Field, []string{"eq", "has", "in", "gte", "lt", "starts_with", "exists"}[r.pick(7)])
 		q = &Query{Filters: []QueryFilter{f}}
 	}
 	r.note("count %s %s", cn, js(q))
@@ -885,7 +1116,7 @@ func (r *modelRun) checkCount() {
 
 func (r *modelRun) checkDistinct() {
 	cn := modelColls[r.pick(len(modelColls))]
-	field := []string{"a", "b", "t", "o", "_id", "missing"}[r.pick(6)]
+	field := modelQueryFields[r.pick(len(modelQueryFields))]
 	if f, ok := r.indexedField(cn); ok && r.chance(0.5) {
 		field = f // answered from the index keys when there are no filters
 	}
@@ -923,9 +1154,10 @@ func (r *modelRun) engineState() mState {
 	out := mState{}
 	for _, cn := range modelColls {
 		c := r.coll(cn)
-		mc := &mColl{schema: c.Schema(), indexes: map[string]string{}, docs: map[string]map[string]any{}}
+		mc := &mColl{schema: c.Schema(), indexes: map[string]string{}, unique: map[string]bool{}, docs: map[string]map[string]any{}}
 		for _, ix := range c.Indexes() {
 			mc.indexes[ix.Name] = ix.Field
+			mc.unique[ix.Name] = ix.Unique
 		}
 		docs, err := c.Find(context.Background(), nil)
 		if err != nil {
@@ -942,6 +1174,27 @@ func (r *modelRun) engineState() mState {
 func (r *modelRun) checkState(why string) {
 	if got, want := r.engineState().dump(), r.m.dump(); got != want {
 		r.fail("%s: state mismatch\n--- engine\n%s--- model\n%s--- differing lines\n%s", why, got, want, lineDiff(got, want))
+	}
+	r.checkIndexFiles(why)
+}
+
+// checkIndexFiles compares every collection's index file (key table and
+// index entries, counters, the store's own check) with its documents.
+func (r *modelRun) checkIndexFiles(why string) {
+	for _, cn := range modelColls {
+		c := r.coll(cn)
+		docs, err := c.Find(context.Background(), nil)
+		if err != nil {
+			r.fail("%s: scanning %s: %v", why, cn, err)
+			return
+		}
+		c.db.mu.RLock()
+		checkIndexEntries(r.t, c, docs)
+		c.db.mu.RUnlock()
+		if r.t.Failed() {
+			r.fail("%s: the index file of %s does not match its documents (see above)", why, cn)
+			return
+		}
 	}
 }
 
@@ -960,7 +1213,7 @@ func (r *modelRun) reopen(why string) {
 // and reopens it. An operation in flight at the crash may or may not have
 // landed; everything acknowledged before it must be there.
 func (r *modelRun) crash() {
-	points := []hookPoint{hookAfterWALSync, hookMetaWrite, hookAfterSegWrite, hookAfterSegSync, hookCompactBeforeSwap}
+	points := []hookPoint{hookAfterWALSync, hookMetaWrite, hookAfterSegWrite, hookAfterSegSync, hookAfterIndexCommit, hookCompactBeforeSwap}
 	p := points[r.pick(len(points))]
 	if err := r.e.Close(context.Background()); err != nil {
 		r.fail("crash: Close: %v", err)
@@ -991,7 +1244,7 @@ func (r *modelRun) crash() {
 		case errClass(err) != w.want:
 			r.fail("crash at %s during %s: got %v, want %s", p, w.desc, err, w.want)
 		}
-	case hookAfterSegWrite, hookAfterSegSync:
+	case hookAfterSegWrite, hookAfterSegSync, hookAfterIndexCommit:
 		cn := modelColls[r.pick(len(modelColls))]
 		desc = "flush " + cn
 		if err := r.coll(cn).flush(); err != nil && !errors.Is(err, errSimulatedCrash) {

@@ -43,8 +43,12 @@ func TestCheckDataDirNew(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			root := tt.setup(t)
-			if _, err := checkDataDir(root); err != nil {
+			upgrade, err := checkDataDir(root)
+			if err != nil {
 				t.Fatalf("checkDataDir: %v", err)
+			}
+			if upgrade {
+				t.Error("checkDataDir asks to upgrade a new directory")
 			}
 
 			data, err := os.ReadFile(filepath.Join(root, "cachydb.format"))
@@ -58,13 +62,13 @@ func TestCheckDataDirNew(t *testing.T) {
 			if err := json.Unmarshal(data, &ff); err != nil {
 				t.Fatalf("decoding format file %q: %v", data, err)
 			}
-			if ff.Format != "cachydb" || ff.Version != 2 {
-				t.Errorf("format file = %+v, want {cachydb 2}", ff)
+			if ff.Format != "cachydb" || ff.Version != 3 {
+				t.Errorf("format file = %+v, want {cachydb 3}", ff)
 			}
 
 			// Reopening a directory with a valid format file succeeds.
-			if _, err := checkDataDir(root); err != nil {
-				t.Errorf("second checkDataDir: %v", err)
+			if upgrade, err := checkDataDir(root); err != nil || upgrade {
+				t.Errorf("second checkDataDir = %v, %v; want no upgrade, nil", upgrade, err)
 			}
 		})
 	}
@@ -101,30 +105,43 @@ func TestCheckDataDirOldLayout(t *testing.T) {
 
 func TestCheckDataDirFormatFile(t *testing.T) {
 	tests := []struct {
-		name    string
-		content string
-		wantErr bool
+		name        string
+		content     string
+		wantErr     bool
+		wantUpgrade bool
 	}{
-		{"current version", `{"format":"cachydb","version":2}`, false},
-		{"higher version", `{"format":"cachydb","version":3}`, true},
-		{"lower version", `{"format":"cachydb","version":1}`, true},
-		{"wrong format name", `{"format":"other","version":2}`, true},
-		{"garbage", `not json`, true},
+		{"current version", `{"format":"cachydb","version":3}`, false, false},
+		{"version 2 is upgraded", `{"format":"cachydb","version":2}`, false, true},
+		{"higher version", `{"format":"cachydb","version":4}`, true, false},
+		{"lower version", `{"format":"cachydb","version":1}`, true, false},
+		{"version 0", `{"format":"cachydb","version":0}`, true, false},
+		{"wrong format name", `{"format":"other","version":3}`, true, false},
+		{"garbage", `not json`, true, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			root := t.TempDir()
-			writeFile(t, filepath.Join(root, "cachydb.format"), tt.content)
+			path := filepath.Join(root, "cachydb.format")
+			writeFile(t, path, tt.content)
 
-			_, err := checkDataDir(root)
+			upgrade, err := checkDataDir(root)
+			if got, rerr := os.ReadFile(path); rerr != nil || string(got) != tt.content {
+				t.Errorf("checkDataDir changed the format file to %q (%v)", got, rerr)
+			}
 			if !tt.wantErr {
 				if err != nil {
 					t.Errorf("checkDataDir = %v, want nil", err)
+				}
+				if upgrade != tt.wantUpgrade {
+					t.Errorf("upgrade = %v, want %v", upgrade, tt.wantUpgrade)
 				}
 				return
 			}
 			if !errors.Is(err, ErrIncompatibleDataDir) {
 				t.Errorf("checkDataDir = %v, want ErrIncompatibleDataDir", err)
+			}
+			if upgrade {
+				t.Error("upgrade = true together with an error")
 			}
 		})
 	}
@@ -134,10 +151,10 @@ func TestCheckDataDirFormatFileWinsOverLegacyFiles(t *testing.T) {
 	// A valid cachydb.format means the directory is already in the new
 	// format; legacy-looking names are not re-checked.
 	root := t.TempDir()
-	writeFile(t, filepath.Join(root, "cachydb.format"), `{"format":"cachydb","version":2}`)
+	writeFile(t, filepath.Join(root, "cachydb.format"), `{"format":"cachydb","version":3}`)
 	writeFile(t, filepath.Join(root, "wal.checkpoint"), "")
-	if _, err := checkDataDir(root); err != nil {
-		t.Errorf("checkDataDir = %v, want nil", err)
+	if upgrade, err := checkDataDir(root); err != nil || upgrade {
+		t.Errorf("checkDataDir = %v, %v; want no upgrade, nil", upgrade, err)
 	}
 }
 
