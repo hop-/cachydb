@@ -40,7 +40,7 @@ starting `validating "arguments":`.
 | `already exists (use --on-conflict skip or replace)` | `utils import` / `client import` found an existing `_id`; the message says how many lines were applied | Rerun with `--on-conflict skip` or `replace` |
 | `exists with a different schema` / `different index set` | An import target collection differs from the file | Use `--on-conflict replace`, or import into another directory |
 | `unsupported export format version` | The file was written by a newer cachydb | Upgrade cachydb |
-| `incompatible data directory` | The directory was written by an older, incompatible cachydb | Use a new directory; the old data is not converted |
+| `incompatible data directory` | The directory was written by a cachydb this version cannot open: one older than v0.0.4 (`was created by an older cachydb format`), or a newer one (`newer than supported version`). Directories of v0.0.4 to v0.0.6 are not an error: they are upgraded automatically, one-way, at the first start | Older: use a new directory, the old data is not converted. Newer: upgrade cachydb |
 | `database schema version is newer than supported` | The data was migrated by a newer cachydb | Upgrade cachydb |
 | `invalid transport` | `-t`/`TRANSPORT` is not `stdio` or `http` | Use `stdio` or `http` |
 | `loading configuration from the environment` | An environment variable has a malformed value | Fix the variable named in the message |

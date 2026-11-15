@@ -30,7 +30,9 @@ import (
 //     interrupted between its segment fsync and its index commit leaves
 //     behind). An index file that is missing, damaged, or does not match
 //     the segments is rebuilt from them with a header-only scan
-//     (rebuildIndex), with a warning, secondary indexes included. Index
+//     (rebuildIndex), with a warning, secondary indexes included. (A
+//     directory of format version 2 has no index files: Open builds them
+//     all before this step, see upgrade.go.) Index
 //     entries without a definition in coll.meta are dropped, and
 //     definitions without complete entries are built (syncIndexes).
 //  3. Check that the WAL reaches past every offset the data references.
@@ -46,10 +48,11 @@ import (
 // recoveryStats counts what recovery did. They are logged and read by
 // tests.
 type recoveryStats struct {
-	indexFilesRebuilt atomic.Int64 // index files (index.db) rebuilt from the data segments
-	segmentsScanned   atomic.Int64 // data segments scanned by those rebuilds
-	replayApplied     atomic.Int64 // WAL records whose effect replay applied
-	replaySkipped     atomic.Int64 // WAL records replay found already applied or obsolete
+	collectionsUpgraded atomic.Int64 // collections whose index file the format upgrade 2 -> 3 built (upgrade.go)
+	indexFilesRebuilt   atomic.Int64 // index files (index.db) of format 3 rebuilt because they were missing, damaged, or did not match the data segments
+	segmentsScanned     atomic.Int64 // data segments scanned by the upgrade and those rebuilds
+	replayApplied       atomic.Int64 // WAL records whose effect replay applied
+	replaySkipped       atomic.Int64 // WAL records replay found already applied or obsolete
 }
 
 // replayCtxCheckEvery is how many WAL records replay applies between
@@ -60,12 +63,20 @@ const replayCtxCheckEvery = 1024
 // transaction.
 const rebuildBatch = 50_000
 
-// recover loads the data directory into e and replays the WAL. On error
-// the caller closes the collections' segment files.
-func (e *Engine) recover(ctx context.Context) error {
+// recover loads the data directory into e and replays the WAL. With
+// upgrade set (a directory of format version 2, see checkDataDir) it
+// upgrades the directory to format version 3 after reading the metadata
+// and before loading the collections (upgradeFormat). On error the caller
+// closes the collections' segment files.
+func (e *Engine) recover(ctx context.Context, upgrade bool) error {
 	start := time.Now()
 	if err := e.loadMetadata(ctx); err != nil {
 		return err
+	}
+	if upgrade {
+		if err := e.upgradeFormat(ctx); err != nil {
+			return err
+		}
 	}
 	maxSeen, err := e.loadCollections(ctx)
 	if err != nil {
@@ -103,6 +114,7 @@ func (e *Engine) recover(ctx context.Context) error {
 		"replay_from", from,
 		"replayed", st.replayApplied.Load(),
 		"replay_skipped", st.replaySkipped.Load(),
+		"collections_upgraded", st.collectionsUpgraded.Load(),
 		"index_files_rebuilt", st.indexFilesRebuilt.Load(),
 		"segments_scanned", st.segmentsScanned.Load(),
 		"duration", time.Since(start),
@@ -246,6 +258,7 @@ func (c *Collection) openIndex(ctx context.Context) (*idxstore.Store, indexState
 	if st, err = c.rebuildIndex(ctx); err != nil {
 		return nil, indexState{}, err
 	}
+	c.db.e.recov.indexFilesRebuilt.Add(1)
 	is, mismatch, err := c.alignSegments(st)
 	if err == nil && mismatch != "" {
 		err = fmt.Errorf("the rebuilt index file does not match the data segments: %s", mismatch)
@@ -497,7 +510,6 @@ func (c *Collection) rebuildIndex(ctx context.Context) (_ *idxstore.Store, err e
 	if err != nil {
 		return nil, err
 	}
-	e.recov.indexFilesRebuilt.Add(1)
 	return st, nil
 }
 

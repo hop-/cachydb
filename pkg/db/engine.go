@@ -90,7 +90,9 @@ type Engine struct {
 // the exclusive directory lock (ErrDataDirInUse if another process — or
 // another Engine in this process — holds it), checks the on-disk format
 // (ErrIncompatibleDataDir), removes leftovers of interrupted drops, opens
-// the WAL, loads database and collection metadata, opens the collections'
+// the WAL, loads database and collection metadata, upgrades a directory of
+// format version 2 to version 3 by building every collection's index file
+// from its data segments (one-way; see upgrade.go), opens the collections'
 // index files (rebuilding one that is missing or damaged from the data
 // segments), replays the WAL idempotently (see recovery.go),
 // and starts the background flusher, compactor, and WAL retention. A WAL that ends
@@ -129,7 +131,8 @@ func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 		}
 	}()
 
-	if err := checkDataDir(root); err != nil {
+	upgrade, err := checkDataDir(root)
+	if err != nil {
 		return nil, err
 	}
 	if err := removeDeletedLeftovers(root); err != nil {
@@ -168,7 +171,7 @@ func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 		flushKick: make(chan struct{}, 1),
 		pending:   newPendingBytes(),
 	}
-	if err := e.recover(ctx); err != nil {
+	if err := e.recover(ctx, upgrade); err != nil {
 		e.closeCollectionFiles()
 		return nil, fmt.Errorf("opening %s: %w", root, err)
 	}

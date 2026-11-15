@@ -158,7 +158,7 @@ func TestMetaCheckpointIgnoredByFormatChecks(t *testing.T) {
 	if old, err := hasOldLayout(dir); err != nil || old {
 		t.Fatalf("hasOldLayout = %v, %v; want false", old, err)
 	}
-	if err := checkDataDir(dir); err != nil {
+	if _, err := checkDataDir(dir); err != nil {
 		t.Fatalf("checkDataDir: %v", err)
 	}
 }

@@ -43,7 +43,7 @@ func TestCheckDataDirNew(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			root := tt.setup(t)
-			if err := checkDataDir(root); err != nil {
+			if _, err := checkDataDir(root); err != nil {
 				t.Fatalf("checkDataDir: %v", err)
 			}
 
@@ -63,7 +63,7 @@ func TestCheckDataDirNew(t *testing.T) {
 			}
 
 			// Reopening a directory with a valid format file succeeds.
-			if err := checkDataDir(root); err != nil {
+			if _, err := checkDataDir(root); err != nil {
 				t.Errorf("second checkDataDir: %v", err)
 			}
 		})
@@ -84,7 +84,7 @@ func TestCheckDataDirOldLayout(t *testing.T) {
 			root := t.TempDir()
 			writeFile(t, filepath.Join(root, tt.file), "")
 
-			err := checkDataDir(root)
+			_, err := checkDataDir(root)
 			if !errors.Is(err, ErrIncompatibleDataDir) {
 				t.Fatalf("checkDataDir = %v, want ErrIncompatibleDataDir", err)
 			}
@@ -116,7 +116,7 @@ func TestCheckDataDirFormatFile(t *testing.T) {
 			root := t.TempDir()
 			writeFile(t, filepath.Join(root, "cachydb.format"), tt.content)
 
-			err := checkDataDir(root)
+			_, err := checkDataDir(root)
 			if !tt.wantErr {
 				if err != nil {
 					t.Errorf("checkDataDir = %v, want nil", err)
@@ -136,7 +136,7 @@ func TestCheckDataDirFormatFileWinsOverLegacyFiles(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "cachydb.format"), `{"format":"cachydb","version":2}`)
 	writeFile(t, filepath.Join(root, "wal.checkpoint"), "")
-	if err := checkDataDir(root); err != nil {
+	if _, err := checkDataDir(root); err != nil {
 		t.Errorf("checkDataDir = %v, want nil", err)
 	}
 }

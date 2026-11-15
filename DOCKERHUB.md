@@ -105,6 +105,23 @@ it.
 segments and exits 0. The default 10-second stop timeout is enough for
 typical workloads.
 
+## Upgrading
+
+A data volume written by CachyDB 0.0.4 to 0.0.6 (on-disk format 2) is
+upgraded in place the first time a newer image opens it: each collection
+gets an `index.db` built from its data, and the old hint files and index
+snapshots are removed. The log shows one line per collection
+(`upgrading data directory format 2 -> 3; building index`). If the
+container stops during the upgrade, the next start runs it again.
+
+The upgrade is **one-way**: older images cannot open the volume
+afterwards. Before you switch tags, stop the container and copy the
+volume (or export it with the old image's `cachydb utils export`):
+
+```bash
+docker run --rm -v cachydb-data:/from -v cachydb-data-backup:/to alpine cp -a /from/. /to/
+```
+
 ## Healthcheck
 
 The image has a built-in `HEALTHCHECK` that runs `cachydb healthcheck`.

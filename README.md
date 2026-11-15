@@ -573,6 +573,19 @@ The files are binary (except the small JSON metadata files). See [`dev-docs/STOR
 
 ## Upgrading from Older Versions
 
+### Upgrading a v0.0.4–v0.0.6 data directory
+
+Data directories written by CachyDB v0.0.4 to v0.0.6 (on-disk format 2) are upgraded automatically, in place, the first time this version opens them: each collection gets its `index.db`, built from its data segments, and the old hint files (`seg-*.hint`) and index snapshots (`idx-*.snap`) are removed. The log shows one line per collection (`upgrading data directory format 2 -> 3; building index`); on a large collection this takes a while once. If the process stops during the upgrade, the next start runs it again from the beginning.
+
+The upgrade is **one-way**: older versions cannot open the directory afterwards. Before the first start, stop the server and keep a copy of the data directory, or export it:
+
+```bash
+cp -a ~/.cachydb ~/.cachydb.before-upgrade         # a copy of the whole directory, or
+cachydb utils export -o backup.jsonl               # a JSON Lines export (run it with the old version)
+```
+
+### Directories older than v0.0.4
+
 This storage engine is **not compatible** with data directories created by earlier CachyDB versions (JSON or `collection.data`/`collection.idx` files, `wal.checkpoint`). Opening one fails with:
 
 ```none
