@@ -389,8 +389,8 @@ func BenchmarkScale(b *testing.B) {
 	}
 	r.logf("scale benchmark: %d documents, ids %s, GOMAXPROCS %d, %s", n, idKind, runtime.GOMAXPROCS(0), runtime.Version())
 
-	b.StopTimer() // the metrics below are the result; ns/op is meaningless
-	for range b.N {
+	// the metrics below are the result; ns/op is meaningless
+	for b.Loop() {
 		root := b.TempDir()
 
 		// 1. Load with the indexes in place, through the flusher. The
@@ -607,8 +607,7 @@ func BenchmarkScaleCollections(b *testing.B) {
 	r.logf("many collections: %d collections x %d documents, three indexes each", k, perColl)
 	name := func(j int) string { return fmt.Sprintf("c%04d", j) }
 
-	b.StopTimer()
-	for range b.N {
+	for b.Loop() {
 		root := b.TempDir()
 		e, err := Open(ctx, benchOptions(root))
 		if err != nil {
