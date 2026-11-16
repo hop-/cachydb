@@ -167,8 +167,16 @@ func uniqueStripe(name, enc string) int {
 // vals (lockUnique) and the document lock of id, or run in recovery. It
 // holds no read transaction when it returns.
 func (c *Collection) checkUnique(id string, vals []uniqueValue) error {
+	return c.checkUniqueExcept(func(other string) bool { return other == id }, vals)
+}
+
+// checkUniqueExcept is checkUnique for a write of several documents: the
+// documents for which skip returns true are left out (a batch checks its
+// own documents against each other). Callers hold the stripes of vals and
+// the document locks of the skipped ids, or run in recovery.
+func (c *Collection) checkUniqueExcept(skip func(id string) bool, vals []uniqueValue) error {
 	for attempt := 0; ; attempt++ {
-		err := c.checkUniqueOnce(id, vals)
+		err := c.checkUniqueOnce(skip, vals)
 		if errors.Is(err, errSegmentRetired) && attempt < maxReadRetries {
 			continue // compaction moved a document it was reading
 		}
@@ -180,13 +188,13 @@ func (c *Collection) checkUnique(id string, vals []uniqueValue) error {
 // mu), then the index file (the snapshot rule of document.go), then the
 // overlay again for the ids the index file named, because the overlay
 // decides for its ids.
-func (c *Collection) checkUniqueOnce(id string, vals []uniqueValue) error {
+func (c *Collection) checkUniqueOnce(skip func(id string) bool, vals []uniqueValue) error {
 	c.mu.RLock()
 	st, err := c.storeLocked()
 	if err == nil {
 		for _, uv := range vals {
 			for _, other := range c.uniquePending[uv.def.Name][uv.enc] {
-				if other == id {
+				if skip(other) {
 					continue
 				}
 				if doc, _ := c.overlayDocLocked(other); holds(doc, uv) {
@@ -220,7 +228,7 @@ func (c *Collection) checkUniqueOnce(id string, vals []uniqueValue) error {
 			enc := []byte(uv.enc)
 			for e, ok := cur.Seek(idxstore.ValuePrefix(enc)); ok && bytes.Equal(e.Value, enc); e, ok = cur.Next() {
 				other := string(e.ID)
-				if e.Flags&idxstore.FlagElement != 0 || other == id {
+				if e.Flags&idxstore.FlagElement != 0 || skip(other) {
 					continue
 				}
 				if e.Flags&idxstore.FlagTruncated != 0 {

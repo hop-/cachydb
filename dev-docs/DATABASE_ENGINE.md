@@ -43,11 +43,13 @@ means "disabled".
 | `CompactionRatio` | 0.5 | Dead/total bytes of sealed segments that triggers compaction; must be in (0,1] |
 | `MaxPendingBytes` | `4 × MemtableSize × max(1, GOMAXPROCS/2)`, max 1 GiB | Write backpressure: document writes wait (honoring `ctx`) while the unflushed bytes of all collections are at or above it; negative = no limit |
 | `FlushWorkers` | `min(GOMAXPROCS, 4)` | Collections flushed in parallel by one flush pass; must be >= 0 |
+| `MaxBatchDocs` | 10,000 | Most operations in one `Collection.Batch` (`ErrBatchTooLarge` above it); must be >= 0 |
+| `MaxBatchBytes` | 32 MiB | Largest WAL payload of one batch: ids and document after-images plus 7 bytes per operation and 4 (`ErrBatchTooLarge` above it); must be >= 0 |
 
 The defaults were kept after the benchmarks in `pkg/db/bench_test.go`; the
 reasoning is in the comment above the constants in `options.go`.
 
-A document write (`Insert`, `Update`, `Delete`) can block on
+A document write (`Insert`, `Update`, `Delete`, `Batch`) can block on
 `MaxPendingBytes` when the disk is slower than the writers. It returns
 `ctx.Err()` if its context ends first (nothing is written) and `ErrClosed`
 if the engine closes. `FormatVersion` and `WALFormatVersion` are the
@@ -95,6 +97,7 @@ on-disk format versions this build reads and writes.
 | `Replace(ctx, id, *Document, Condition) (*Document, error)` | Whole-document replace; `doc.ID` empty or `id`; `ErrNotFound` (missing), `ErrConditionFailed` |
 | `Delete(ctx, id) error` | `DeleteWith(ctx, id, nil)` |
 | `DeleteWith(ctx, id, Condition) error` | `ErrNotFound`, `ErrConditionFailed` |
+| `Batch(ctx, []WriteOp) (BatchResult, error)` | Many writes of this collection, all or nothing, as one WAL record (op 11) with one fsync; see [Batches](#batches-batchgo) |
 | `CreateIndex(ctx, name, field, ...IndexOption) error` | `field` may be a nested path; `Unique(true)` makes it unique (see [Unique indexes](#unique-indexes)); builds from existing documents; blocks writes to the whole database while it runs; `ErrExists`; `ErrUniqueViolation` if a unique index would cover shared values |
 | `DropIndex(ctx, name) error` | MCP `drop_index`; `ErrNotFound` |
 | `Schema() *Schema`, `Indexes() []IndexInfo` | Copies; indexes sorted by name, with `Unique` (MCP `describe_collection`) |
@@ -114,8 +117,48 @@ on-disk format versions this build reads and writes.
   depth) with `now` as an RFC 3339 UTC string with nanoseconds. `Insert`,
   `UpdateWith`, `Replace`, conditions, and query filters resolve it
   themselves, once per call, before schema validation.
-- Every write still logs one `put_doc`/`delete_doc` after-image; the WAL
-  record format is unchanged.
+- Every single write still logs one `put_doc`/`delete_doc` after-image; a
+  `Batch` logs one `batch` record holding every item's after-image (or
+  delete).
+
+### Batches (`batch.go`)
+
+`Collection.Batch(ctx, ops []WriteOp) (BatchResult, error)` applies many
+inserts, updates, replaces, and deletes of one collection atomically: one
+WAL record (op 11, `batch`), one fsync, and either every operation is
+applied and durable or none is, also across a crash (the record has one
+CRC; a torn record is dropped whole by WAL recovery).
+
+```go
+type WriteOp struct {
+    Kind     OpKind     // OpInsert, OpUpdate, OpReplace, OpDelete
+    ID       string
+    Document *Document  // OpInsert, OpReplace
+    Update   UpdateSpec // OpUpdate
+    If       Condition  // OpUpdate, OpReplace, OpDelete
+}
+type BatchResult struct{ IDs []string; Upserted []bool } // per operation
+```
+
+- Each kind behaves exactly as its single write (`Insert`, `UpdateWith`,
+  `Replace`, `DeleteWith`): the same build callbacks, conditions, upsert,
+  `$now` (one time for the whole batch), and schema validation. An insert's
+  id is `ID`, else `Document.ID`, else a generated UUID v7; a replace's is
+  `ID`, else `Document.ID`. An update's stored version must match both `If`
+  and `Update.If`. A field the kind does not use must be empty.
+- An id may appear only once per batch (every item gets the record's WAL
+  offset as its version). The second operation fails with `ErrExists`.
+- Any failing operation fails the whole call with a `*BatchItemError`
+  (`Index`, `Err`; text `batch operation <i>: ...`) that wraps the
+  operation's sentinel: `ErrExists`, `ErrNotFound`, `ErrConditionFailed`,
+  `ErrSchemaValidation`, `ErrUniqueViolation`. Nothing is written.
+- Unique indexes see the batch's final state: the batch's documents must
+  not share a value with each other or with a document outside the batch,
+  but one operation may take a value another operation of the batch frees.
+- More than `MaxBatchDocs` operations, or a payload over `MaxBatchBytes`,
+  fails with `ErrBatchTooLarge`, whose text states the limit.
+- An empty batch writes nothing. `ops` is not modified or retained.
+- Locking and replay: [STORAGE.md](STORAGE.md#write-path-pkgdbdocumentgo).
 
 Every acknowledged write is fsynced to the WAL before the call returns.
 Returned documents are deep copies: mutating them never changes stored data.
@@ -132,6 +175,7 @@ Errors are wrapped with context; test them with `errors.Is`.
 | `ErrSchemaValidation` | Invalid schema, document violates the schema (a `*SchemaError` listing every violation wraps it), a reserved `_id` misuse, or `UpdateSchema` found non-matching documents |
 | `ErrConditionFailed` | An `if` condition did not match the stored document (or it is missing); nothing was written |
 | `ErrUniqueViolation` | A write's value for a unique index belongs to another document, or `CreateIndex` with `Unique(true)` found documents sharing a value; nothing was written |
+| `ErrBatchTooLarge` | A `Batch` has more operations than `MaxBatchDocs` or a larger payload than `MaxBatchBytes`; the text states the limit; nothing was written |
 | `ErrClosed` | Engine closed |
 | `ErrDataDirInUse` | Another process (or engine) holds `cachydb.lock` |
 | `ErrIncompatibleDataDir` | Old-format or newer-format data directory |

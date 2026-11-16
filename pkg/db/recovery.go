@@ -660,6 +660,11 @@ func (e *Engine) replayRecord(ctx context.Context, r wal.Record) (bool, error) {
 			return false, nil
 		}
 		return c.replayDoc(r)
+	case wal.OpBatch:
+		if c == nil || r.Offset <= c.replayFloor() {
+			return false, nil
+		}
+		return c.replayBatch(r)
 	default:
 		return false, fmt.Errorf("%w: unknown operation %d", ErrWALCorrupt, r.Op)
 	}
@@ -920,14 +925,23 @@ func (d *Database) finishRename(c *Collection, newName string, off uint64) error
 // of the same id replayed before this record is in the memtable, and one
 // replayed after it has a higher offset.
 func (c *Collection) replayDoc(r wal.Record) (bool, error) {
-	if len(r.ID) > maxIDLen {
+	return c.replayItem(r.Op, r.ID, r.Payload, r.Offset, func(other string) bool { return other == r.ID })
+}
+
+// replayItem is replayDoc for one document change: op (put_doc or
+// delete_doc) of the document id with the after-image doc, written at WAL
+// offset off, by a single record or as an item of a batch record. The
+// unique check that only logs leaves out the documents for which skip
+// returns true (id itself, or every id of the batch).
+func (c *Collection) replayItem(op wal.Op, id string, doc []byte, off uint64, skip func(string) bool) (bool, error) {
+	if len(id) > maxIDLen {
 		return false, fmt.Errorf("collection %q in database %q: the document id is %d bytes, longer than the limit of %d bytes; this version cannot store it",
-			c.name, c.db.name, len(r.ID), maxIDLen)
+			c.name, c.db.name, len(id), maxIDLen)
 	}
 	var next *Document
-	if r.Op == wal.OpPutDoc {
+	if op == wal.OpPutDoc {
 		var err error
-		if next, err = decodeDocument(r.ID, r.Payload); err != nil {
+		if next, err = decodeDocument(id, doc); err != nil {
 			return false, err
 		}
 	}
@@ -935,7 +949,7 @@ func (c *Collection) replayDoc(r wal.Record) (bool, error) {
 	// The memtable first, then the key table (nothing is being flushed
 	// during replay).
 	c.mu.RLock()
-	me, inMem := c.memtable[r.ID]
+	me, inMem := c.memtable[id]
 	c.mu.RUnlock()
 	var (
 		curOff  uint64
@@ -947,7 +961,7 @@ func (c *Collection) replayDoc(r wal.Record) (bool, error) {
 	if inMem {
 		curOff, existed, cur = me.walOffset, me.doc != nil, me.doc // applyLocked keeps the entry's base
 	} else {
-		ke, ok, err := c.storedEntry(r.ID)
+		ke, ok, err := c.storedEntry(id)
 		if err != nil {
 			return false, err
 		}
@@ -956,8 +970,8 @@ func (c *Collection) replayDoc(r wal.Record) (bool, error) {
 		}
 		if ok {
 			curOff, existed, baseOff = ke.WALOffset, true, ke.WALOffset
-			if r.Offset > curOff && len(c.indexes) > 0 {
-				prev, err := c.readStored(r.ID, ke)
+			if off > curOff && len(c.indexes) > 0 {
+				prev, err := c.readStored(id, ke)
 				if err != nil {
 					return false, err
 				}
@@ -966,22 +980,22 @@ func (c *Collection) replayDoc(r wal.Record) (bool, error) {
 			}
 		}
 	}
-	if r.Offset <= curOff {
+	if off <= curOff {
 		return false, nil
 	}
 	// The record is committed: a unique violation (which the write path
 	// prevents, so it means a damaged or foreign WAL) is applied anyway and
 	// only logged.
 	if vals := c.changedUniqueValues(cur, next); len(vals) > 0 {
-		if err := c.checkUnique(r.ID, vals); err != nil {
+		if err := c.checkUniqueExcept(skip, vals); err != nil {
 			c.db.e.logger.Warn("cachydb: WAL replay applied a write that violates a unique index",
-				"database", c.db.name, "collection", c.name, "id", r.ID, "offset", r.Offset, "err", err)
+				"database", c.db.name, "collection", c.name, "id", id, "offset", off, "err", err)
 		}
 	}
 
-	size := int64(len(r.ID)+len(r.Payload)) + memEntryOverhead
+	size := int64(len(id)+len(doc)) + memEntryOverhead
 	c.mu.Lock()
-	c.applyLocked(r.ID, existed, base, baseOff, next, r.Offset, size)
+	c.applyLocked(id, existed, base, baseOff, next, off, size)
 	c.mu.Unlock()
 	return true, nil
 }

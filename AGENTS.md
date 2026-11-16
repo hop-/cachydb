@@ -43,7 +43,7 @@ Start with `dev-docs/PROJECT.md`, then `dev-docs/DEVELOPMENT.md`. User-facing do
 | Path | Role |
 |------|------|
 | `pkg/db/engine.go` | `Engine`, `Open`/`Close`, database operations |
-| `pkg/db/document.go` | Document write path (WAL commit point; `UpdateWith`, `Replace`, `DeleteWith`, conditions), read path, candidate selection |
+| `pkg/db/document.go`, `batch.go` | Document write path (WAL commit point; `UpdateWith`, `Replace`, `DeleteWith`, conditions), read path, candidate selection; `Collection.Batch` (WAL op 11, one record and fsync for many writes) |
 | `pkg/db/query.go`, `plan.go`, `compare.go`, `index.go`, `unique.go` | `Find` (OR groups, sort, projection), `CountDocuments`, `Distinct`; query plans and snapshots; compiled operators and `$now`; index entries; unique indexes (field paths: `types.go` `GetPath`) |
 | `pkg/db/collection.go`, `database.go` | Schema/index metadata ops incl. `UpdateSchema` (WAL op 9), `RenameCollection` (WAL op 10), `CopyCollection` |
 | `pkg/db/flush.go`, `recovery.go`, `upgrade.go`, `compact.go` | Parallel flusher (segment append, then one `index.db` transaction with the checkpoint), recovery (index file open, segment alignment, rebuild) and replay, format 2 → 3 upgrade, compaction (incl. small-segment merges) |

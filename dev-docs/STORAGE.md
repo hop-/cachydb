@@ -143,6 +143,17 @@ u16 db_len · db · u16 coll_len · coll · u16 id_len · id · u32 payload_len 
 | 8 | `drop_index` | `{"name"}` |
 | 9 | `update_schema` | `{"schema": <Schema or null>}` (plan 004) |
 | 10 | `rename_coll` | `{"new_name"}`; `coll` is the old name (plan 004) |
+| 11 | `batch` | binary item list (below); `id` is empty (plan 013) |
+
+**Batch payload** (op 11, `internal/wal/batch.go`, little-endian): `u32
+count`, then per item `u8 op · u16 id_len · id · u32 doc_len · doc`, where
+`op` is 1 (put: `doc` is the after-image, as `put_doc`'s payload) or 2
+(delete: `doc_len` 0). Ids are not empty. One record holds the changes of
+one collection (`db`, `coll` in the header) and every item's version is
+the record's offset, so an id appears at most once per batch. A record
+larger than the group-commit cap (4 MiB) is written alone. Decoding is
+strict (count, ops, lengths, no trailing bytes); a malformed payload fails
+replay with `ErrWALCorrupt`.
 
 Offsets start at 1 and increase by exactly 1 across the whole log. The
 format is self-describing so a future WAL reader / change feed needs no
@@ -306,6 +317,19 @@ returns. A cached `Get` is ~8.5× faster than an uncached one
 No read transaction is open across the WAL append. Index entries are not
 touched on the write path: the flusher applies them.
 
+**Batches** (`pkg/db/batch.go`, op 11) follow the same steps for many
+documents of one collection: build every operation first (the single
+writes' build callbacks), then 0. backpressure, 1. `Database.mu` shared,
+2. the docLock stripes of all ids in ascending stripe order, each once
+(a single write holds one stripe, so no deadlock), 3–4. read, build, and
+validate every after-image in operation order, 5. unique values: the
+batch's documents against each other, then the stripes of every value an
+operation adds (ascending, each once) and the check against the overlay
+and `index.db` leaving out the batch's own ids, 6. register inflight
+once, one WAL append + fsync (`hookAfterWALSync`), 7. apply every item
+under one `Collection.mu` section, each with the record's offset. The
+memtable, flush, and segments see ordinary puts and tombstones.
+
 Writes become visible only after they are durable. If the append fails,
 nothing is applied. Writes to different documents commit concurrently and
 share fsyncs; writes to one document are serialized, so read-modify-write
@@ -441,7 +465,9 @@ deleted by retention.
    a warning and falls back to one past the minimum meta-file
    `wal_offset`. An idle collection still pins the start at its last
    checkpoint. Each record is applied only if its effect is missing: document
-   records iff their offset beats the current version's; create/drop
+   records iff their offset beats the current version's (a `batch` record
+   item by item, each with the record's offset, so replaying it again or
+   after some of its items were flushed changes nothing more); create/drop
    records iff the meta file's `wal_offset` (and `created_offset`) is
    older; `update_schema` likewise. Replay never fails on "already exists"
    or "not found". Replayed changes land in memtables and are flushed
@@ -523,6 +549,7 @@ copy (`keptTombs`).
 ```
 Engine.metaMu → Database.mu → compactMu → flushMu → storeMu → Collection.mu
                 Database.mu (shared) → docLock → uniqueLocks (ascending) → Collection.mu
+                Database.mu (shared) → docLocks (ascending, Batch) → uniqueLocks (ascending) → Collection.mu
 ```
 
 `index.db` transactions are not locks in this order, but two rules hold:
@@ -535,7 +562,7 @@ held across a WAL append or while starting an update in the same goroutine.
 | `Engine.mu` | databases map only; never held during I/O |
 | `Engine.metaMu` | create/drop database, including I/O |
 | `Database.mu` | collections map, collection schemas; exclusive for metadata ops (incl. the whole `CreateIndex` build, `UpdateSchema` validation, and the flush inside `RenameCollection`); shared by document writes |
-| `docLocks[256]` | one document's read-modify-write; held across the WAL append |
+| `docLocks[256]` | one document's read-modify-write; held across the WAL append. A `Batch` takes the stripes of all its ids in ascending order, each once |
 | `uniqueLocks[256]` | writers of one `(unique index, encoded value)` (`pkg/db/unique.go`); taken after the document lock, only by writes that set a new value of a unique index, several in ascending stripe order, and held until the write is applied (so across the WAL append). The uniqueness check reads `index.db` in a short read transaction that ends before the append: no read transaction is held across the append |
 | `Collection.mu` | the `store` pointer, memtables, index definitions, inflight, `uniquePending`, checkpoint; memory-only sections |
 | `storeMu` | opening `index.db` on first use after a rename (`indexStore`) against the operations that close it (`markDropped`, `detach`, `closeReaders`) |
@@ -556,7 +583,7 @@ The engine calls it at the points in `pkg/db/hooks.go`:
 
 | Hook | Point |
 | --- | --- |
-| `hookAfterWALSync` | document write: after the WAL fsync, before the apply |
+| `hookAfterWALSync` | document write or batch: after the WAL fsync, before the apply |
 | `hookAfterSegWrite` | flush: after the segment write, before its fsync |
 | `hookAfterSegSync` | flush: after the segment fsync, before the index transaction |
 | `hookAfterIndexCommit` | flush: after the index transaction committed, before the overlay is cleared |

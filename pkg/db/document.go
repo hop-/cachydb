@@ -60,8 +60,13 @@ const memEntryOverhead = 64
 // key-table lookup and the read; the caller looks the document up again.
 var errSegmentRetired = errors.New("data segment retired")
 
-// docLock returns the stripe lock serializing writes to id (FNV-1a).
+// docLock returns the stripe lock serializing writes to id.
 func (c *Collection) docLock(id string) *sync.Mutex {
+	return &c.docLocks[docStripe(id)]
+}
+
+// docStripe returns the index of the stripe lock of id (FNV-1a).
+func docStripe(id string) int {
 	const (
 		offset32 = 2166136261
 		prime32  = 16777619
@@ -71,7 +76,7 @@ func (c *Collection) docLock(id string) *sync.Mutex {
 		h ^= uint32(id[i])
 		h *= prime32
 	}
-	return &c.docLocks[h%numDocLocks]
+	return int(h % numDocLocks)
 }
 
 func (c *Collection) cacheKey(id string) cache.Key {
@@ -84,30 +89,56 @@ func (c *Collection) cacheKey(id string) cache.Key {
 // if the document does not satisfy the collection's schema or carries
 // "_id" in its data. doc is not modified or retained.
 func (c *Collection) Insert(ctx context.Context, doc *Document) (string, error) {
+	w, err := c.prepareInsert(doc, "", nowString(time.Now()))
+	if err != nil {
+		return "", err
+	}
+	if _, err := c.write(ctx, w.id, w.build); err != nil {
+		return "", err
+	}
+	return w.id, nil
+}
+
+// docWrite is one prepared document write: the id it changes and the build
+// callback of write. Insert, UpdateWith, Replace, and DeleteWith prepare
+// one; Batch prepares one per operation, so both apply the same rules.
+type docWrite struct {
+	id    string
+	build func(cur *Document) (*Document, error)
+	// upserted is set by build when an update created the document.
+	upserted bool
+}
+
+// prepareInsert checks an insert of doc and returns its write. id, when
+// not empty, is the id to use (doc.ID must then be empty or the same);
+// otherwise doc.ID is used, and an empty one gets a generated UUID v7. $now
+// values resolve to ts.
+func (c *Collection) prepareInsert(doc *Document, id, ts string) (*docWrite, error) {
 	if doc == nil {
-		return "", errors.New("inserting document: document is nil")
+		return nil, errors.New("inserting document: document is nil")
 	}
 	if _, ok := doc.Data["_id"]; ok {
-		return "", fmt.Errorf("%w: inserting document: field \"_id\" in data is reserved; set Document.ID", ErrSchemaValidation)
+		return nil, fmt.Errorf("%w: inserting document: field \"_id\" in data is reserved; set Document.ID", ErrSchemaValidation)
 	}
-	id := doc.ID
+	switch {
+	case id == "":
+		id = doc.ID
+	case doc.ID != "" && doc.ID != id:
+		return nil, fmt.Errorf("%w: inserting document %q: the document has a different _id %q", ErrSchemaValidation, id, doc.ID)
+	}
 	if id == "" {
 		id = uuid.NewV7().String()
 	}
 	if len(id) > maxIDLen {
-		return "", fmt.Errorf("inserting document: id is %d bytes, max %d", len(id), maxIDLen)
+		return nil, fmt.Errorf("inserting document: id is %d bytes, max %d", len(id), maxIDLen)
 	}
-	data := resolveNowData(doc.Data, nowString(time.Now()))
-	_, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
+	data := resolveNowData(doc.Data, ts)
+	return &docWrite{id: id, build: func(cur *Document) (*Document, error) {
 		if cur != nil {
 			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrExists)
 		}
 		return &Document{ID: id, Data: data}, nil
-	})
-	if err != nil {
-		return "", err
-	}
-	return id, nil
+	}}, nil
 }
 
 // Get returns a copy of the document id (ErrNotFound if absent).
@@ -155,30 +186,49 @@ func (c *Collection) Update(ctx context.Context, id string, set map[string]any) 
 // with ErrSchemaValidation if u.Set or u.Unset names "_id", a field is in
 // both, or the result does not satisfy the schema.
 func (c *Collection) UpdateWith(ctx context.Context, id string, u UpdateSpec) (doc *Document, upserted bool, err error) {
+	w, err := c.prepareUpdate(id, u, nil, nowString(time.Now()))
+	if err != nil {
+		return nil, false, err
+	}
+	next, err := c.write(ctx, id, w.build)
+	if err != nil {
+		return nil, false, err
+	}
+	return next.Clone(), w.upserted, nil
+}
+
+// prepareUpdate checks the update u of the document id and returns its
+// write. extra holds more filters the stored version must match, besides
+// u.If. $now values resolve to ts.
+func (c *Collection) prepareUpdate(id string, u UpdateSpec, extra Condition, ts string) (*docWrite, error) {
 	if _, ok := u.Set["_id"]; ok {
-		return nil, false, fmt.Errorf("%w: updating document %q: field \"_id\" cannot be changed", ErrSchemaValidation, id)
+		return nil, fmt.Errorf("%w: updating document %q: field \"_id\" cannot be changed", ErrSchemaValidation, id)
 	}
 	for _, f := range u.Unset {
 		if f == "_id" {
-			return nil, false, fmt.Errorf("%w: updating document %q: field \"_id\" cannot be unset", ErrSchemaValidation, id)
+			return nil, fmt.Errorf("%w: updating document %q: field \"_id\" cannot be unset", ErrSchemaValidation, id)
 		}
 		if _, ok := u.Set[f]; ok {
-			return nil, false, fmt.Errorf("%w: updating document %q: field %q in both updates and unset", ErrSchemaValidation, id, f)
+			return nil, fmt.Errorf("%w: updating document %q: field %q in both updates and unset", ErrSchemaValidation, id, f)
 		}
 	}
 	if u.Upsert {
 		if err := checkDocID(id); err != nil {
-			return nil, false, fmt.Errorf("upserting document: %w", err)
+			return nil, fmt.Errorf("upserting document: %w", err)
 		}
 	}
-	ts := nowString(time.Now())
 	set := resolveNowData(u.Set, ts)
-	cond, err := compileFilters(resolveNowFilters(u.If, ts))
-	if err != nil {
-		return nil, false, fmt.Errorf("updating document %q: if: %w", id, err)
+	filters := u.If
+	if len(extra) > 0 {
+		filters = slices.Concat(extra, u.If)
 	}
-	next, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
-		upserted = false
+	cond, err := compileFilters(resolveNowFilters(filters, ts))
+	if err != nil {
+		return nil, fmt.Errorf("updating document %q: if: %w", id, err)
+	}
+	w := &docWrite{id: id}
+	w.build = func(cur *Document) (*Document, error) {
+		w.upserted = false
 		if err := c.checkCondition(id, cur, cond); err != nil {
 			return nil, err
 		}
@@ -186,7 +236,7 @@ func (c *Collection) UpdateWith(ctx context.Context, id string, u UpdateSpec) (d
 			if !u.Upsert {
 				return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
 			}
-			upserted = true
+			w.upserted = true
 			return &Document{ID: id, Data: set}, nil
 		}
 		// A new top-level map: cur is shared (memtable) and must not
@@ -199,11 +249,8 @@ func (c *Collection) UpdateWith(ctx context.Context, id string, u UpdateSpec) (d
 			delete(data, k)
 		}
 		return &Document{ID: id, Data: data}, nil
-	})
-	if err != nil {
-		return nil, false, err
 	}
-	return next.Clone(), upserted, nil
+	return w, nil
 }
 
 // Replace atomically replaces the whole document id with doc and returns
@@ -214,6 +261,20 @@ func (c *Collection) UpdateWith(ctx context.Context, id string, u UpdateSpec) (d
 // its filters (ErrConditionFailed otherwise). $now values are resolved;
 // the result must satisfy the schema. doc is not modified or retained.
 func (c *Collection) Replace(ctx context.Context, id string, doc *Document, cond Condition) (*Document, error) {
+	w, err := c.prepareReplace(id, doc, cond, nowString(time.Now()))
+	if err != nil {
+		return nil, err
+	}
+	next, err := c.write(ctx, id, w.build)
+	if err != nil {
+		return nil, err
+	}
+	return next.Clone(), nil
+}
+
+// prepareReplace checks the replacement of the document id by doc under
+// cond and returns its write. $now values resolve to ts.
+func (c *Collection) prepareReplace(id string, doc *Document, cond Condition, ts string) (*docWrite, error) {
 	if doc == nil {
 		return nil, errors.New("replacing document: document is nil")
 	}
@@ -223,13 +284,12 @@ func (c *Collection) Replace(ctx context.Context, id string, doc *Document, cond
 	if _, ok := doc.Data["_id"]; ok {
 		return nil, fmt.Errorf("%w: replacing document %q: field \"_id\" in data is reserved; set Document.ID", ErrSchemaValidation, id)
 	}
-	ts := nowString(time.Now())
 	data := resolveNowData(doc.Data, ts)
 	ccond, err := compileFilters(resolveNowFilters(cond, ts))
 	if err != nil {
 		return nil, fmt.Errorf("replacing document %q: if: %w", id, err)
 	}
-	next, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
+	return &docWrite{id: id, build: func(cur *Document) (*Document, error) {
 		if err := c.checkCondition(id, cur, ccond); err != nil {
 			return nil, err
 		}
@@ -237,11 +297,7 @@ func (c *Collection) Replace(ctx context.Context, id string, doc *Document, cond
 			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
 		}
 		return &Document{ID: id, Data: data}, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return next.Clone(), nil
+	}}, nil
 }
 
 // Delete removes the document id (ErrNotFound if absent). It is
@@ -255,11 +311,22 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 // and the document does not match it or is absent, and with ErrNotFound
 // if cond is empty and the document is absent.
 func (c *Collection) DeleteWith(ctx context.Context, id string, cond Condition) error {
-	ccond, err := compileFilters(resolveNowFilters(cond, nowString(time.Now())))
+	w, err := c.prepareDelete(id, cond, nowString(time.Now()))
 	if err != nil {
-		return fmt.Errorf("deleting document %q: if: %w", id, err)
+		return err
 	}
-	_, err = c.write(ctx, id, func(cur *Document) (*Document, error) {
+	_, err = c.write(ctx, id, w.build)
+	return err
+}
+
+// prepareDelete checks the deletion of the document id under cond and
+// returns its write. $now values resolve to ts.
+func (c *Collection) prepareDelete(id string, cond Condition, ts string) (*docWrite, error) {
+	ccond, err := compileFilters(resolveNowFilters(cond, ts))
+	if err != nil {
+		return nil, fmt.Errorf("deleting document %q: if: %w", id, err)
+	}
+	return &docWrite{id: id, build: func(cur *Document) (*Document, error) {
 		if err := c.checkCondition(id, cur, ccond); err != nil {
 			return nil, err
 		}
@@ -267,8 +334,7 @@ func (c *Collection) DeleteWith(ctx context.Context, id string, cond Condition) 
 			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
 		}
 		return nil, nil
-	})
-	return err
+	}}, nil
 }
 
 // checkCondition returns ErrConditionFailed if cond is not empty and cur
@@ -340,20 +406,9 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 
 	rec := wal.Record{Op: wal.OpDeleteDoc, DB: d.name, Coll: c.name, ID: id}
 	if next != nil {
-		// The WAL payload is the full after-image including _id (§3.1).
-		// The stored document is decoded from it, so it holds exactly
-		// what replay and segment reads will produce, and shares no
-		// memory with the caller's values.
-		payload, err := json.Marshal(&Document{ID: id, Data: next.Data})
-		if err != nil {
-			return nil, fmt.Errorf("encoding document %q: %w", id, err)
-		}
-		if next, err = decodeDocument(id, payload); err != nil {
+		var payload []byte
+		if payload, next, err = c.encodeAfterImage(id, next); err != nil {
 			return nil, err
-		}
-		if err := c.schema.ValidateDocument(next); err != nil {
-			// A *SchemaError, which wraps ErrSchemaValidation.
-			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, err)
 		}
 		rec.Op, rec.Payload = wal.OpPutDoc, payload
 
@@ -388,6 +443,28 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 	// Database.mu is held shared.
 	c.apply(id, cur != nil, c.indexKeysAll(cur), curOff, next, off, lb, size)
 	return next, nil
+}
+
+// encodeAfterImage encodes next, the after-image of id built by a write,
+// as its WAL payload: the full document including _id (§3.1). It returns
+// the payload and the document to store, decoded from the payload, so the
+// stored document holds exactly what replay and segment reads will produce
+// and shares no memory with the caller's values. It fails if the document
+// does not satisfy the collection's schema. Callers hold Database.mu.
+func (c *Collection) encodeAfterImage(id string, next *Document) ([]byte, *Document, error) {
+	payload, err := json.Marshal(&Document{ID: id, Data: next.Data})
+	if err != nil {
+		return nil, nil, fmt.Errorf("encoding document %q: %w", id, err)
+	}
+	stored, err := decodeDocument(id, payload)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := c.schema.ValidateDocument(stored); err != nil {
+		// A *SchemaError, which wraps ErrSchemaValidation.
+		return nil, nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, err)
+	}
+	return payload, stored, nil
 }
 
 // registerInflight records that a document write is about to be appended

@@ -23,4 +23,8 @@ var (
 	// already belongs to another document, or a unique index that cannot be
 	// created because existing documents share a value; nothing was written.
 	ErrUniqueViolation = errors.New("unique index violation")
+	// ErrBatchTooLarge reports a Collection.Batch with more operations than
+	// Options.MaxBatchDocs or a larger payload than Options.MaxBatchBytes;
+	// the error states the limit. Nothing was written. Split the batch.
+	ErrBatchTooLarge = errors.New("batch too large")
 )
