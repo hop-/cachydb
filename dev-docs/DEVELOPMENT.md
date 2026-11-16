@@ -590,3 +590,14 @@ environment configuration from `os.Getenv`; neither needs a module.
     mode.
 12. stdio: closing stdin exits 0, but the SDK drops the responses of
     requests still in flight.
+13. `Open` trusts a valid but stale `index.db`. A copy of `index.db`
+    restored on its own from an older backup, or a file whose newest bbolt
+    meta page was damaged (bbolt then falls back to the previous one),
+    passes the open check. `alignSegments` then deletes the segment files
+    it does not register and truncates the covered segment to its old
+    position. If WAL retention has already removed those records, the
+    documents are lost silently. Back up and restore the whole data
+    directory, never `index.db` alone; to repair a damaged `index.db`,
+    delete it so `Open` rebuilds it from the segments. A fix (check that
+    the collection's checkpoint + 1 is still in the WAL before deleting or
+    truncating, otherwise rebuild) is an open follow-up.

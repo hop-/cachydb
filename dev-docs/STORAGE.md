@@ -465,6 +465,17 @@ deleted by retention.
 6. Write `cachydb.metacp`, then start the flusher, compactor, and WAL
    retention.
 
+**Restore the whole data directory, never `index.db` alone.** Step 3
+trusts any `index.db` that passes the open check. If the file is valid but
+stale (an older copy restored on its own, or bbolt falling back to its
+previous meta page after media damage), `alignSegments` deletes the
+segment files that copy does not register and truncates the covered
+segment to its old `covered`. Replay restores only the records still in
+the WAL; if retention has already removed them, those documents are lost
+without a warning. To repair a damaged `index.db`, delete it and let
+`Open` rebuild it from the segments. See Known Limitations in
+`DEVELOPMENT.md`.
+
 Open no longer scans the data segments (unless it rebuilds an index file
 or builds an index). Its cost is the WAL open (every retained WAL segment
 is read and CRC-checked, up to `WALRetentionSize`) plus the replay of the
