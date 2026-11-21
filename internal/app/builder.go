@@ -181,6 +181,7 @@ func (b *Builder) Build(ctx context.Context) (_ *App, err error) {
 		Version:         b.version,
 		TokensRequired:  decision.TokensRequired,
 		Users:           users,
+		Logger:          opts.Logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create MCP server: %w", err)

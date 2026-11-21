@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 
@@ -273,12 +274,16 @@ type CopyCollectionOutput struct {
 	Copied  int    `json:"copied" jsonschema:"Number of documents copied"`
 }
 
-// toolSpec is one tool: its definition, an example call, and how to
-// register its handler.
+// toolSpec is one tool: its definition, the access level it needs, an
+// example call, and how to register its handler.
 type toolSpec struct {
-	tool     *mcp.Tool
-	example  map[string]any
-	register func(s *Server, srv *mcp.Server, t *mcp.Tool)
+	tool    *mcp.Tool
+	access  toolAccess
+	example map[string]any
+	// databaseArg: the tool's input has a "database" argument (implements
+	// databaseArg); see validate.
+	databaseArg bool
+	register    func(s *Server, srv *mcp.Server, t *mcp.Tool)
 }
 
 // schemaOptions renders Operator, FieldType, and SortOrder as string
@@ -323,13 +328,17 @@ func writing(title string, destructive, idempotent bool) *mcp.ToolAnnotations {
 	}
 }
 
-// newSpec builds a toolSpec for a typed handler.
+// newSpec builds a toolSpec for a typed handler that needs access acc.
+// The registered handler is wrapped: Server.authorizeCall resolves the
+// principal and the database and checks acc before the handler runs.
 func newSpec[In, Out any](
 	name, description string,
 	annotations *mcp.ToolAnnotations,
+	acc toolAccess,
 	example map[string]any,
 	handler func(s *Server) mcp.ToolHandlerFor[In, Out],
 ) toolSpec {
+	_, hasDatabaseArg := any(new(In)).(databaseArg)
 	return toolSpec{
 		tool: &mcp.Tool{
 			Name:         name,
@@ -338,9 +347,19 @@ func newSpec[In, Out any](
 			InputSchema:  schemaFor[In](),
 			OutputSchema: schemaFor[Out](),
 		},
-		example: example,
+		access:      acc,
+		example:     example,
+		databaseArg: hasDatabaseArg,
 		register: func(s *Server, srv *mcp.Server, t *mcp.Tool) {
-			mcp.AddTool(srv, t, handler(s))
+			h := handler(s)
+			mcp.AddTool(srv, t, func(ctx context.Context, req *mcp.CallToolRequest, in In) (*mcp.CallToolResult, Out, error) {
+				ctx, err := s.authorizeCall(ctx, req, name, acc, &in)
+				if err != nil {
+					var zero Out
+					return nil, zero, err
+				}
+				return h(ctx, req, in)
+			})
 		},
 	}
 }
@@ -350,31 +369,31 @@ func toolSpecs() []toolSpec {
 	return []toolSpec{
 		newSpec("list_databases",
 			"List every database on this server, sorted by name.",
-			readOnly("List databases"), map[string]any{},
+			readOnly("List databases"), accessNone, map[string]any{},
 			func(s *Server) mcp.ToolHandlerFor[ListDatabasesInput, ListDatabasesOutput] {
 				return s.listDatabasesTool
 			}),
 		newSpec("create_database",
 			"Create a database. Creating a database that already exists succeeds and changes nothing.",
-			writing("Create database", false, true), map[string]any{"name": "shop"},
+			writing("Create database", false, true), accessServer, map[string]any{"name": "shop"},
 			func(s *Server) mcp.ToolHandlerFor[CreateDatabaseInput, MessageOutput] { return s.createDatabaseTool }),
 		newSpec("delete_database",
 			"Delete a database with all its collections and documents. This cannot be undone.",
-			writing("Delete database", true, true), map[string]any{"name": "shop"},
+			writing("Delete database", true, true), accessServer, map[string]any{"name": "shop"},
 			func(s *Server) mcp.ToolHandlerFor[DeleteDatabaseInput, MessageOutput] { return s.deleteDatabaseTool }),
 		newSpec("use_database",
 			"Make an existing database the default for this session's later calls that omit the database argument. Other sessions are not affected.",
-			writing("Use database", false, true), map[string]any{"name": "shop"},
+			writing("Use database", false, true), accessNone, map[string]any{"name": "shop"},
 			func(s *Server) mcp.ToolHandlerFor[UseDatabaseInput, UseDatabaseOutput] { return s.useDatabaseTool }),
 		newSpec("current_database",
 			"Return the database that calls without a database argument use: this session's use_database choice, or the server default.",
-			readOnly("Current database"), map[string]any{},
+			readOnly("Current database"), accessNone, map[string]any{},
 			func(s *Server) mcp.ToolHandlerFor[CurrentDatabaseInput, CurrentDatabaseOutput] {
 				return s.currentDatabaseTool
 			}),
 		newSpec("create_collection",
 			"Create a collection, optionally with a schema (field types and required fields) that every insert and update must satisfy. See resource cachydb://docs/schema.",
-			writing("Create collection", false, false),
+			writing("Create collection", false, false), accessAdmin,
 			map[string]any{"name": "products", "schema": map[string]any{"fields": map[string]any{
 				"name": map[string]any{"type": "string", "required": true}, "price": map[string]any{"type": "number"},
 			}}},
@@ -383,20 +402,20 @@ func toolSpecs() []toolSpec {
 			}),
 		newSpec("list_collections",
 			"List the collections of a database, sorted by name.",
-			readOnly("List collections"), map[string]any{"database": "shop"},
+			readOnly("List collections"), accessRead, map[string]any{"database": "shop"},
 			func(s *Server) mcp.ToolHandlerFor[ListCollectionsInput, ListCollectionsOutput] {
 				return s.listCollectionsTool
 			}),
 		newSpec("insert_document",
 			"Insert a JSON document into a collection and return its id. A string _id in the document sets the id; otherwise a UUID is generated. Fails if the id exists or the schema rejects the document.",
-			writing("Insert document", false, false),
+			writing("Insert document", false, false), accessWrite,
 			map[string]any{"collection": "products", "document": map[string]any{"_id": "p1", "name": "Pen", "price": 2.5}},
 			func(s *Server) mcp.ToolHandlerFor[InsertDocumentInput, InsertDocumentOutput] {
 				return s.insertDocumentTool
 			}),
 		newSpec("find_documents",
 			"Find the documents of a collection matching every filter in query.filters (and, if given, at least one group of query.any), with optional sort, projection (fields), skip, and limit; sorted by _id by default. Operators include contains (case-insensitive substring) and has / has_any / has_all (array elements). Comparison is type-aware and a document missing the field matches no operator, not even ne. See resource cachydb://docs/query.",
-			readOnly("Find documents"),
+			readOnly("Find documents"), accessRead,
 			map[string]any{"collection": "products", "query": map[string]any{
 				"filters": []any{map[string]any{"field": "price", "operator": "lt", "value": 10}},
 				"sort":    []any{map[string]any{"field": "price", "order": "desc"}},
@@ -407,7 +426,7 @@ func toolSpecs() []toolSpec {
 			}),
 		newSpec("count_documents",
 			"Count the documents of a collection matching query.filters and query.any, without returning them. A single eq or has filter on an indexed field is answered from the index.",
-			readOnly("Count documents"),
+			readOnly("Count documents"), accessRead,
 			map[string]any{"collection": "products", "query": map[string]any{
 				"filters": []any{map[string]any{"field": "price", "operator": "lt", "value": 10}},
 			}},
@@ -416,12 +435,12 @@ func toolSpecs() []toolSpec {
 			}),
 		newSpec("distinct",
 			"List the distinct values of a field among the documents matching query (all by default). Array values contribute each element, so this lists tags. Values are sorted.",
-			readOnly("Distinct values"),
+			readOnly("Distinct values"), accessRead,
 			map[string]any{"collection": "products", "field": "name"},
 			func(s *Server) mcp.ToolHandlerFor[DistinctInput, DistinctOutput] { return s.distinctTool }),
 		newSpec("update_document",
 			"Merge top-level fields into a document (updates) and remove fields (unset); other fields are kept and the result must satisfy the schema. With if, the write happens only if the stored document matches those filters (compare-and-set; otherwise a condition-failed error). With upsert, a missing document is created.",
-			writing("Update document", false, false),
+			writing("Update document", false, false), accessWrite,
 			map[string]any{"collection": "products", "id": "p1", "updates": map[string]any{"price": 3},
 				"if": []any{map[string]any{"field": "price", "operator": "eq", "value": 2.5}}},
 			func(s *Server) mcp.ToolHandlerFor[UpdateDocumentInput, UpdateDocumentOutput] {
@@ -429,59 +448,60 @@ func toolSpecs() []toolSpec {
 			}),
 		newSpec("replace_document",
 			"Replace a whole existing document atomically (fields not in the new document are removed). The result must satisfy the schema; with if, the stored document must match those filters.",
-			writing("Replace document", false, true),
+			writing("Replace document", false, true), accessWrite,
 			map[string]any{"collection": "products", "id": "p1", "document": map[string]any{"name": "Pen", "price": 3}},
 			func(s *Server) mcp.ToolHandlerFor[ReplaceDocumentInput, MessageOutput] {
 				return s.replaceDocumentTool
 			}),
 		newSpec("delete_document",
 			"Delete a document by _id; with if, only if it matches those filters. This cannot be undone.",
-			writing("Delete document", true, true),
+			writing("Delete document", true, true), accessWrite,
 			map[string]any{"collection": "products", "id": "p1"},
 			func(s *Server) mcp.ToolHandlerFor[DeleteDocumentInput, MessageOutput] { return s.deleteDocumentTool }),
 		newSpec("describe_collection",
 			"Describe a collection: its schema (or null), its indexes, and its document count.",
-			readOnly("Describe collection"),
+			readOnly("Describe collection"), accessRead,
 			map[string]any{"collection": "products"},
 			func(s *Server) mcp.ToolHandlerFor[DescribeCollectionInput, DescribeCollectionOutput] {
 				return s.describeCollectionTool
 			}),
 		newSpec("update_schema",
 			"Replace a collection's schema, or remove it with null. Every existing document is checked first; if any fails, nothing changes and the error lists the failing ids. Writes to the database wait meanwhile.",
-			writing("Update schema", false, true),
+			writing("Update schema", false, true), accessAdmin,
 			map[string]any{"collection": "products", "schema": map[string]any{"fields": map[string]any{
 				"name": map[string]any{"type": "string", "required": true}, "price": map[string]any{"type": "number"},
 			}}},
 			func(s *Server) mcp.ToolHandlerFor[UpdateSchemaInput, MessageOutput] { return s.updateSchemaTool }),
 		newSpec("rename_collection",
 			"Rename a collection within its database, keeping its documents, schema, and indexes. The new name must not exist.",
-			writing("Rename collection", false, false),
+			writing("Rename collection", false, false), accessAdmin,
 			map[string]any{"collection": "products_backup", "new_name": "products_old"},
 			func(s *Server) mcp.ToolHandlerFor[RenameCollectionInput, MessageOutput] {
 				return s.renameCollectionTool
 			}),
 		newSpec("copy_collection",
 			"Copy a collection (schema, indexes, and documents with the same ids) to a new collection, in the same or another database. Not atomic: after an error the copy may be partial; delete it and retry.",
-			writing("Copy collection", false, false),
+			// read on the source; admin on the target (CopyCollectionInput.extraAccess).
+			writing("Copy collection", false, false), accessRead,
 			map[string]any{"collection": "products", "new_name": "products_backup"},
 			func(s *Server) mcp.ToolHandlerFor[CopyCollectionInput, CopyCollectionOutput] {
 				return s.copyCollectionTool
 			}),
 		newSpec("delete_collection",
 			"Delete a collection with all its documents and indexes. This cannot be undone.",
-			writing("Delete collection", true, true),
+			writing("Delete collection", true, true), accessAdmin,
 			map[string]any{"collection": "products_old"},
 			func(s *Server) mcp.ToolHandlerFor[DeleteCollectionInput, MessageOutput] {
 				return s.deleteCollectionTool
 			}),
 		newSpec("create_index",
 			"Create a hash index on a top-level field so eq filters (and has, has_any, has_all on array fields, whose elements are indexed) avoid a full scan. Writes to the database wait while the index builds.",
-			writing("Create index", false, false),
+			writing("Create index", false, false), accessAdmin,
 			map[string]any{"collection": "products", "index_name": "by_name", "field_name": "name"},
 			func(s *Server) mcp.ToolHandlerFor[CreateIndexInput, MessageOutput] { return s.createIndexTool }),
 		newSpec("drop_index",
 			"Drop a secondary index; queries on its field scan again.",
-			writing("Drop index", true, true),
+			writing("Drop index", true, true), accessAdmin,
 			map[string]any{"collection": "products", "index_name": "by_name"},
 			func(s *Server) mcp.ToolHandlerFor[DropIndexInput, MessageOutput] { return s.dropIndexTool }),
 	}
@@ -499,9 +519,18 @@ func ToolDefinitions() []*mcp.Tool {
 	return out
 }
 
-// registerTools registers every tool of toolSpecs on srv.
-func (s *Server) registerTools(srv *mcp.Server) {
-	for _, sp := range toolSpecs() {
+// registerTools registers every tool of toolSpecs on srv. It registers
+// nothing and fails if any tool lacks a valid access level (see
+// toolSpec.validate).
+func (s *Server) registerTools(srv *mcp.Server) error {
+	specs := toolSpecs()
+	for _, sp := range specs {
+		if err := sp.validate(); err != nil {
+			return err
+		}
+	}
+	for _, sp := range specs {
 		sp.register(s, srv, sp.tool)
 	}
+	return nil
 }

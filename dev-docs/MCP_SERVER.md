@@ -51,9 +51,51 @@ With tokens required, `httpHandler()` wraps only `/mcp` in the SDK's
 `auth.RequireBearerToken` (`AllowMissingExpiration`, tokens do not expire):
 a request without a valid bearer token gets 401; the verifier
 (`Server.verifyToken`) calls `Store.Authenticate` and returns
-`TokenInfo{UserID: name}`, which the SDK binds to the session. Until tools
-check per-database access, the verifier accepts only server-admin tokens.
-`/healthz` never needs a token.
+`TokenInfo{UserID: name}` for any user's token, or an error wrapping the
+SDK's `ErrInvalidToken`. The SDK binds each session to the user that
+created it and answers 403 when another user's token reuses its
+`Mcp-Session-Id`. Failed authentications (no bearer token: logged by
+`logMissingToken`, since the SDK refuses those without calling the
+verifier; unknown or revoked token) are logged at INFO through
+`Config.Logger` (the engine logger) with the remote address and the
+reason, never the token. `/healthz` never needs a token.
+
+### Tool access
+
+Every tool has an access level (`internal/mcp/access.go`), passed to
+`newSpec` in `toolSpecs`:
+
+| Access | Tools |
+| --- | --- |
+| none | `list_databases` (lists only databases the principal can read), `current_database`, `use_database` (the target must be readable; checked before existence) |
+| read | `list_collections`, `describe_collection`, `find_documents`, `count_documents`, `distinct`; `copy_collection` on its source |
+| write | `insert_document`, `update_document`, `replace_document`, `delete_document` |
+| admin | `create_collection`, `update_schema`, `rename_collection`, `delete_collection`, `create_index`, `drop_index`; `copy_collection` on its target (`target_database`, else the source database) |
+| server | `create_database`, `delete_database` (which then calls `Store.ForgetDatabase`) |
+
+`newSpec` wraps every handler in `Server.authorizeCall`, the one place
+tools are authorized:
+
+1. **Principal** (`Server.principal`): with a `req.Extra.TokenInfo`, the
+   user's current state from `Store.Principal` (a user removed meanwhile
+   fails); with tokens not required (stdio, loopback HTTP, `AUTH=off`),
+   `auth.FullAccess()`, which every check allows. An HTTP server that
+   requires tokens refuses a call without `TokenInfo`.
+2. **Database**: inputs with a `database` argument implement
+   `databaseArg` (on the pointer); the wrapper resolves it (see below) and
+   writes the resolved name back, so the handler acts on exactly the
+   database that was checked. `copy_collection` also implements
+   `extraAccess` for its target.
+3. **Check**: `Store.Authorize` for each requirement (it re-reads the
+   user's current grants, so a revoke applies to the next call). A denied
+   call is a tool error wrapping `auth.ErrPermissionDenied` that names the
+   user, the database, and the level.
+
+`toolSpec.validate` rejects a tool without an access level, a database
+level (read, write, admin) on an input without a `database` argument, and
+a `database` argument on a none or server tool; `registerTools` then
+fails and `New` returns the error. The handler of a tool without a level
+is never reached (`authorizeCall` denies it).
 
 ## Transports
 
@@ -130,11 +172,13 @@ and a receiving middleware (`trackSessionMiddleware`, needed because
 clients on protocol 2026-07-28 use `server/discover` instead of the
 initialize handshake) register each session in `Server.sessions`; a goroutine waits on
 `ServerSession.Wait()` and forgets the session when it ends. Each handler
-resolves its database in this order:
+resolves its database in this order (`Server.databaseName`, applied by
+`authorizeCall` before the access check):
 
 1. the tool's `database` argument, if given;
 2. the session's `use_database` choice;
-3. the server default (`main`).
+3. the user's `default_database` (never set with auth off);
+4. the server default (`main`).
 
 ## Tools (21)
 
@@ -309,6 +353,8 @@ whose text names the action and the cause (`toolError` in `server.go`):
 | `ErrClosed` | `<action>: the database engine is shut down: …` |
 | `ErrWALFailed`, `ErrWALCorrupt` | `<action>: write-ahead log failure, restart the server: …` |
 | context cancelled / deadline | `<action>: request cancelled: …` |
+| `auth.ErrPermissionDenied` | `<action>: permission denied: user "<name>" needs <level> access to database "<db>" (hint: ask a server admin for access)`; server tools: `… must be a server admin …` |
+| `auth.ErrUnauthenticated` | `<action>: unauthenticated: … (hint: ask a server admin for a valid token)` (the token's user was removed) |
 
 ## Write consistency
 
