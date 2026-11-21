@@ -433,15 +433,26 @@ func (v *verifier) checkWAL() error {
 	return nil
 }
 
-// checkWALRecord checks that a record's payload decodes the way replay
-// decodes it.
+// checkWALRecord checks that a document record meets the rules replay
+// applies (the id rule of checkReplayID, the payload decoded the way
+// replay decodes it), that a batch record names each id once, and that
+// a metadata record's payload is JSON.
 func (v *verifier) checkWALRecord(path string, pos int64, r wal.Record) error {
-	bad := func(err error) {
-		v.problem(VerifyFinding{File: v.rel(path), Message: fmt.Sprintf("at byte %d: %s record at WAL offset %d for %s/%s: %v; replay fails",
-			pos, r.Op, r.Offset, r.DB, r.Coll, err)})
+	report := func(err error, consequence string) {
+		v.problem(VerifyFinding{File: v.rel(path), Database: r.DB, Collection: r.Coll,
+			Message: fmt.Sprintf("at byte %d: %s record at WAL offset %d for %s/%s: %v; %s",
+				pos, r.Op, r.Offset, r.DB, r.Coll, err, consequence)})
 	}
+	bad := func(err error) { report(err, "replay fails") }
 	switch r.Op {
-	case wal.OpPutDoc:
+	case wal.OpPutDoc, wal.OpDeleteDoc:
+		if err := checkReplayID(r.ID); err != nil {
+			bad(err)
+			return nil
+		}
+		if r.Op != wal.OpPutDoc {
+			return nil
+		}
 		if _, err := decodeDocument(r.ID, r.Payload); err != nil {
 			bad(err)
 		}
@@ -452,6 +463,10 @@ func (v *verifier) checkWALRecord(path string, pos int64, r wal.Record) error {
 			return nil
 		}
 		for i, it := range items {
+			if err := checkReplayID(it.ID); err != nil {
+				bad(fmt.Errorf("item %d: %w", i, err))
+				return nil
+			}
 			if it.Op != wal.OpPutDoc {
 				continue
 			}
@@ -459,6 +474,10 @@ func (v *verifier) checkWALRecord(path string, pos int64, r wal.Record) error {
 				bad(fmt.Errorf("item %d: %w", i, err))
 				return nil
 			}
+		}
+		if i, j := repeatedBatchID(items); i >= 0 {
+			report(fmt.Errorf("item %d repeats the id %q of item %d, which the batch format forbids", i, items[i].ID, j),
+				"replay applies only the first item of the id")
 		}
 	case wal.OpCreateColl, wal.OpCreateIndex, wal.OpDropIndex, wal.OpUpdateSchema, wal.OpRenameColl:
 		if !json.Valid(r.Payload) {
@@ -498,6 +517,7 @@ type collCheck struct {
 	// already reported.
 	damaged map[uint32]bool
 
+	newest      uint32 // the newest segment on disk
 	registered  map[uint32]bool
 	missingSegs map[uint32]bool
 	// incomplete is set when damage stopped the scan of data index.db
@@ -569,6 +589,9 @@ func (v *verifier) checkCollection(ctx context.Context, c *Collection) (err erro
 		return err
 	}
 	v.r.DataSegments += len(segs)
+	if len(segs) > 0 {
+		k.newest = segs[len(segs)-1]
+	}
 
 	st, err := k.openIndex()
 	if err != nil {
@@ -681,11 +704,35 @@ func (k *collCheck) prepare(st *idxstore.Store, onDisk []uint32) error {
 		}
 	}
 	for _, seg := range onDisk {
-		if !k.registered[seg] {
+		if k.registered[seg] {
+			continue
+		}
+		rolled, err := k.rolledSegment(seg)
+		if err != nil {
+			return err
+		}
+		if !rolled {
 			k.notice(k.segFile(seg), "not registered in index.db (an interrupted flush or compaction); Open deletes it, and WAL replay restores the changes the WAL still holds")
 		}
 	}
 	return nil
+}
+
+// rolledSegment reports whether the unregistered segment seg is the next
+// segment a flush that filled the covered segment created (sealActive):
+// newer than the covered segment and header only. That is the normal
+// state after a clean close, not an interruption, and it holds no data,
+// so it gets no finding (Open deletes it and the next flush creates it
+// again).
+func (k *collCheck) rolledSegment(seg uint32) (bool, error) {
+	if seg <= k.is.covered.Seg {
+		return false, nil
+	}
+	fi, err := os.Stat(segment.DataPath(k.c.dir, seg))
+	if err != nil {
+		return false, err
+	}
+	return fi.Size() == segment.HeaderSize, nil
 }
 
 // prepareTx counts the key table and sets up the index checks in the read
@@ -765,6 +812,21 @@ func (k *collCheck) scanSegment(ctx context.Context, seg uint32) error {
 		return err
 	}
 	switch {
+	case k.tx == nil && seg == k.newest:
+		// Without a usable index.db, Open rebuilds it (or upgrades a
+		// format-2 directory), which opens the newest segment as the
+		// active one: that truncates a torn final write and refuses any
+		// other damage.
+		keep, size, cerr := segment.CheckActive(k.c.dir, seg)
+		switch {
+		case cerr == nil:
+			k.notice(k.segFile(seg), "%s: a torn final write; Open truncates it (%d bytes) when it rebuilds index.db",
+				withoutPath(err, segment.DataPath(k.c.dir, seg)), size-keep)
+		case errors.Is(cerr, segment.ErrCorrupt):
+			k.problem(k.segFile(seg), "%s", withoutPath(err, segment.DataPath(k.c.dir, seg)))
+		default:
+			return cerr
+		}
 	case k.tx == nil:
 		k.problem(k.segFile(seg), "%s", withoutPath(err, segment.DataPath(k.c.dir, seg)))
 	case k.registered[seg] && (seg != k.is.covered.Seg || uint64(validEnd) < k.is.covered.End):

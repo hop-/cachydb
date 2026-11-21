@@ -928,15 +928,25 @@ func (c *Collection) replayDoc(r wal.Record) (bool, error) {
 	return c.replayItem(r.Op, r.ID, r.Payload, r.Offset, func(other string) bool { return other == r.ID })
 }
 
+// checkReplayID is the id rule replay applies to every document change
+// (a put_doc or delete_doc record, or an item of a batch record) and
+// Verify checks: the id must fit in the index file. The WAL format can
+// hold longer ids, which this version cannot store, so replay fails.
+func checkReplayID(id string) error {
+	if len(id) > maxIDLen {
+		return fmt.Errorf("the document id is %d bytes, longer than the limit of %d bytes; this version cannot store it", len(id), maxIDLen)
+	}
+	return nil
+}
+
 // replayItem is replayDoc for one document change: op (put_doc or
 // delete_doc) of the document id with the after-image doc, written at WAL
 // offset off, by a single record or as an item of a batch record. The
 // unique check that only logs leaves out the documents for which skip
 // returns true (id itself, or every id of the batch).
 func (c *Collection) replayItem(op wal.Op, id string, doc []byte, off uint64, skip func(string) bool) (bool, error) {
-	if len(id) > maxIDLen {
-		return false, fmt.Errorf("collection %q in database %q: the document id is %d bytes, longer than the limit of %d bytes; this version cannot store it",
-			c.name, c.db.name, len(id), maxIDLen)
+	if err := checkReplayID(id); err != nil {
+		return false, fmt.Errorf("collection %q in database %q: %w", c.name, c.db.name, err)
 	}
 	var next *Document
 	if op == wal.OpPutDoc {

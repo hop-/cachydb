@@ -565,6 +565,23 @@ func (c *Collection) checkBatchUnique(items []batchItem) (func(), error) {
 	return unlock, nil
 }
 
+// repeatedBatchID returns the index of the first item of a decoded batch
+// record whose id an earlier item has, and that earlier item's index, or
+// -1 and -1 when every id appears once. The batch format allows an id once
+// per batch, and the write path never writes a repeat. Replay does not
+// refuse one: every item gets the record's offset, so it applies the first
+// item of the id and skips the rest. Verify reports it.
+func repeatedBatchID(items []wal.BatchItem) (i, first int) {
+	seen := make(map[string]int, len(items))
+	for i, it := range items {
+		if j, ok := seen[it.ID]; ok {
+			return i, j
+		}
+		seen[it.ID] = i
+	}
+	return -1, -1
+}
+
 // replayBatch applies a batch record (op 11) item by item, each iff the
 // record's offset is newer than the item's id's current version (as
 // replayDoc does for single records), so replaying it again or after some

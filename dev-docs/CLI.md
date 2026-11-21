@@ -215,7 +215,8 @@ data-directory lock (so stop the server first; the in-use error carries a
 hint that there is no `cachydb client` equivalent), runs no recovery,
 starts no background work, and writes nothing unless `--rebuild-index` is
 given. It checks the WAL (headers, checksums, offset continuity, that
-every `put_doc` and `batch` record decodes as replay decodes it), every
+every `put_doc`, `delete_doc` and `batch` record meets replay's id rule
+and decodes as replay decodes it, that a batch names each id once), every
 data segment record (checksum, decompression, the live documents' JSON),
 each `index.db` with idxstore's full `Store.Check`, that every key-table
 entry points at a put of its id with its WAL offset, that `index.db` is
@@ -234,10 +235,13 @@ not older than the segments, and that the data `index.db` does not cover
   file, one line per problem (`<file or db/coll>: <what>`, the file
   relative to the data directory), `note: …` lines for what the next
   `Open` repairs by itself (a torn WAL tail, a leftover segment of an
-  interrupted flush or compaction, an index that is not built, a format-2
-  directory), and last a one-line summary: `verify: ok: …` or `verify: N
+  interrupted flush or compaction, a torn final write of the newest data
+  segment when `index.db` is missing or the directory is format 2, an
+  index that is not built, a format-2 directory), and last a one-line
+  summary: `verify: ok: …` or `verify: N
   problem(s): …` with the database, collection, document, data segment,
-  and WAL counts.
+  and WAL counts. A healthy, cleanly closed directory prints only the
+  summary (the empty next segment a full segment leaves is not a note).
 - **JSON** (`--format json`): the `db.VerifyReport` (`ok`, `dir`,
   `format`, the counts, `wal_first`, `wal_next`, `rebuilt`, `problems` and
   `notices` as `[{file, database, collection, message}]`,

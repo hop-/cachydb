@@ -145,7 +145,7 @@ version and decide how old files are handled:
   fail with `ErrIncompatibleDataDir`; pre-v0.0.4 directories have no
   converter at all.
 
-Never change the numeric values of WAL ops (1–10) or record types (a reader
+Never change the numeric values of WAL ops (1–11) or record types (a reader
 still accepts type 3, the old checkpoint marker); new metadata ops need a
 replay case in `replayRecord` and crash tests at `hookMetaWrite`. The
 upgrade fixtures (`TestCompatFixtures`, one per release) must keep

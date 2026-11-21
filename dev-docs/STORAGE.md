@@ -534,21 +534,32 @@ unless `RebuildIndex` is set. It returns a `VerifyReport` with
    `wal.Open` (header, checksums, offset continuity across segments, the
    torn-tail rule of the newest segment, which is a notice), but it reads
    on after damage, starting the next segment at its name. Every
-   `put_doc` payload and every put item of a `batch` record (op 11,
-   `wal.DecodeBatch`) must decode as replay decodes it
-   (`decodeDocument`); metadata payloads must be JSON. With damage the end
-   of the WAL is unknown, so the checks that need it are skipped.
+   `put_doc` and `delete_doc` record and every item of a `batch` record
+   (op 11, `wal.DecodeBatch`) must meet replay's id rule
+   (`checkReplayID`, shared with `replayItem`: at most `maxIDLen` bytes),
+   and every put must decode as replay decodes it (`decodeDocument`). A
+   batch record that repeats an id (`repeatedBatchID`; the format allows
+   each id once, replay applies the first and skips the rest) is a
+   problem too. Metadata payloads must be JSON. With damage the end of
+   the WAL is unknown, so the checks that need it are skipped.
 2. **Per collection** (format 3): `idxstore.Open`, then the full
    `Store.Check` (a missing, damaged, or incomplete file is a problem;
    with bbolt page damage, `idxstore.PageProblemPrefix`, the file is not
    read further). The segment files are compared with the registered
    segments and `covered` as `alignSegments` would: a registered segment
    without its file, or a covered segment shorter than `covered`, is a
-   problem; an unregistered file or bytes past `covered` are notices.
+   problem; an unregistered file or bytes past `covered` are notices,
+   except the header-only segment newer than the covered one that a
+   flush filling its segment creates (`sealActive`): that is the normal
+   state after a clean close and gets no finding.
 3. **Every data segment record** (`segment.Scan`: checksum,
    decompression) in one read transaction. Damage in the data `index.db`
    covers is a problem (the records after it cannot be scanned); damage
-   past it is a notice. Each record is looked up in the key table:
+   past it is a notice. Without a usable `index.db` (missing, damaged, or
+   a format-2 directory) every damage is a problem except a torn final
+   write of the newest segment (`segment.CheckActive`, the read-only rule
+   of `OpenActive`), which the rebuild at `Open` truncates: a notice.
+   Each record is looked up in the key table:
    - a put the entry points at must have the entry's size and WAL offset
      and lie in covered data; its document must decode;
    - a covered record newer than the key table's version of its id (or a

@@ -36,6 +36,10 @@ const (
 	dataSuffix    = ".data"
 )
 
+// HeaderSize is the size of a segment file's header: a segment file of
+// exactly this size holds no record.
+const HeaderSize = headerSize
+
 // DataPath returns the path of data segment seg in dir: <dir>/seg-%06d.data.
 func DataPath(dir string, seg uint32) string {
 	return filepath.Join(dir, fmt.Sprintf("%s%06d%s", dataPrefix, seg, dataSuffix))
