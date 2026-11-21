@@ -441,6 +441,12 @@ func (e *Engine) SystemDatabase(ctx context.Context) (*Database, error) {
 	return e.createDatabase(ctx, SystemDatabaseName)
 }
 
+// HasSystemDatabase reports whether the reserved system database exists,
+// without creating it (SystemDatabase creates it).
+func (e *Engine) HasSystemDatabase() bool {
+	return e.lookupDatabase(SystemDatabaseName) != nil
+}
+
 // createDatabase is CreateDatabase for a name the caller has checked.
 func (e *Engine) createDatabase(ctx context.Context, name string) (*Database, error) {
 	if err := e.enter(); err != nil {

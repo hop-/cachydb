@@ -18,6 +18,7 @@ engine's job (see [STORAGE.md](STORAGE.md)). Overview:
 | TLS | `--tls-cert` and `--tls-key` flags, or `TLS_CERT` and `TLS_KEY` env vars (PEM files; both or neither) | none: plain HTTP |
 | Data directory | `-R` / `--root` flag, or `ROOT_DIR` env var | `~/.cachydb` |
 | Default database | `-d` / `--db` flag, or `DB_NAME` env var | `main` |
+| Bootstrap admin token | `BOOTSTRAP_ADMIN_TOKEN` or `BOOTSTRAP_ADMIN_TOKEN_FILE` env var (no flag) | none |
 
 Precedence: flag > environment variable > default.
 
@@ -39,13 +40,32 @@ start-up matrix; loopback means the host is `127.0.0.1`, `::1`, or
 | HTTP | loopback host | no tokens | tokens required | no tokens |
 | HTTP | any other host | tokens required | tokens required | no tokens, WARN at start |
 
-`app.Builder.Build` validates the mode and the TLS pair before opening the
-engine. When tokens are required it opens the `auth.Store` (`_system`) and,
-if no user exists, returns `app.ErrNoUsers` with a message naming
+`app.Builder.Build` validates the mode, the TLS pair, and the bootstrap
+token (`auth.ValidateBootstrapToken`) before opening the engine.
+`Builder.openUsers` then opens the `auth.Store` when tokens are required,
+when a bootstrap token is set, or whenever `_system` already exists
+(`Engine.HasSystemDatabase`), so `delete_database` forgets grants with
+authentication off too; otherwise nothing creates `_system`. Failing to
+open an existing `_system` fails the start-up in every mode. Next it
+applies the bootstrap token, and when tokens are required and no user
+exists it returns `app.ErrNoUsers` with a message naming
 `cachydb utils user add`, `BOOTSTRAP_ADMIN_TOKEN`, and `AUTH=off`; the
-process exits 1 and the default database is not created. Anything that
-creates users at start-up belongs in `openUsers`, before that check.
-`AUTH=off` on a non-loopback host logs a WARN through the engine logger.
+process exits 1 and the default database is not created. `AUTH=off` on a
+non-loopback host logs a WARN through the engine logger.
+
+**Bootstrap token.** `cmd.runApp` reads `BOOTSTRAP_ADMIN_TOKEN` or the
+file named by `BOOTSTRAP_ADMIN_TOKEN_FILE` (`app.BootstrapToken`: both set
+is an error, white space is trimmed) and passes it to
+`Builder.WithBootstrapAdminToken`. At every start, in every mode,
+`Store.EnsureAdmin("admin", token)` makes sure the user exists, is a
+server admin, and holds the token with label `bootstrap`; a different
+earlier `bootstrap` token of `admin` is revoked first, so after the value
+changes only the current one works. Removing the setting leaves the
+stored token. A value that already is another user's token is refused.
+The token must be 32 to 512 characters of RFC 6750 `b64token`
+(`[A-Za-z0-9._~+/-]+=*`), so it need not start with `cdb_`
+(`Store.Authenticate` accepts any form). Each change is logged at INFO
+with actor `BOOTSTRAP_ADMIN_TOKEN`; the token never is.
 
 With tokens required, `httpHandler()` wraps only `/mcp` in the SDK's
 `auth.RequireBearerToken` (`AllowMissingExpiration`, tokens do not expire):
@@ -71,7 +91,8 @@ Every tool has an access level (`internal/mcp/access.go`), passed to
 | read | `list_collections`, `describe_collection`, `find_documents`, `count_documents`, `distinct`; `copy_collection` on its source |
 | write | `insert_document`, `update_document`, `replace_document`, `delete_document` |
 | admin | `create_collection`, `update_schema`, `rename_collection`, `delete_collection`, `create_index`, `drop_index`; `copy_collection` on its target (`target_database`, else the source database) |
-| server | `create_database`, `delete_database` (which then calls `Store.ForgetDatabase`) |
+| server | `create_database`, `delete_database` (which then calls `Store.ForgetDatabase` whenever the server has a store, also with auth off), and the six admin user tools |
+| none (registered only with tokens) | `whoami` |
 
 `newSpec` wraps every handler in `Server.authorizeCall`, the one place
 tools are authorized:
@@ -96,6 +117,41 @@ level (read, write, admin) on an input without a `database` argument, and
 a `database` argument on a none or server tool; `registerTools` then
 fails and `New` returns the error. The handler of a tool without a level
 is never reached (`authorizeCall` denies it).
+
+### User tools
+
+`internal/mcp/users.go` defines `accessToolSpecs`: `whoami` (access
+none) and the admin tools `list_users`, `create_user`, `set_access`,
+`create_token`, `revoke_token`, `delete_user` (access server, marked
+`adminOnly`). `registerTools` validates them always but registers them
+only when `Config.TokensRequired`, so a server with authentication off
+lists exactly the 21 tools it always did. With tokens required, the
+receiving middleware `filterToolsList` sets `cacheScope: "private"` on
+every `tools/list` result (the list differs per user) and removes the
+admin tools unless the request's principal (`principalOf`, the same
+resolution as tool calls) is a server admin; the access level stays the
+real guard. `ToolDefinitions`/`ToolDocs` (the `tools` topic) cover only
+the always-registered tools; `AccessToolDocs` renders the user tools at
+the end of the `access` topic.
+
+- `whoami` → `user`, `server_admin`, `default_database`, `grants`
+  (database → level name).
+- `list_users` → `users` [`NewUserInfo`: name, flag, default database,
+  grants, created, token labels; never a token or digest].
+- `create_user` (`name`, `server_admin`?, `default_database`?) → `user`,
+  `label` (`default`), `token` (shown only here).
+- `set_access` (`user`, and `database` + `level` (`none` removes),
+  `server_admin`?, `default_database`? (empty clears)) → `Store.SetAccess`,
+  all parts in one compare-and-set write; returns the updated `user`.
+- `create_token` (`user`, `label`?) → `label`, `token`; `revoke_token`
+  (`user`, `label`); `delete_user` (`name`).
+
+`auth.Store` refuses to delete or demote the only server admin
+(`ErrLastServerAdmin`), for the MCP tools and `cachydb utils user` alike.
+Every successful change is logged at INFO via `auth.LogChange` (actor =
+the calling user, action = the tool name, target = the user changed, plus
+database/level/label; never a token). `userToolError` adds a
+`list_users` hint to not-found errors.
 
 ## Transports
 
@@ -156,8 +212,9 @@ transport has no health endpoint.
 
 1. `app.Builder.Build` opens the engine (`db.Open`: lock, recovery).
 2. `NewServer(ctx, engine, defaultDBName, transport, httpAddr, version)`
-   creates the default database if missing, registers the 21 tools and the
-   8 docs resources, and sets the server instructions and the
+   creates the default database if missing, registers the 21 tools (28
+   with tokens required: plus `whoami` and the six admin tools) and the
+   9 docs resources, and sets the server instructions and the
    implementation version (the build version, from `cmd.getVersion`).
 3. `Server.Start(ctx)` runs the transport until `ctx` is cancelled
    (SIGINT/SIGTERM), stdin closes (stdio), or the transport fails.
@@ -177,10 +234,11 @@ resolves its database in this order (`Server.databaseName`, applied by
 
 1. the tool's `database` argument, if given;
 2. the session's `use_database` choice;
-3. the user's `default_database` (never set with auth off);
+3. the user's `default_database` (only with tokens: with auth off the
+   principal is the implicit full-access one, which has none);
 4. the server default (`main`).
 
-## Tools (21)
+## Tools (21, plus the user tools)
 
 Tools are defined once in `internal/mcp/tools.go` (`toolSpecs`): name,
 description, annotations, typed input and output structs, and an example
@@ -326,7 +384,8 @@ indexed per element). Writes to the whole database wait while it builds.
   `cachydb://docs/<topic>` (name and title = the topic title, description
   = its summary). Reads return the same content as `cachydb docs <topic>`;
   the `tools` topic is rendered from the tool definitions
-  (`DocsTopics`/`ToolDocs`).
+  (`DocsTopics`/`ToolDocs`), and the `access` topic ends with the
+  generated user-tool reference (`AccessToolDocs`).
 - **Implementation info**: name `cachydb`, the real build version.
 - **HTTP handler**: `(*Server).HTTPHandler()` returns the `/mcp` +
   `/healthz` handler, so callers and tests (`internal/cmd/client_test.go`)
@@ -355,6 +414,8 @@ whose text names the action and the cause (`toolError` in `server.go`):
 | context cancelled / deadline | `<action>: request cancelled: …` |
 | `auth.ErrPermissionDenied` | `<action>: permission denied: user "<name>" needs <level> access to database "<db>" (hint: ask a server admin for access)`; server tools: `… must be a server admin …` |
 | `auth.ErrUnauthenticated` | `<action>: unauthenticated: … (hint: ask a server admin for a valid token)` (the token's user was removed) |
+| `auth.ErrLastServerAdmin` (user tools) | `<action>: last server admin: cannot remove\|demote user "<name>", the only server admin; make another user a server admin first` |
+| `ErrNotFound` (user tools) | `<action>: user "<name>": not found (hint: list_users shows the users and their token labels)` |
 
 ## Write consistency
 

@@ -29,6 +29,10 @@ starting `validating "arguments":`.
 | `the database engine is shut down` | The server is stopping | Reconnect after it restarts |
 | `write-ahead log failure, restart the server` | A disk write or fsync failed; writes stop | Check the disk, then restart the server |
 | `request cancelled` | The client cancelled the call or it timed out | Retry if needed |
+| `permission denied: user "u" needs write access to database "d"` / `must be a server admin` | With tokens, the user lacks the level the call needs (`use_database` and other tools say the same for a database the user cannot read, whether it exists or not) | Call `whoami` to see your access; ask a server admin for a grant; see `cachydb docs access` |
+| `unauthenticated` | The user of the session's token was removed, or the call carried no token | Ask a server admin for a valid token |
+| `last server admin` | `delete_user` or `set_access` would remove or demote the only server admin | Make another user a server admin first |
+| `give level with database` / `nothing to change` | `set_access` got a database without a level, or no change at all | Pass `database` and `level` (`none` removes), `server_admin`, or `default_database` |
 
 ## Startup and CLI errors
 
@@ -36,6 +40,11 @@ starting `validating "arguments":`.
 | --- | --- | --- |
 | `data directory is in use by another cachydb process` | Another server or utils command holds the directory lock | Stop it, use another `-R` directory, or go through the running HTTP server with `cachydb client` (the message suggests the command) |
 | `connecting to the cachydb server at …` | `cachydb client` found no server at `--url` / `CACHYDB_URL` | Start one with `cachydb -t http -p 7601`, or fix the URL |
+| `the server requires a token: pass --token or set CACHYDB_TOKEN` / `the server rejected the token` | The server answered HTTP 401: no token, or an unknown or revoked one | Pass a valid token with `--token` or `CACHYDB_TOKEN`; MCP clients send `Authorization: Bearer <token>` |
+| `refusing to start: … no user exists` | Clients need a token (`AUTH=required`, or a non-loopback host under `AUTH=auto`) and there is no user | Create the first admin with `cachydb utils user add NAME --admin` (server stopped) or set `BOOTSTRAP_ADMIN_TOKEN`; or, on a trusted network only, `AUTH=off`; see `cachydb docs access` |
+| `invalid bootstrap token` | `BOOTSTRAP_ADMIN_TOKEN` (or its file) is shorter than 32 or longer than 512 characters, has other characters, or is another user's token | Use a long random value, for example `openssl rand -hex 32` |
+| `BOOTSTRAP_ADMIN_TOKEN and BOOTSTRAP_ADMIN_TOKEN_FILE are both set` | Both settings are given | Keep one |
+| `invalid authentication mode` / `TLS needs both a certificate and a key` | `AUTH` is not `auto`, `required`, or `off`, or only one of `TLS_CERT` and `TLS_KEY` is set | Fix the setting named in the message |
 | `tool error: …` | `cachydb client call` ran a tool that failed (exit status 1) | Read the tool's message after the prefix |
 | `already exists (use --on-conflict skip or replace)` | `utils import` / `client import` found an existing `_id`; the message says how many lines were applied | Rerun with `--on-conflict skip` or `replace` |
 | `exists with a different schema` / `different index set` | An import target collection differs from the file | Use `--on-conflict replace`, or import into another directory |

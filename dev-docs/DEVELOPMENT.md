@@ -491,8 +491,9 @@ The workflow, in order:
 2. Builds `linux/amd64` with `VERSION=<tag>` (stamped into
    `cmd.Version`) and smoke-tests it without secrets: user 65532, a run
    with no user and no `AUTH` exits non-zero with the refusal message,
-   then with `AUTH=off`: healthy within 30s, `GET /healthz`, MCP
-   `initialize` over HTTP,
+   then with a random `BOOTSTRAP_ADMIN_TOKEN`: healthy within 30s,
+   `GET /healthz` without a token, MCP `initialize` over HTTP answered 401
+   without a token and 200 with it,
    `version --json` reports the tag, `docker stop` exits 0 within 15s, and
    an `initialize` over stdio.
 3. Logs in to Docker Hub and pushes `linux/amd64` + `linux/arm64` as
@@ -583,10 +584,11 @@ environment configuration from `os.Getenv`; neither needs a module.
    collection under it.
 8. The exact object `{"$now": true}` cannot be stored literally (it
    becomes a timestamp).
-9. Until tools check per-database access levels, an HTTP server that
-   requires tokens accepts only server-admin tokens on `/mcp`; `/healthz`
-   is always open. `utils export` and `client export` hold a whole collection's documents
-   in memory at once (offline) or page with `skip` (client).
+9. Access control has no token expiry, no per-collection grants, and no
+   rate limiting of failed authentications; tokens are bearer secrets, so
+   use TLS or a trusted network. `utils export` and `client export` hold a
+   whole collection's documents in memory at once (offline) or page with
+   `skip` (client).
 10. Single node only. The data-directory lock needs `flock` (Linux, macOS,
     the BSDs); elsewhere (Windows, Solaris, illumos, AIX) it is a no-op with
     a logged warning, and Windows is unsupported at runtime.

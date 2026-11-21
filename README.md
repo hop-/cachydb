@@ -23,6 +23,7 @@ A lightweight document-based database with Model Context Protocol (MCP) support,
 - **Schema evolution**: Every violation reported at once; `describe_collection`, `update_schema`, `rename_collection`, `copy_collection`, `delete_collection`, `drop_index`
 - **Export and client**: JSON Lines export/import (`cachydb utils export|import`), offline `utils find|get`, an offline integrity check (`utils verify`, which can also rebuild index files), and `cachydb client` to call any tool of a running HTTP server from the shell
 - **MCP integration**: Built-in MCP server supporting stdio and Streamable HTTP transports, with `use_database` per session
+- **Users and access**: Users with tokens and `read` / `write` / `admin` access per database (plus server admins), required for HTTP that other machines can reach; HTTPS with `--tls-cert` / `--tls-key`; managed offline (`cachydb utils user`) or over MCP by server admins
 - **Durable writes**: Every acknowledged write is fsynced to a write-ahead log; concurrent writes share fsyncs (group commit)
 - **Append-only storage**: zstd-compressed, append-only data segments with background compaction; the key table and indexes live on disk in one index file per collection, so memory use does not grow with the number of documents (tested with 10 million)
 - **Crash recovery**: Restart always recovers, including after `kill -9`, power loss, or a torn file tail
@@ -99,6 +100,18 @@ Change the port with `--port`, the listen host with `--host`, and serve HTTPS wi
 
 **Authentication** (`--auth` / `AUTH`): with the default `auto`, stdio and loopback HTTP (`127.0.0.1`, `::1`, `localhost`) need no token, and HTTP on any other host requires one. `required` requires tokens for all HTTP; `off` never does (on a non-loopback host it logs a warning). When tokens are required and no user exists, the server refuses to start and names the ways out: create the first admin with `cachydb utils user add NAME --admin` (server stopped), set `BOOTSTRAP_ADMIN_TOKEN`, or opt out with `AUTH=off` on a trusted network. `/healthz` never needs a token.
 
+**Users and tokens.** A user has tokens, an optional server-admin flag, an optional default database, and an access level per database: `read`, `write` (plus document writes), or `admin` (plus collections, schemas, indexes); database `*` means every database. Only server admins create and delete databases and manage users. Clients send `Authorization: Bearer <token>`. A token is printed once when it is created; only its SHA-256 digest is stored.
+
+```bash
+cachydb utils user add admin --admin                    # server stopped; prints the token once
+cachydb utils user add alice --default-database shop
+cachydb utils user grant alice shop write
+cachydb utils user list                                 # never shows tokens
+BOOTSTRAP_ADMIN_TOKEN="$(openssl rand -hex 32)" cachydb -t http --host 0.0.0.0   # or: ensure "admin" holds this token at start
+```
+
+On a server that requires tokens every user gets the `whoami` tool, and server admins also get `list_users`, `create_user`, `set_access`, `create_token`, `revoke_token`, and `delete_user` (hidden from other users; a server with authentication off registers none of them). See `cachydb docs access`.
+
 ### Configuration
 
 CLI flags (override environment variables, which override the defaults):
@@ -123,6 +136,7 @@ Environment variables:
 - `HOST`: HTTP listen host (default: `127.0.0.1`)
 - `AUTH`: `auto`, `required`, or `off` (default: `auto`); any other value is a start-up error
 - `TLS_CERT`, `TLS_KEY`: PEM certificate and key files; both or neither
+- `BOOTSTRAP_ADMIN_TOKEN` (or `BOOTSTRAP_ADMIN_TOKEN_FILE`, a file holding it): at every start, make sure the server admin `admin` exists and holds this token; a changed value replaces the old token; never logged
 - `ROOT_DIR`: Data directory (default: `~/.cachydb`)
 - `DB_NAME`: Default database (default: `main`)
 - `WAL_RETENTION_AGE`: How long processed WAL segments are kept, as a Go duration (default: `24h`, `0` = no age limit)
@@ -146,7 +160,8 @@ cachydb utils get -d kb -c notes --id wal-design
 cachydb utils verify --deep                            # integrity check of the data directory; exit 1 on damage
 cachydb utils verify --rebuild-index -d kb -c notes    # rebuild a damaged or stale index.db from the data segments
 
-# Through a running HTTP server (--url or CACHYDB_URL, default http://127.0.0.1:7601/mcp)
+# Through a running HTTP server (--url or CACHYDB_URL, default http://127.0.0.1:7601/mcp;
+# --token or CACHYDB_TOKEN when the server requires tokens)
 cachydb client tools
 cachydb client call find_documents '{"database":"kb","collection":"notes","query":{"limit":5}}'
 cachydb client export -d kb -o kb.jsonl
@@ -162,7 +177,7 @@ Logs go to stderr; in stdio mode stdout carries only MCP messages. SIGINT/SIGTER
 The binary documents itself, so an agent does not need this repository:
 
 ```bash
-cachydb docs                         # topics: overview, quickstart, mcp, tools, query, schema, config, errors
+cachydb docs                         # topics: overview, quickstart, mcp, tools, query, schema, config, access, errors
 cachydb docs quickstart              # one topic (markdown)
 cachydb docs tools --format json     # every MCP tool with its input/output JSON Schema and an example
 cachydb version --json               # version, Go, storage/WAL format, MCP protocol
@@ -225,9 +240,12 @@ cachydb healthcheck --url http://db.internal:7601/healthz
 
 The official image [`hovhannespalyan/cachydb`](https://hub.docker.com/r/hovhannespalyan/cachydb) is a small distroless image for `linux/amd64` and `linux/arm64`. It runs as the non-root user `65532`, keeps data in the `/data` volume, and is configured with the [environment variables](#configuration). Its defaults are `TRANSPORT=http`, `HOST=0.0.0.0`, `PORT=7601`, `ROOT_DIR=/data`, `DB_NAME=main`. Tags: `latest`, `X.Y`, `X.Y.Z`.
 
-Because the container listens on every interface, clients need a token under the default `AUTH=auto`, and **the container refuses to start until a user exists** (`cachydb utils user add`, or `BOOTSTRAP_ADMIN_TOKEN`). For local use without tokens, publish the port on localhost and set `AUTH=off`:
+Because the container listens on every interface, clients need a token under the default `AUTH=auto`, and **the container refuses to start until a user exists** (`BOOTSTRAP_ADMIN_TOKEN`, or `cachydb utils user add` on the stopped volume). For local use without tokens, publish the port on localhost and set `AUTH=off`:
 
 ```bash
+# HTTP server with tokens: the server admin "admin" holds the token you choose
+docker run -d --name cachydb -p 7601:7601 -v cachydb-data:/data -e BOOTSTRAP_ADMIN_TOKEN="$TOKEN" hovhannespalyan/cachydb
+
 # HTTP server at http://localhost:7601/mcp, data in the cachydb-data volume, no tokens
 docker run -d --name cachydb -p 127.0.0.1:7601:7601 -v cachydb-data:/data -e AUTH=off hovhannespalyan/cachydb
 
@@ -505,6 +523,16 @@ Create an index on a collection field for faster `eq` queries, and `has` / `has_
   "index_name": "email_idx",
   "field_name": "email"
 }
+```
+
+### Users and access (only when the server requires tokens)
+
+`whoami` (every user) shows the caller's access. Server admins also get `list_users`, `create_user` (returns the first token once), `set_access` (a level on one database, `none` to remove it, the server-admin flag, the default database), `create_token`, `revoke_token`, and `delete_user`; the only server admin cannot be removed or demoted. `cachydb docs access` has their schemas.
+
+```json
+{"name": "create_user", "arguments": {"name": "alice", "default_database": "shop"}}
+{"name": "set_access", "arguments": {"user": "alice", "database": "shop", "level": "write"}}
+{"name": "whoami", "arguments": {}}
 ```
 
 ## Architecture

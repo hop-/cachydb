@@ -21,7 +21,7 @@ server instructions, and `cachydb://docs/<topic>` resources.
 
 - [DATABASE_ENGINE.md](DATABASE_ENGINE.md) — `pkg/db` public API, documents, schemas, query and index semantics, migrations
 - [STORAGE.md](STORAGE.md) — on-disk layout and formats, WAL, data segments, flush, recovery, compaction, lock order
-- [MCP_SERVER.md](MCP_SERVER.md) — the 21 MCP tools, transports, sessions, errors
+- [MCP_SERVER.md](MCP_SERVER.md) — the 21 MCP tools (plus the user tools with tokens), auth modes, tool access, transports, sessions, errors
 - [CLI.md](CLI.md) — commands (incl. `docs`, `version --json`), flags, environment variables, known issues
 - [DEVELOPMENT.md](DEVELOPMENT.md) — coding patterns, testing, benchmarks, known limitations
 
@@ -30,18 +30,23 @@ server instructions, and `cachydb://docs/<topic>` resources.
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │ CLI (cobra)   internal/cmd                                   │
-│ cachydb [app] | version | utils list | utils migrate         │
+│ cachydb [app] | version | utils list|migrate|user | client   │
 │ signal.NotifyContext → RunE → errors to stderr, exit 1       │
 └───────────────┬───────────────────────────────┬──────────────┘
                 │ server                        │ utils
 ┌───────────────▼─────────────────┐             │
 │ internal/app (Builder, App)     │             │
-│ opens Engine, Start / Stop      │             │
+│ opens Engine, auth store,       │             │
+│ bootstrap token, Start / Stop   │             │
 └───────────────┬─────────────────┘             │
 ┌───────────────▼─────────────────┐             │
-│ internal/mcp (21 tools)         │             │
+│ internal/mcp (21 tools + 7 user │             │
+│ tools with tokens), tool access │             │
 │ stdio | Streamable HTTP (/mcp)  │             │
 │ per-session use_database        │             │
+├─────────────────────────────────┤             │
+│ internal/auth: users, tokens,   │◄────────────┤
+│ grants in _system; auth modes   │             │
 └───────────────┬─────────────────┘             │
 ┌───────────────▼───────────────────────────────▼──────────────┐
 │ pkg/db  Engine → Database → Collection                       │
@@ -67,13 +72,15 @@ cachydb/
 ├── main.go                  # → cmd.Execute()
 ├── go.mod                   # github.com/hop-/cachydb, Go 1.27.0
 ├── internal/
-│   ├── app/                 # Builder (options → Engine + MCP server), App Start/Stop
-│   ├── cmd/                 # cobra commands: root/app, docs, version, healthcheck, utils list/migrate/export/import/find/get, client, flags
+│   ├── app/                 # Builder (options → Engine, auth store, bootstrap token, MCP server), App Start/Stop
+│   ├── auth/                # users, tokens, grants (Store over _system), levels, auth modes (Decide), bootstrap admin
+│   ├── cmd/                 # cobra commands: root/app, docs, version, healthcheck, utils list/migrate/export/import/find/get/verify/user, client, flags
 │   ├── exportfmt/           # JSONL export format, Export/Import over Source/Target (engine adapter)
 │   ├── config/              # environment settings, ByteSize parser, Windows root dir name
 │   ├── docs/                # embedded agent docs topics (cachydb docs, MCP resources)
-│   └── mcp/                 # server.go: handlers, sessions, transports;
-│                            # tools.go: tool definitions; docs.go: instructions, resources
+│   └── mcp/                 # server.go: handlers, sessions, transports; access.go: tool access;
+│                            # tools.go: tool definitions; users.go: whoami and admin tools;
+│                            # listen.go: ListenConfig; docs.go: instructions, resources
 ├── pkg/db/
 │   ├── engine.go            # Engine, Open/Close, database create/drop
 │   ├── database.go          # Database, collection create/drop/rename/copy

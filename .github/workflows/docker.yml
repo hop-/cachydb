@@ -164,10 +164,18 @@ jobs:
           echo "$out" | grep -q 'BOOTSTRAP_ADMIN_TOKEN'
           echo "$out" | grep -q 'AUTH=off'
 
+      - name: "Smoke test: bootstrap admin token"
+        run: |
+          # A random token for this run only; masked in the logs.
+          token="$(openssl rand -hex 32)"
+          echo "::add-mask::$token"
+          echo "SMOKE_TOKEN=$token" >> "$GITHUB_ENV"
+
       - name: "Smoke test: HTTP server becomes healthy"
         run: |
-          # AUTH=off: no user exists in a fresh container.
-          docker run -d --name "$SMOKE_CONTAINER" -p 7601:7601 -e AUTH=off "$SMOKE_IMAGE"
+          # BOOTSTRAP_ADMIN_TOKEN creates the server admin "admin" holding
+          # the token, so the default AUTH=auto (tokens required) starts.
+          docker run -d --name "$SMOKE_CONTAINER" -p 7601:7601 -e BOOTSTRAP_ADMIN_TOKEN="$SMOKE_TOKEN" "$SMOKE_IMAGE"
           for _ in $(seq 1 30); do
             status="$(docker inspect -f '{{.State.Health.Status}}' "$SMOKE_CONTAINER")"
             echo "health: $status"
@@ -189,10 +197,23 @@ jobs:
           echo "$body"
           echo "$body" | jq -e --arg v "$VERSION" '.status == "ok" and .version == $v'
 
-      - name: "Smoke test: MCP initialize over HTTP (AUTH=off, no token)"
+      - name: "Smoke test: MCP initialize without a token is refused (401)"
+        run: |
+          code="$(curl -sS --max-time 10 -o unauthorized.out -w '%{http_code}' \
+            -X POST http://127.0.0.1:7601/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke-test","version":"1.0.0"}}}')"
+          echo "HTTP $code"
+          cat unauthorized.out
+          echo
+          [ "$code" = "401" ]
+
+      - name: "Smoke test: MCP initialize over HTTP with the token"
         run: |
           code="$(curl -sS --max-time 10 -o initialize.out -w '%{http_code}' \
             -X POST http://127.0.0.1:7601/mcp \
+            -H "Authorization: Bearer $SMOKE_TOKEN" \
             -H 'Content-Type: application/json' \
             -H 'Accept: application/json, text/event-stream' \
             -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke-test","version":"1.0.0"}}}')"
@@ -223,7 +244,14 @@ jobs:
 
       - name: "Smoke test: container logs"
         if: always()
-        run: docker logs "$SMOKE_CONTAINER" || true
+        run: |
+          docker logs "$SMOKE_CONTAINER" > container.log 2>&1 || true
+          cat container.log
+          # The bootstrap token must never be logged.
+          if [ -n "${SMOKE_TOKEN:-}" ] && grep -qF "$SMOKE_TOKEN" container.log; then
+            echo "::error::the container log contains the bootstrap token"
+            exit 1
+          fi
 
       - name: "Smoke test: stdio transport"
         run: |

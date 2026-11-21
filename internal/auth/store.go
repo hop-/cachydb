@@ -45,8 +45,9 @@ const TokenPrefix = "cdb_"
 // tokenBytes is the number of random bytes in a token.
 const tokenBytes = 32
 
-// defaultTokenLabel is the label of a token created without one.
-const defaultTokenLabel = "default"
+// DefaultTokenLabel is the label of a token created without one, and of
+// the first token CreateUser makes.
+const DefaultTokenLabel = "default"
 
 // maxChangeAttempts bounds the compare-and-set retries of one user change.
 const maxChangeAttempts = 100
@@ -233,8 +234,10 @@ func (s *Store) Principal(name string) (Principal, error) {
 // Authenticate returns the principal of the user holding token, or an
 // error wrapping ErrUnauthenticated for an unknown or revoked token. The
 // token is looked up by its SHA-256 digest and never appears in the error.
+// Generated tokens start with TokenPrefix; a bootstrap token (EnsureAdmin)
+// may have any form ValidateBootstrapToken accepts.
 func (s *Store) Authenticate(token string) (Principal, error) {
-	if strings.HasPrefix(token, TokenPrefix) {
+	if token != "" {
 		snap := s.snap.Load()
 		if t, ok := snap.tokens[digest(token)]; ok {
 			if u, ok := snap.users[t.user]; ok {
@@ -294,7 +297,7 @@ func (s *Store) CreateUser(ctx context.Context, name string, opts UserOptions) (
 			}
 			return fmt.Errorf("creating user %q: %w", name, err)
 		}
-		if err := s.insertToken(ctx, name, defaultTokenLabel, dig); err != nil {
+		if err := s.insertToken(ctx, name, DefaultTokenLabel, dig); err != nil {
 			// Undo the user so a retry can create it; a crash here
 			// leaves a user without tokens, which authenticates nobody.
 			if derr := s.users.DeleteWith(ctx, name, nil); derr != nil {
@@ -311,11 +314,17 @@ func (s *Store) CreateUser(ctx context.Context, name string, opts UserOptions) (
 }
 
 // DeleteUser removes the user name and its tokens; db.ErrNotFound if
-// there is no such user.
+// there is no such user, ErrLastServerAdmin if it is the only server
+// admin.
 func (s *Store) DeleteUser(ctx context.Context, name string) error {
 	return s.change(ctx, func() error {
-		if _, ok := s.snap.Load().users[name]; !ok {
+		snap := s.snap.Load()
+		u, ok := snap.users[name]
+		if !ok {
 			return errNoUser(name)
+		}
+		if u.principal.ServerAdmin && snap.lastServerAdmin(name) {
+			return errLastServerAdmin(name, "remove")
 		}
 		// Tokens first: a crash in between leaves a user without tokens,
 		// never a token of a removed user.
@@ -374,9 +383,69 @@ func (s *Store) Revoke(ctx context.Context, name, database string) error {
 }
 
 // SetServerAdmin sets or clears the server-admin flag of the user name.
+// Clearing it on the only server admin fails with ErrLastServerAdmin.
 func (s *Store) SetServerAdmin(ctx context.Context, name string, admin bool) error {
+	return s.SetAccess(ctx, name, AccessChange{ServerAdmin: &admin})
+}
+
+// AccessChange is one change of a user's access for SetAccess. Nil fields
+// are left alone.
+type AccessChange struct {
+	// Database and Level set the grant on Database (a database name or
+	// AllDatabases) to Level; LevelNone removes it (nothing to remove is
+	// not an error). Level is used only when Database is set.
+	Database string
+	Level    Level
+	// ServerAdmin sets or clears the server-admin flag.
+	ServerAdmin *bool
+	// DefaultDatabase sets the default database; "" clears it.
+	DefaultDatabase *string
+}
+
+// IsZero reports whether c changes nothing.
+func (c AccessChange) IsZero() bool {
+	return c.Database == "" && c.ServerAdmin == nil && c.DefaultDatabase == nil
+}
+
+// SetAccess applies every part of c to the user name in one write, so the
+// parts take effect together or not at all. Clearing the server-admin flag
+// of the only server admin fails with ErrLastServerAdmin.
+func (s *Store) SetAccess(ctx context.Context, name string, c AccessChange) error {
+	if c.Database != "" {
+		if err := validGrantDatabase(c.Database); err != nil {
+			return err
+		}
+		if c.Level != LevelNone && !c.Level.grantable() {
+			return fmt.Errorf("%w: %s (want none, read, write, or admin)", ErrInvalidLevel, c.Level)
+		}
+	}
+	if c.DefaultDatabase != nil && *c.DefaultDatabase != "" {
+		if err := db.ValidateName("database", *c.DefaultDatabase); err != nil {
+			return err
+		}
+	}
 	return s.changeUser(ctx, name, func(u *storedUser) error {
-		u.ServerAdmin = admin
+		if c.ServerAdmin != nil && !*c.ServerAdmin && u.ServerAdmin && s.snap.Load().lastServerAdmin(name) {
+			return errLastServerAdmin(name, "demote")
+		}
+		if c.Database != "" {
+			grants := maps.Clone(u.Grants)
+			if grants == nil {
+				grants = make(map[string]Level)
+			}
+			if c.Level == LevelNone {
+				delete(grants, c.Database)
+			} else {
+				grants[c.Database] = c.Level
+			}
+			u.Grants = grants
+		}
+		if c.ServerAdmin != nil {
+			u.ServerAdmin = *c.ServerAdmin
+		}
+		if c.DefaultDatabase != nil {
+			u.DefaultDatabase = *c.DefaultDatabase
+		}
 		return nil
 	})
 }
@@ -384,15 +453,7 @@ func (s *Store) SetServerAdmin(ctx context.Context, name string, admin bool) err
 // SetDefaultDatabase sets the default database of the user name; an empty
 // database clears it.
 func (s *Store) SetDefaultDatabase(ctx context.Context, name, database string) error {
-	if database != "" {
-		if err := db.ValidateName("database", database); err != nil {
-			return err
-		}
-	}
-	return s.changeUser(ctx, name, func(u *storedUser) error {
-		u.DefaultDatabase = database
-		return nil
-	})
+	return s.SetAccess(ctx, name, AccessChange{DefaultDatabase: &database})
 }
 
 // ForgetDatabase removes every user's grant on database (not grants on
@@ -430,19 +491,19 @@ func (s *Store) ForgetDatabase(ctx context.Context, database string) error {
 	return nil
 }
 
-// CreateToken adds a token labeled label to the user name and returns it;
-// it is shown only this once. An empty label picks the first free one of
-// "default", "default-2", "default-3", ...; labels follow the
-// database-name rule and are unique per user (db.ErrExists).
-func (s *Store) CreateToken(ctx context.Context, name, label string) (string, error) {
+// CreateToken adds a token labeled label to the user name and returns it
+// with its label; the token is shown only this once. An empty label picks
+// the first free one of "default", "default-2", "default-3", ...; labels
+// follow the database-name rule and are unique per user (db.ErrExists).
+func (s *Store) CreateToken(ctx context.Context, name, label string) (token, usedLabel string, err error) {
 	if label != "" {
 		if err := db.ValidateName("token label", label); err != nil {
-			return "", err
+			return "", "", err
 		}
 	}
 	token, dig, err := newToken()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	err = s.change(ctx, func() error {
 		u, ok := s.snap.Load().users[name]
@@ -453,9 +514,9 @@ func (s *Store) CreateToken(ctx context.Context, name, label string) (string, er
 			return slices.ContainsFunc(u.tokens, func(t Token) bool { return t.Label == l })
 		}
 		if label == "" {
-			label = defaultTokenLabel
+			label = DefaultTokenLabel
 			for i := 2; taken(label); i++ {
-				label = defaultTokenLabel + "-" + strconv.Itoa(i)
+				label = DefaultTokenLabel + "-" + strconv.Itoa(i)
 			}
 		} else if taken(label) {
 			return fmt.Errorf("token %q of user %q: %w", label, name, db.ErrExists)
@@ -463,9 +524,9 @@ func (s *Store) CreateToken(ctx context.Context, name, label string) (string, er
 		return s.insertToken(ctx, name, label, dig)
 	})
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return token, nil
+	return token, label, nil
 }
 
 // RevokeToken deletes the token labeled label of the user name;
@@ -509,39 +570,43 @@ var errUnchanged = errors.New("unchanged")
 // compare-and-set on its rev field); otherwise it reads it again and
 // retries, so a concurrent change of the same user is never lost.
 func (s *Store) changeUser(ctx context.Context, name string, fn func(*storedUser) error) error {
-	return s.change(ctx, func() error {
-		for range maxChangeAttempts {
-			doc, err := s.users.Get(ctx, name)
-			if err != nil {
-				if errors.Is(err, db.ErrNotFound) {
-					return errNoUser(name)
-				}
-				return fmt.Errorf("reading user %q: %w", name, err)
+	return s.change(ctx, func() error { return s.changeUserLocked(ctx, name, fn) })
+}
+
+// changeUserLocked is changeUser for a caller that holds the change lock
+// (inside change).
+func (s *Store) changeUserLocked(ctx context.Context, name string, fn func(*storedUser) error) error {
+	for range maxChangeAttempts {
+		doc, err := s.users.Get(ctx, name)
+		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				return errNoUser(name)
 			}
-			u := decodeUser(doc)
-			cond := db.Condition{{Field: fieldRev, Operator: "exists", Value: false}}
-			if u.hasRev {
-				cond = db.Condition{{Field: fieldRev, Operator: "eq", Value: u.rev}}
-			}
-			if err := fn(&u); err != nil {
-				if errors.Is(err, errUnchanged) {
-					return nil
-				}
-				return err
-			}
-			u.rev++
-			_, err = s.users.Replace(ctx, name, u.document(), cond)
-			switch {
-			case err == nil:
-				return nil
-			case errors.Is(err, db.ErrConditionFailed):
-				continue // changed meanwhile (or removed): read again
-			default:
-				return fmt.Errorf("changing user %q: %w", name, err)
-			}
+			return fmt.Errorf("reading user %q: %w", name, err)
 		}
-		return fmt.Errorf("changing user %q: it kept changing concurrently (%d attempts)", name, maxChangeAttempts)
-	})
+		u := decodeUser(doc)
+		cond := db.Condition{{Field: fieldRev, Operator: "exists", Value: false}}
+		if u.hasRev {
+			cond = db.Condition{{Field: fieldRev, Operator: "eq", Value: u.rev}}
+		}
+		if err := fn(&u); err != nil {
+			if errors.Is(err, errUnchanged) {
+				return nil
+			}
+			return err
+		}
+		u.rev++
+		_, err = s.users.Replace(ctx, name, u.document(), cond)
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, db.ErrConditionFailed):
+			continue // changed meanwhile (or removed): read again
+		default:
+			return fmt.Errorf("changing user %q: %w", name, err)
+		}
+	}
+	return fmt.Errorf("changing user %q: it kept changing concurrently (%d attempts)", name, maxChangeAttempts)
 }
 
 // storedUser is a user document decoded for a change.
@@ -621,6 +686,21 @@ func parseTime(v any) time.Time {
 }
 
 func errNoUser(name string) error { return fmt.Errorf("user %q: %w", name, db.ErrNotFound) }
+
+func errLastServerAdmin(name, action string) error {
+	return fmt.Errorf("%w: cannot %s user %q, the only server admin; make another user a server admin first", ErrLastServerAdmin, action, name)
+}
+
+// lastServerAdmin reports whether no user other than name is a server
+// admin.
+func (snap *snapshot) lastServerAdmin(name string) bool {
+	for other, u := range snap.users {
+		if other != name && u.principal.ServerAdmin {
+			return false
+		}
+	}
+	return true
+}
 
 func validGrantDatabase(database string) error {
 	if database == AllDatabases {

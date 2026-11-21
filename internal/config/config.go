@@ -24,6 +24,13 @@ type Config struct {
 	// HTTP transport (env TLS_CERT, TLS_KEY); both or neither.
 	TLSCert string
 	TLSKey  string
+	// BootstrapAdminToken (env BOOTSTRAP_ADMIN_TOKEN) or the file named by
+	// BootstrapAdminTokenFile (env BOOTSTRAP_ADMIN_TOKEN_FILE) holds the
+	// token the server admin "admin" gets at start-up. A secret: never
+	// logged or printed. There is no flag, so it never shows in a process
+	// listing.
+	BootstrapAdminToken     string
+	BootstrapAdminTokenFile string
 	// RootDir is the data directory (env ROOT_DIR); empty means
 	// $HOME/<RootDirName>.
 	RootDir     string
@@ -82,6 +89,8 @@ func Init() error {
 		fromEnv("AUTH", &cfg.Auth, asIs),
 		fromEnv("TLS_CERT", &cfg.TLSCert, asIs),
 		fromEnv("TLS_KEY", &cfg.TLSKey, asIs),
+		fromEnv("BOOTSTRAP_ADMIN_TOKEN", &cfg.BootstrapAdminToken, asIs),
+		fromEnv("BOOTSTRAP_ADMIN_TOKEN_FILE", &cfg.BootstrapAdminTokenFile, asIs),
 		fromEnv("ROOT_DIR", &cfg.RootDir, asIs),
 		fromEnv("DB_NAME", &cfg.DBName, asIs),
 		fromEnv("TRANSPORT", &cfg.Transport, asIs),

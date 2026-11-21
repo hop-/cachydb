@@ -1,7 +1,7 @@
 ---
 name: config
 title: Configuration
-summary: Every flag and environment variable, defaults, precedence (flag > env > default), listen host, AUTH and TLS, value formats, cachydb client (CACHYDB_URL), and the export format
+summary: Every flag and environment variable, defaults, precedence (flag > env > default), listen host, AUTH, BOOTSTRAP_ADMIN_TOKEN and TLS, value formats, cachydb client (CACHYDB_URL, CACHYDB_TOKEN), utils user, and the export format
 ---
 # Configuration
 
@@ -20,6 +20,8 @@ environment variable, which wins over the default.**
 | `--tls-key` | `TLS_KEY` | none | PEM private key file; with `--tls-cert`, serve HTTPS |
 | `-R, --root` | `ROOT_DIR` | `~/.cachydb` | Data directory (one server per directory) |
 | `-d, --db` | `DB_NAME` | `main` | Default database; created at startup if missing |
+| | `BOOTSTRAP_ADMIN_TOKEN` | none | At every start, make sure the server admin `admin` exists and holds this token (32 to 512 characters); never logged; no flag |
+| | `BOOTSTRAP_ADMIN_TOKEN_FILE` | none | A file holding the bootstrap token (for Docker secrets); not together with `BOOTSTRAP_ADMIN_TOKEN` |
 
 ### When clients need a token
 
@@ -34,7 +36,9 @@ When clients need a token and no user exists, cachydb refuses to start
 `cachydb utils user add NAME --admin` while the server is stopped, set
 `BOOTSTRAP_ADMIN_TOKEN`, or, on a trusted network only, set `AUTH=off`.
 Clients send the token as `Authorization: Bearer <token>`; without a
-valid one, `/mcp` answers 401. `/healthz` never needs a token.
+valid one, `/mcp` answers 401. `/healthz` never needs a token. Changing
+`BOOTSTRAP_ADMIN_TOKEN` and restarting replaces the old bootstrap token;
+see `cachydb docs access` for users, access levels, and tokens.
 
 TLS needs both files; setting only one is a start-up error. The
 certificate and key are read once at start-up.
@@ -61,6 +65,11 @@ instead.
 | `utils import` | `-i` file (`-` = stdin), `--on-conflict fail\|skip\|replace` (default `fail`) | A summary on stderr |
 | `utils find` | `-d`, `-c` (required), `--query` JSON (the `find_documents` `query`), `--format jsonl\|json` (default `jsonl`) | Documents |
 | `utils get` | `-d`, `-c`, `--id` (required) | One document; exit 1 if not found |
+| `utils user add NAME` | `--admin`, `--default-database DB` | The first token, once, alone on stdout |
+| `utils user list` | `--format text\|json` | Users, access, and token labels; never tokens |
+| `utils user remove NAME` | | Removes the user and its tokens (not the only server admin) |
+| `utils user grant NAME DATABASE read\|write\|admin` / `revoke NAME DATABASE` | `*` = every database | |
+| `utils user token add NAME` / `token revoke NAME LABEL` | `--label L` | `add` prints the token once, alone on stdout |
 
 `--on-conflict`: `fail` stops at the first existing `_id` (and reports how
 many lines were applied); `skip` keeps existing documents; `replace`
@@ -73,6 +82,7 @@ existing collection whose schema or index set differs is an error.
 | Flag | Env var | Default | Meaning |
 | --- | --- | --- | --- |
 | `--url` | `CACHYDB_URL` | `http://127.0.0.1:7601/mcp` | MCP endpoint of a running `cachydb -t http` server |
+| `--token` | `CACHYDB_TOKEN` | none | Token for a server that requires one, sent as `Authorization: Bearer`; prefer the variable (a flag shows in the process list). After a 401 the error names the flag |
 
 - `cachydb client tools [--format json]` lists the server's tools.
 - `cachydb client call <tool> [json-args | -]` calls any tool with a JSON
@@ -124,9 +134,11 @@ reads only the variables.
 
 **A container needs a user or `AUTH=off`:** with `HOST=0.0.0.0` and the
 default `AUTH=auto`, clients need a token, so a container without a user
-exits at start with the refusal message above.
+exits at start with the refusal message above. `BOOTSTRAP_ADMIN_TOKEN`
+(or `BOOTSTRAP_ADMIN_TOKEN_FILE`) creates the admin without a shell.
 
 ```bash
+docker run -d -p 7601:7601 -v cachydb-data:/data -e BOOTSTRAP_ADMIN_TOKEN="$TOKEN" hovhannespalyan/cachydb
 docker run -d -p 127.0.0.1:8080:8080 -v cachydb-data:/data -e PORT=8080 -e DB_NAME=app -e AUTH=off hovhannespalyan/cachydb
 docker run -i --rm -v cachydb-data:/data -e TRANSPORT=stdio hovhannespalyan/cachydb
 ```

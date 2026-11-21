@@ -31,6 +31,9 @@ engine (`github.com/hop-/cachydb/pkg/db`) directly.
   otherwise) that it creates at startup. Each MCP session can pick another
   one with `use_database`, and every data tool takes an optional
   `database` argument.
+- HTTP that other machines can reach needs **users with tokens**, each
+  with `read`, `write`, or `admin` access per database or a server-admin
+  flag; stdio and loopback HTTP need none. See `cachydb docs access`.
 
 ## Durability
 

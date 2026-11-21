@@ -68,6 +68,7 @@ on-disk format versions this build reads and writes.
 | `Database(name) (*Database, error)` | `ErrNotFound` if missing |
 | `ListDatabases() []string` | Sorted; nil when empty; never lists the system database |
 | `SystemDatabase(ctx) (*Database, error)` | Creates or returns the reserved database `SystemDatabaseName` (`_system`), which holds `internal/auth`'s users and tokens. `Database`, `CreateDatabase`, and `DropDatabase` reject its name (`ErrInvalidName`), and `ListDatabases` and `MigrateAll` skip it; recovery, flush, compaction, and `Verify` treat it like any database |
+| `HasSystemDatabase() bool` | Reports whether `_system` exists, without creating it; the server opens the auth store whenever it does, so `delete_database` forgets grants even with authentication off |
 | `DropDatabase(ctx, name) error` | Waits for in-flight writes in the database |
 | `MigrateDatabase(ctx, name, target) error` | See [Migrations](#migrations) |
 | `MigrateAll(ctx, target) error` | Every database `ListDatabases` returns (not the system database) |

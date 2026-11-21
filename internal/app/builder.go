@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/hop-/cachydb/internal/auth"
@@ -19,8 +20,11 @@ type Builder struct {
 	transport string
 	listen    mcpserver.ListenConfig
 	authMode  string
-	version   string
-	logger    *slog.Logger
+	// bootstrapToken is the BOOTSTRAP_ADMIN_TOKEN value; a secret, never
+	// logged.
+	bootstrapToken string
+	version        string
+	logger         *slog.Logger
 
 	walRetentionSet  bool
 	walRetentionAge  time.Duration
@@ -67,6 +71,39 @@ func (b *Builder) WithListen(l mcpserver.ListenConfig) *Builder {
 func (b *Builder) WithAuth(mode string) *Builder {
 	b.authMode = mode
 	return b
+}
+
+// WithBootstrapAdminToken sets the bootstrap token: at start-up Build
+// makes sure the server admin auth.BootstrapAdmin exists and holds it
+// (auth.Store.EnsureAdmin). Empty means none. Build rejects a token that
+// fails auth.ValidateBootstrapToken. See BootstrapToken for reading it
+// from the environment.
+func (b *Builder) WithBootstrapAdminToken(token string) *Builder {
+	b.bootstrapToken = token
+	return b
+}
+
+// BootstrapToken returns the bootstrap token given by value
+// (BOOTSTRAP_ADMIN_TOKEN) or by the contents of the file named by file
+// (BOOTSTRAP_ADMIN_TOKEN_FILE), with surrounding white space removed;
+// "" if neither is set. Setting both is an error. No error contains the
+// token.
+func BootstrapToken(value, file string) (string, error) {
+	switch {
+	case value != "" && file != "":
+		return "", errors.New("BOOTSTRAP_ADMIN_TOKEN and BOOTSTRAP_ADMIN_TOKEN_FILE are both set: use one")
+	case file != "":
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return "", fmt.Errorf("BOOTSTRAP_ADMIN_TOKEN_FILE: %w", err)
+		}
+		token := strings.TrimSpace(string(data))
+		if token == "" {
+			return "", fmt.Errorf("BOOTSTRAP_ADMIN_TOKEN_FILE: %s is empty", file)
+		}
+		return token, nil
+	}
+	return strings.TrimSpace(value), nil
 }
 
 // WithVersion sets the build version the MCP server reports.
@@ -133,10 +170,10 @@ func disabledIfZero[T int64 | time.Duration](v T) T {
 // recovery) and creates the MCP server on it. The returned App owns the
 // engine; call Stop to close it.
 //
-// It fails before opening the engine for an invalid authentication mode
-// or a TLS certificate without a key (or the reverse), and after opening
-// it when HTTP clients need tokens (auth.Decide) but no user exists; see
-// ErrNoUsers.
+// It fails before opening the engine for an invalid authentication mode,
+// a TLS certificate without a key (or the reverse), or an invalid
+// bootstrap token, and after opening it when HTTP clients need tokens
+// (auth.Decide) but no user exists; see ErrNoUsers.
 func (b *Builder) Build(ctx context.Context) (_ *App, err error) {
 	mode, err := auth.ParseMode(b.authMode)
 	if err != nil {
@@ -144,6 +181,11 @@ func (b *Builder) Build(ctx context.Context) (_ *App, err error) {
 	}
 	if err := b.listen.Validate(); err != nil {
 		return nil, err
+	}
+	if b.bootstrapToken != "" {
+		if err := auth.ValidateBootstrapToken(b.bootstrapToken); err != nil {
+			return nil, fmt.Errorf("BOOTSTRAP_ADMIN_TOKEN: %w", err)
+		}
 	}
 	host := b.listen.HostOrDefault()
 	decision := auth.Decide(mode, b.transport == "http", host)
@@ -167,11 +209,9 @@ func (b *Builder) Build(ctx context.Context) (_ *App, err error) {
 		opts.Logger.Warn("authentication is off on a listener other machines can reach: every client that reaches it has full access to every database",
 			"host", host, "auth", string(mode))
 	}
-	var users *auth.Store
-	if decision.TokensRequired {
-		if users, err = openUsers(ctx, engine, mode, host); err != nil {
-			return nil, err
-		}
+	users, err := b.openUsers(ctx, engine, decision, mode, host, opts.Logger)
+	if err != nil {
+		return nil, err
 	}
 
 	mcpServer, err := mcpserver.New(ctx, engine, mcpserver.Config{
@@ -194,18 +234,58 @@ func (b *Builder) Build(ctx context.Context) (_ *App, err error) {
 // one; Build refuses to start it.
 var ErrNoUsers = errors.New("no user exists")
 
-// openUsers opens the auth store of a server whose HTTP clients need
-// tokens and checks that a user exists to present one. Anything that
-// creates users at start-up runs before the check.
-func openUsers(ctx context.Context, engine *db.Engine, mode auth.Mode, host string) (*auth.Store, error) {
+// openUsers opens the auth store when the server needs it, applies the
+// bootstrap token, and, when HTTP clients need tokens, checks that a user
+// exists to present one. It returns nil (no store) when none is needed.
+//
+// The store is opened when tokens are required, when a bootstrap token is
+// set, and whenever the system database already exists, also with
+// authentication off: delete_database must then remove the deleted
+// database's grants, or a database recreated under that name would
+// inherit them once authentication is on. Without any of these, nothing
+// creates the system database. Failing to open an existing one fails the
+// start-up, with authentication off too, rather than leave stale grants
+// behind.
+func (b *Builder) openUsers(ctx context.Context, engine *db.Engine, decision auth.Decision, mode auth.Mode, host string, logger *slog.Logger) (*auth.Store, error) {
+	if !decision.TokensRequired && b.bootstrapToken == "" && !engine.HasSystemDatabase() {
+		return nil, nil
+	}
 	users, err := auth.Open(ctx, engine)
 	if err != nil {
 		return nil, err
 	}
-	if !users.HasUsers() {
+	if b.bootstrapToken != "" {
+		if err := ensureBootstrapAdmin(ctx, users, b.bootstrapToken, logger); err != nil {
+			return nil, err
+		}
+	}
+	if decision.TokensRequired && !users.HasUsers() {
 		return nil, noUsersError(mode, host)
 	}
 	return users, nil
+}
+
+// ensureBootstrapAdmin applies the bootstrap token and logs what changed,
+// never the token.
+func ensureBootstrapAdmin(ctx context.Context, users *auth.Store, token string, logger *slog.Logger) error {
+	res, err := users.EnsureAdmin(ctx, auth.BootstrapAdmin, token)
+	if err != nil {
+		return fmt.Errorf("BOOTSTRAP_ADMIN_TOKEN: %w", err)
+	}
+	const actor = "BOOTSTRAP_ADMIN_TOKEN"
+	if res.CreatedUser {
+		auth.LogChange(logger, actor, "create_user", auth.BootstrapAdmin, "server_admin", true)
+	}
+	if res.MadeServerAdmin {
+		auth.LogChange(logger, actor, "set_access", auth.BootstrapAdmin, "server_admin", true)
+	}
+	if res.ReplacedToken {
+		auth.LogChange(logger, actor, "revoke_token", auth.BootstrapAdmin, "label", auth.BootstrapLabel, "reason", "the bootstrap token changed")
+	}
+	if res.AddedToken {
+		auth.LogChange(logger, actor, "create_token", auth.BootstrapAdmin, "label", auth.BootstrapLabel)
+	}
+	return nil
 }
 
 // noUsersError explains why the server needs tokens and the ways out.

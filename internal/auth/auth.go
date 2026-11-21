@@ -13,6 +13,7 @@ package auth
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 )
 
@@ -26,6 +27,9 @@ var (
 	// ErrInvalidLevel reports an access level that is not read, write, or
 	// admin where a grant level is required.
 	ErrInvalidLevel = errors.New("invalid access level")
+	// ErrLastServerAdmin reports a change that would remove or demote the
+	// only server admin, which would leave nobody able to manage users.
+	ErrLastServerAdmin = errors.New("last server admin")
 )
 
 // AllDatabases is the database name of a grant that covers every
@@ -126,4 +130,15 @@ func denied(p Principal, database string, need Level) error {
 		return fmt.Errorf("%w: user %q must be a server admin", ErrPermissionDenied, p.Name)
 	}
 	return fmt.Errorf("%w: user %q needs %s access to database %q", ErrPermissionDenied, p.Name, need, database)
+}
+
+// LogChange logs one user-management change at INFO: who made it (actor),
+// what it was (action), and the user it changed (target), plus attrs
+// (key-value pairs such as the database and level). Callers must never
+// pass a token.
+func LogChange(logger *slog.Logger, actor, action, target string, attrs ...any) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Info("user management", append([]any{"actor", actor, "action", action, "target", target}, attrs...)...)
 }

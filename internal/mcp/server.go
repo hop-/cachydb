@@ -47,10 +47,13 @@ type Server struct {
 	// tokensRequired means every /mcp request must carry the token of a
 	// user in users; /healthz never needs one.
 	tokensRequired bool
-	users          *auth.Store   // set when tokensRequired, may be nil otherwise
-	logger         *slog.Logger  // failed authentications
+	users          *auth.Store   // set when tokensRequired, may be set otherwise
+	logger         *slog.Logger  // failed authentications, user-management changes
 	stderr         io.Writer     // startup/shutdown messages; never stdout
 	stdio          mcp.Transport // the stdio transport; tests replace it
+	// adminTools names the registered user-management tools, which
+	// tools/list shows only to server admins (filterToolsList).
+	adminTools map[string]bool
 
 	// sessions maps *mcp.ServerSession to *sessionState: the database the
 	// session selected with use_database.
@@ -96,7 +99,10 @@ type Config struct {
 	// of a user in Users (the start-up decision of auth.Decide). /healthz
 	// never needs a token, and stdio is never affected.
 	TokensRequired bool
-	// Users is the auth store; it must be set when TokensRequired is.
+	// Users is the auth store; it must be set when TokensRequired is. It
+	// may be set without TokensRequired: delete_database then still
+	// removes the deleted database's grants, and every call keeps full
+	// access.
 	Users *auth.Store
 	// Logger receives failed authentications (INFO); nil means
 	// slog.Default().
@@ -175,6 +181,9 @@ func New(ctx context.Context, engine *db.Engine, cfg Config) (*Server, error) {
 	// handshake (server/discover), so InitializedHandler never runs for
 	// them: also track the session on every request it sends.
 	s.server.AddReceivingMiddleware(s.trackSessionMiddleware)
+	if s.tokensRequired {
+		s.server.AddReceivingMiddleware(s.filterToolsList)
+	}
 	if err := s.registerTools(s.server); err != nil {
 		return nil, fmt.Errorf("creating MCP server: %w", err)
 	}

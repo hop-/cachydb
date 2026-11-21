@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/hop-/cachydb/internal/app"
 	"github.com/hop-/cachydb/internal/config"
 	mcpserver "github.com/hop-/cachydb/internal/mcp"
 	"github.com/spf13/cobra"
@@ -21,7 +22,12 @@ HTTP listens on 127.0.0.1 (this machine only) unless --host says
 otherwise. Clients need a token when --auth is required, or when it is
 auto (the default) and the host is not loopback (127.0.0.1, ::1,
 localhost); the server then refuses to start while no user exists. stdio
-never needs a token. With --tls-cert and --tls-key it serves HTTPS.`,
+never needs a token. With --tls-cert and --tls-key it serves HTTPS.
+
+Create users with "cachydb utils user add" while the server is stopped,
+or set BOOTSTRAP_ADMIN_TOKEN (or BOOTSTRAP_ADMIN_TOKEN_FILE, a file
+holding it): every start then makes sure the server admin "admin" exists
+and holds that token. See "cachydb docs access".`,
 	Example: `  cachydb app -R /path/to/data             # stdio
   cachydb app -t http -p 8080              # Streamable HTTP at http://localhost:8080/mcp
   TRANSPORT=http PORT=8080 cachydb app     # the same settings from the environment
@@ -114,6 +120,11 @@ func runApp(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	ctx := cmd.Context()
+	c := config.GetConfig()
+	bootstrap, err := app.BootstrapToken(c.BootstrapAdminToken, c.BootstrapAdminTokenFile)
+	if err != nil {
+		return err
+	}
 
 	application, err := newBuilder().
 		WithDBName(dbName()).
@@ -125,6 +136,7 @@ func runApp(cmd *cobra.Command, _ []string) error {
 			TLSKey:  generalTLSKey,
 		}).
 		WithAuth(generalAuth).
+		WithBootstrapAdminToken(bootstrap).
 		WithVersion(getVersion()).
 		Build(ctx)
 	if err != nil {

@@ -5,7 +5,8 @@
 # environment variables (TRANSPORT, PORT, DB_NAME, ...); see DOCKERHUB.md.
 # HOST=0.0.0.0 makes the server reachable from outside the container, so
 # under AUTH=auto clients need a token and the container exits at start
-# while no user exists: create one, or set AUTH=off on a trusted network.
+# while no user exists: set BOOTSTRAP_ADMIN_TOKEN (or _FILE), create one
+# with "cachydb utils user add", or set AUTH=off on a trusted network.
 #
 # Build:   docker build --build-arg VERSION=v0.0.4 -t cachydb .
 # Release: .github/workflows/docker.yml builds linux/amd64 and linux/arm64

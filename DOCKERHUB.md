@@ -4,8 +4,9 @@ A lightweight document database with a built-in
 [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server,
 written in Go. Databases hold collections of JSON documents, with optional
 schemas and hash indexes. Every acknowledged write is fsynced to a
-write-ahead log first, so it survives a crash. AI agents use it through 12
-MCP tools (create collections, insert, find, update, delete, index).
+write-ahead log first, so it survives a crash. AI agents use it through 21
+MCP tools (create collections, insert, find, update, delete, index), with
+users, tokens, and per-database access when it serves other machines.
 
 - Source and full documentation: <https://github.com/hop-/cachydb>
 - Small static image: distroless, no shell, runs as the non-root user
@@ -17,22 +18,42 @@ MCP tools (create collections, insert, find, update, delete, index).
 ### HTTP (a long-running server)
 
 ```bash
+# Tokens required: the server admin "admin" holds the token you choose
+TOKEN="$(openssl rand -hex 32)"; echo "$TOKEN"   # keep it
+docker run -d --name cachydb -p 7601:7601 -v cachydb-data:/data \
+  -e BOOTSTRAP_ADMIN_TOKEN="$TOKEN" hovhannespalyan/cachydb
+
+# Local use without tokens: localhost only
 docker run -d --name cachydb -p 127.0.0.1:7601:7601 -v cachydb-data:/data \
   -e AUTH=off hovhannespalyan/cachydb
 ```
 
 The MCP endpoint is `http://localhost:7601/mcp` (Streamable HTTP). Many
-clients can connect at once. Data lives in the `cachydb-data` volume and
-survives container restarts and upgrades.
+clients can connect at once; with tokens they send
+`Authorization: Bearer <token>`. Data lives in the `cachydb-data` volume
+and survives container restarts and upgrades.
 
 **A container needs a user or `AUTH=off`.** The image listens on every
 interface of the container (`HOST=0.0.0.0`), so by default (`AUTH=auto`)
 clients need a token, and the container exits at start with *"refusing
-to start: ... no user exists"* until a user exists. Create the first
-admin with `cachydb utils user add NAME --admin` on the stopped volume,
-or set `BOOTSTRAP_ADMIN_TOKEN`; or, as above, set `AUTH=off`, which is
-only safe when the port is published on localhost or a trusted network
-(cachydb logs a warning). `/healthz` never needs a token.
+to start: ... no user exists"* until a user exists. Set
+`BOOTSTRAP_ADMIN_TOKEN` (or `BOOTSTRAP_ADMIN_TOKEN_FILE`, a mounted file
+or Docker secret holding it): every start makes sure the server admin
+`admin` holds that token, and a changed value replaces the old one. Or
+create users with `cachydb utils user add NAME --admin` on the stopped
+volume. Or set `AUTH=off`, which is only safe when the port is published
+on localhost or a trusted network (cachydb logs a warning). Use TLS
+(`TLS_CERT`, `TLS_KEY`) when clients on other machines connect.
+`/healthz` never needs a token.
+
+Server admins then manage users over MCP (`create_user`, `set_access`,
+`create_token`, ...; other users do not see these tools), for example
+with the image's own client:
+
+```bash
+docker exec -e CACHYDB_TOKEN="$TOKEN" cachydb cachydb client call create_user '{"name":"alice"}'
+docker exec -e CACHYDB_TOKEN="$TOKEN" cachydb cachydb client call set_access '{"user":"alice","database":"main","level":"write"}'
+```
 
 ### stdio (the agent starts the container)
 
@@ -67,6 +88,8 @@ Configure the container with environment variables:
 | `PORT` | `7601` | HTTP port inside the container (path `/mcp`) |
 | `AUTH` | `auto` | `auto`: tokens for HTTP on a non-loopback host (the image's case); `required`: always for HTTP; `off`: never (logs a warning on a non-loopback host) |
 | `TLS_CERT`, `TLS_KEY` | none | PEM certificate and key files (mount them); with both, the server serves HTTPS. One without the other is an error |
+| `BOOTSTRAP_ADMIN_TOKEN` | none | At every start, make sure the server admin `admin` exists and holds this token (32 to 512 characters, e.g. `openssl rand -hex 32`); never logged |
+| `BOOTSTRAP_ADMIN_TOKEN_FILE` | none | A file holding the bootstrap token (e.g. `/run/secrets/...`); not together with `BOOTSTRAP_ADMIN_TOKEN` |
 | `ROOT_DIR` | `/data` | Data directory. Keep it at `/data`, the volume |
 | `DB_NAME` | `main` | Default database, created at startup if missing |
 | `WAL_RETENTION_AGE` | `24h` | Keep processed WAL this long; `0` = no age limit |
@@ -158,7 +181,7 @@ services:
       - cachydb-data:/data
     environment:
       DB_NAME: main
-      AUTH: "off"               # or create a user and remove this line
+      AUTH: "off"               # or set BOOTSTRAP_ADMIN_TOKEN and remove this line
     restart: unless-stopped
 
 volumes:
@@ -227,7 +250,7 @@ several clients, or give each stdio client its own volume.
 
 - The image documents itself:
   `docker run --rm hovhannespalyan/cachydb docs` lists the topics
-  (overview, quickstart, mcp, tools, query, schema, config, errors). Over
+  (overview, quickstart, mcp, tools, query, schema, config, access, errors). Over
   MCP they are the resources `cachydb://docs/<topic>`.
 - README, storage design and the Go library API:
   <https://github.com/hop-/cachydb>

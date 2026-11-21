@@ -129,10 +129,18 @@ var errNoPrincipal = errors.New("the call has no principal")
 // tokens are not required (stdio, loopback HTTP, AUTH=off). An HTTP call
 // that should carry a token but carries none is refused.
 func (s *Server) principal(req *mcp.CallToolRequest) (auth.Principal, error) {
-	if req != nil && req.Extra != nil && req.Extra.TokenInfo != nil && s.users != nil {
+	if req == nil {
+		return s.principalOf(nil)
+	}
+	return s.principalOf(req.Extra)
+}
+
+// principalOf is principal for the extra data of any request.
+func (s *Server) principalOf(extra *mcp.RequestExtra) (auth.Principal, error) {
+	if extra != nil && extra.TokenInfo != nil && s.users != nil {
 		// Re-read by name: a user removed after its token was checked
 		// fails here (auth.ErrUnauthenticated).
-		return s.users.Principal(req.Extra.TokenInfo.UserID)
+		return s.users.Principal(extra.TokenInfo.UserID)
 	}
 	if s.tokensRequired && s.transport == "http" {
 		return auth.Principal{}, fmt.Errorf("%w: the request has no bearer token", auth.ErrUnauthenticated)

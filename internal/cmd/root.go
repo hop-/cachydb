@@ -32,7 +32,7 @@ Data:
 
 For AI agents:
   Run "cachydb docs" to list the built-in topics (overview, quickstart,
-  mcp, tools, query, schema, config, errors), for example
+  mcp, tools, query, schema, config, access, errors), for example
   "cachydb docs quickstart" or "cachydb docs tools --format json". Over
   MCP, read the resources cachydb://docs/<topic>.
 

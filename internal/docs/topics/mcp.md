@@ -1,7 +1,7 @@
 ---
 name: mcp
 title: Using cachydb as an MCP server
-summary: stdio vs Streamable HTTP, listen host, tokens and TLS, client configuration examples (incl. Docker), health checks, per-session databases, the data-directory lock, cachydb client, and the 21 tools by task
+summary: stdio vs Streamable HTTP, listen host, tokens and TLS, client configuration examples (incl. Docker and tokens), health checks, per-session databases, the data-directory lock, cachydb client, and the tools by task
 ---
 <!--
 Client config formats checked on 2026-11-01 against the official docs:
@@ -35,7 +35,9 @@ Clients send `Authorization: Bearer <token>`; without a valid token
 refuses to start: create the first admin with
 `cachydb utils user add NAME --admin` (server stopped), set
 `BOOTSTRAP_ADMIN_TOKEN`, or set `AUTH=off` on a trusted network only.
-See `cachydb docs config`.
+With tokens, each user sees and uses only the databases it has access
+to, `whoami` shows that access, and server admins also get the user
+tools. See `cachydb docs config` and `cachydb docs access`.
 
 Use absolute paths in client configs. Replace `/path/to/cachydb` with the
 binary's location (`which cachydb`) and `/path/to/data` with the data
@@ -49,6 +51,9 @@ claude mcp add --transport stdio cachydb -- /path/to/cachydb -R /path/to/data
 
 # HTTP (start `cachydb -t http -p 7601` separately)
 claude mcp add --transport http cachydb http://localhost:7601/mcp
+
+# HTTP on a server that requires tokens
+claude mcp add --transport http cachydb https://db.example:7601/mcp --header "Authorization: Bearer <token>"
 ```
 
 Add `--scope project` to share it through the project's `.mcp.json`, or
@@ -131,8 +136,18 @@ variables (see `cachydb docs config`).
 
 The image listens on every interface (`HOST=0.0.0.0`), so **a container
 needs a user or `AUTH=off`**: without either it exits at start with the
-refusal message. For local use, publish the port on localhost and set
-`AUTH=off`:
+refusal message. To require tokens, give it a bootstrap admin token (see
+`cachydb docs access`):
+
+```bash
+# HTTP server with tokens; the admin's token is the value you chose
+docker run -d --name cachydb -p 7601:7601 -v cachydb-data:/data \
+  -e BOOTSTRAP_ADMIN_TOKEN="$(openssl rand -hex 32)" hovhannespalyan/cachydb
+```
+
+Use TLS (`TLS_CERT`, `TLS_KEY`) or a trusted network when clients on
+other machines connect. For local use, publish the port on localhost and
+set `AUTH=off`:
 
 ```bash
 # HTTP server: http://localhost:7601/mcp, no tokens
@@ -192,7 +207,8 @@ Every data tool resolves its database in this order:
 
 1. the tool's `database` argument, if given;
 2. the database this session chose with `use_database`;
-3. the server default (`main`, or `-d/--db`).
+3. the user's default database (only when the server requires tokens);
+4. the server default (`main`, or `-d/--db`).
 
 The `use_database` choice belongs to one MCP session: other sessions
 (other HTTP clients) are not affected. `current_database` reports it.
@@ -230,8 +246,10 @@ retry.
 | Indexes | `create_index`, `drop_index` |
 | Writing | `insert_document`, `update_document` (`updates`, `unset`, `if`, `upsert`), `replace_document`, `delete_document` (`if`) |
 | Reading | `find_documents` (`filters`, `any`, `sort`, `fields`, `limit`, `skip`), `count_documents`, `distinct` |
+| Users (only when the server requires tokens) | `whoami` (everyone); `list_users`, `create_user`, `set_access`, `create_token`, `revoke_token`, `delete_user` (server admins; hidden from other users) |
 
-`cachydb docs tools` has every schema and an example call.
+`cachydb docs tools` has every schema and an example call; the user tools
+are in `cachydb docs access`.
 
 ## Self-description
 

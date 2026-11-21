@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hop-/cachydb/internal/exportfmt"
@@ -35,12 +37,19 @@ shell scripts and agents without MCP support call every tool.
 
 The server address is --url, else the environment variable CACHYDB_URL,
 else ` + defaultClientURL + `. Start the server with
-"cachydb -t http -p 7601".`,
+"cachydb -t http -p 7601".
+
+A server that requires tokens needs --token, or the environment variable
+CACHYDB_TOKEN (preferred: a flag shows in the process list); it is sent
+as "Authorization: Bearer <token>" on every request. Use https:// for a
+server on another machine, so the token is not sent in clear text. See
+"cachydb docs access".`,
 	Example: `  cachydb client tools
   cachydb client call find_documents '{"database":"kb","collection":"notes","query":{"limit":5}}'
   echo '{"collection":"notes"}' | cachydb client call count_documents -
   cachydb client export -d kb -o kb.jsonl
-  cachydb client import -i kb.jsonl --on-conflict skip --url http://db-host:7601/mcp`,
+  cachydb client import -i kb.jsonl --on-conflict skip --url http://db-host:7601/mcp
+  CACHYDB_TOKEN="$TOKEN" cachydb client call whoami --url https://db-host:7601/mcp`,
 }
 
 var clientToolsCmd = &cobra.Command{
@@ -151,11 +160,13 @@ rules and --on-conflict modes as "cachydb utils import".`,
 
 var (
 	clientURLFlag     string
+	clientTokenFlag   string
 	clientToolsFormat string
 )
 
 func init() {
 	clientCmd.PersistentFlags().StringVar(&clientURLFlag, "url", "", "server MCP endpoint (env CACHYDB_URL; default "+defaultClientURL+")")
+	clientCmd.PersistentFlags().StringVar(&clientTokenFlag, "token", "", "token for a server that requires one, sent as a bearer token (env CACHYDB_TOKEN, preferred)")
 	clientToolsCmd.Flags().StringVarP(&clientToolsFormat, "format", "f", "text", "output format: text or json")
 	clientExportCmd.Flags().StringVarP(&exportDatabase, "database", "d", "", "export only this database")
 	clientExportCmd.Flags().StringVarP(&exportCollection, "collection", "c", "", "export only this collection (requires -d)")
@@ -178,12 +189,68 @@ func clientURL() string {
 	return defaultClientURL
 }
 
-// withClient connects to the server at url, calls fn, and closes the
-// session.
+// clientToken returns the token: --token, else CACHYDB_TOKEN, else "".
+func clientToken() string {
+	if clientTokenFlag != "" {
+		return clientTokenFlag
+	}
+	return os.Getenv("CACHYDB_TOKEN")
+}
+
+// bearerTransport sends token (if any) as a bearer token on every request
+// and remembers whether the server answered 401 Unauthorized.
+type bearerTransport struct {
+	token        string
+	base         http.RoundTripper
+	unauthorized atomic.Bool
+}
+
+func (t *bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if t.token != "" {
+		// A RoundTripper must not modify the caller's request.
+		r = r.Clone(r.Context())
+		r.Header.Set("Authorization", "Bearer "+t.token)
+	}
+	resp, err := t.base.RoundTrip(r)
+	if err == nil && resp.StatusCode == http.StatusUnauthorized {
+		t.unauthorized.Store(true)
+	}
+	return resp, err
+}
+
+// authHint explains a 401 answer, naming the flag; "" if there was none.
+func (t *bearerTransport) authHint() string {
+	switch {
+	case !t.unauthorized.Load():
+		return ""
+	case t.token == "":
+		return "the server requires a token: pass --token or set CACHYDB_TOKEN"
+	default:
+		return "the server rejected the token (unknown or revoked): check --token / CACHYDB_TOKEN"
+	}
+}
+
+// withClient connects to the server at url, sending the token of
+// clientToken, calls fn, and closes the session. An error after a 401
+// answer carries a hint that names --token.
 func withClient(ctx context.Context, url string, fn func(*mcp.ClientSession) error) (err error) {
+	rt := &bearerTransport{token: clientToken(), base: http.DefaultTransport}
+	defer func() {
+		if hint := rt.authHint(); err != nil && hint != "" {
+			err = fmt.Errorf("%s: %w", hint, err)
+		}
+	}()
 	client := mcp.NewClient(&mcp.Implementation{Name: "cachydb-client", Version: getVersion()}, nil)
-	cs, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: url, DisableStandaloneSSE: true, MaxRetries: -1}, nil)
+	cs, err := client.Connect(ctx, &mcp.StreamableClientTransport{
+		Endpoint:             url,
+		HTTPClient:           &http.Client{Transport: rt},
+		DisableStandaloneSSE: true,
+		MaxRetries:           -1,
+	}, nil)
 	if err != nil {
+		if rt.authHint() != "" {
+			return fmt.Errorf("connecting to the cachydb server at %s: %w", url, err)
+		}
 		return fmt.Errorf("connecting to the cachydb server at %s (start one with \"cachydb -t http\", or set --url / CACHYDB_URL): %w", url, err)
 	}
 	defer func() {

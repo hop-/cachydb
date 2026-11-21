@@ -49,6 +49,13 @@ When tokens are required and no user exists the server exits 1 with
 ...; or ... AUTH=off (--auth off)"*. `--auth off` on a non-loopback host
 starts and logs a WARN.
 
+`BOOTSTRAP_ADMIN_TOKEN`, or `BOOTSTRAP_ADMIN_TOKEN_FILE` naming a file
+that holds it (env only, no flag; both set is an error), makes every
+start ensure the server admin `admin` holds that token (label
+`bootstrap`; a changed value replaces the old token; 32 to 512 `b64token`
+characters). It is applied in every mode and never logged; see
+[MCP_SERVER.md](MCP_SERVER.md#when-tokens-are-required).
+
 ### `cachydb docs`
 
 Prints the built-in, agent-facing documentation (`internal/docs`). It never
@@ -68,8 +75,10 @@ cachydb docs --format json           # index: [{"name","title","summary"}]
 | `--format` | `-f` | `md` | `md` or `json` |
 
 Topics, in order: `overview`, `quickstart`, `mcp`, `tools`, `query`,
-`schema`, `config`, `errors`. The `tools` topic is generated from
-`mcpserver.ToolDefinitions()`; in JSON it adds
+`schema`, `config`, `access`, `errors`. The `tools` topic is generated
+from `mcpserver.ToolDefinitions()`, and the `access` topic ends with the
+generated reference of the user tools (`mcpserver.AccessToolDocs()`,
+markdown only); in JSON the `tools` topic adds
 `"tools":[{"name","description","annotations","inputSchema","outputSchema","example"}]`.
 An unknown topic exits 1 with the topic list on stderr and nothing on
 stdout. The same topics are MCP resources `cachydb://docs/<topic>` (see
@@ -272,12 +281,40 @@ not older than the segments, and that the data `index.db` does not cover
   or when the check could not run (a locked or incompatible directory, an
   unknown `-d`/`-c`). At most 1,000 problems are listed.
 
+### `cachydb utils user` (`user.go`)
+
+```
+cachydb utils user add NAME [--admin] [--default-database DB]
+cachydb utils user list [--format text|json]
+cachydb utils user remove NAME
+cachydb utils user grant NAME DATABASE read|write|admin
+cachydb utils user revoke NAME DATABASE
+cachydb utils user token add NAME [--label L]
+cachydb utils user token revoke NAME LABEL
+```
+
+Offline user management (`withUsers`: `withEngine` plus `auth.Open`,
+which creates `_system` if missing). `add` and `token add` print the new
+token exactly once, alone on stdout (so `TOKEN="$(…)"` works), with a
+note on stderr. `list` prints a table (name, server admin, default
+database, grants as `db=level`, token labels) or, with `--format json`,
+the `list_users` user objects (`mcpserver.NewUserInfo`); never tokens or
+digests. `DATABASE` `*` is every database. `remove` (and demoting over
+MCP) of the only server admin fails with `auth.ErrLastServerAdmin`;
+`revoke` of a missing grant fails with not found. Every change is logged
+at INFO through the engine logger (actor `cachydb utils user`).
+
 ### `cachydb client` (`client.go`)
 
 An MCP client (go-sdk `mcp.NewClient` + `StreamableClientTransport`, no
 standalone SSE, no retries) for a running `cachydb -t http` server.
 `--url` (persistent), else `CACHYDB_URL`, else
-`http://127.0.0.1:7601/mcp`.
+`http://127.0.0.1:7601/mcp`. `--token` (persistent), else
+`CACHYDB_TOKEN`, is sent as `Authorization: Bearer` on every request by
+`bearerTransport`, a `RoundTripper` in
+`StreamableClientTransport.HTTPClient`; it records a 401 answer, and
+`withClient` then prefixes the error with a hint naming `--token` /
+`CACHYDB_TOKEN` (no token given, or the token was rejected).
 
 | Subcommand | Behavior |
 |------------|----------|
@@ -308,6 +345,9 @@ status 1 and an error that names the variable.
 | `WAL_RETENTION_SIZE` | `1GiB` | `--wal-retention-size` |
 | `CACHE_SIZE` | `64MiB` | `--cache-size` |
 | `CACHYDB_URL` | `http://127.0.0.1:7601/mcp` | `cachydb client --url` (read by `client` only) |
+| `CACHYDB_TOKEN` | none | `cachydb client --token` (read by `client` only) |
+| `BOOTSTRAP_ADMIN_TOKEN` | none | none (a secret; env only) |
+| `BOOTSTRAP_ADMIN_TOKEN_FILE` | none | none |
 
 Precedence: flag > environment variable > default.
 
@@ -345,6 +385,7 @@ main.go → cmd.Execute()
       App.Start(ctx)                    # until signal / stdin EOF (exit 0) / error
       App.Stop(WithoutCancel(ctx))      # 10s: sessions, Engine.Close
     runList / runMigrate                # utils: withEngine(Open … Close)
+    utils user …                        # withUsers: withEngine + auth.Open (creates _system)
     utils export/import/find/get        # withEngine; exportfmt.Engine adapter
     utils verify                        # db.Verify: lock, read-only checks (or rebuild); no recovery
     client tools/call/export/import     # withClient: MCP over Streamable HTTP; never opens the engine

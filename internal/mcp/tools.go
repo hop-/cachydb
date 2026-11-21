@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -64,17 +65,17 @@ type SchemaDef struct {
 }
 
 type CreateCollectionInput struct {
-	Database string     `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
+	Database string     `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Name     string     `json:"name" jsonschema:"Collection name: letters, digits, _ and -, starting with a letter or digit, at most 64 characters"`
 	Schema   *SchemaDef `json:"schema,omitempty" jsonschema:"Optional schema, checked on every insert and update; change it later with update_schema. Omit for a schemaless collection"`
 }
 
 type ListCollectionsInput struct {
-	Database string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
+	Database string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 }
 
 type InsertDocumentInput struct {
-	Database   string         `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
+	Database   string         `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string         `json:"collection" jsonschema:"Collection name"`
 	Document   map[string]any `json:"document" jsonschema:"The document as a JSON object. A string _id sets the document id; without one a UUID is generated. {\"$now\": true} is the server's current time"`
 }
@@ -110,13 +111,13 @@ type MatchQuery struct {
 }
 
 type FindDocumentsInput struct {
-	Database   string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
+	Database   string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string `json:"collection" jsonschema:"Collection name"`
 	Query      *Query `json:"query,omitempty" jsonschema:"Filters, OR groups, projection, sort, limit, and skip; omit to return every document"`
 }
 
 type UpdateDocumentInput struct {
-	Database   string         `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
+	Database   string         `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string         `json:"collection" jsonschema:"Collection name"`
 	ID         string         `json:"id" jsonschema:"Document _id"`
 	Updates    map[string]any `json:"updates,omitempty" jsonschema:"Top-level fields to set (replaced or added); other fields are kept; _id cannot be changed. {\"$now\": true} is the server's current time"`
@@ -126,7 +127,7 @@ type UpdateDocumentInput struct {
 }
 
 type ReplaceDocumentInput struct {
-	Database   string         `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
+	Database   string         `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string         `json:"collection" jsonschema:"Collection name"`
 	ID         string         `json:"id" jsonschema:"_id of the existing document to replace"`
 	Document   map[string]any `json:"document" jsonschema:"The new document; its _id, if given, must equal id. {\"$now\": true} is the server's current time"`
@@ -134,62 +135,62 @@ type ReplaceDocumentInput struct {
 }
 
 type DeleteDocumentInput struct {
-	Database   string   `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
+	Database   string   `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string   `json:"collection" jsonschema:"Collection name"`
 	ID         string   `json:"id" jsonschema:"Document _id"`
 	If         []Filter `json:"if,omitempty" jsonschema:"Condition: the stored document must match all of these filters, or nothing is deleted"`
 }
 
 type CountDocumentsInput struct {
-	Database   string      `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
+	Database   string      `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string      `json:"collection" jsonschema:"Collection name"`
 	Query      *MatchQuery `json:"query,omitempty" jsonschema:"Filters and OR groups; omit to count every document"`
 }
 
 type DistinctInput struct {
-	Database   string      `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
+	Database   string      `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string      `json:"collection" jsonschema:"Collection name"`
 	Field      string      `json:"field" jsonschema:"Top-level field whose distinct values to list; array values contribute each element"`
 	Query      *MatchQuery `json:"query,omitempty" jsonschema:"Filters and OR groups selecting the documents; omit for every document"`
 }
 
 type DescribeCollectionInput struct {
-	Database   string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
+	Database   string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string `json:"collection" jsonschema:"Collection name"`
 }
 
 type UpdateSchemaInput struct {
-	Database   string     `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
+	Database   string     `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string     `json:"collection" jsonschema:"Collection name"`
 	Schema     *SchemaDef `json:"schema" jsonschema:"The new schema, or null to remove it; every existing document must satisfy it"`
 }
 
 type RenameCollectionInput struct {
-	Database   string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
+	Database   string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string `json:"collection" jsonschema:"Collection to rename"`
 	NewName    string `json:"new_name" jsonschema:"New collection name in the same database; must not exist"`
 }
 
 type CopyCollectionInput struct {
-	Database       string `json:"database,omitempty" jsonschema:"Database of the source collection; defaults to the session's use_database choice, then the server default"`
+	Database       string `json:"database,omitempty" jsonschema:"Database of the source collection; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection     string `json:"collection" jsonschema:"Source collection"`
 	NewName        string `json:"new_name" jsonschema:"Name of the new collection; must not exist"`
 	TargetDatabase string `json:"target_database,omitempty" jsonschema:"Existing database for the copy; defaults to the source database"`
 }
 
 type DeleteCollectionInput struct {
-	Database   string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
+	Database   string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string `json:"collection" jsonschema:"Collection to delete with all its documents and indexes"`
 }
 
 type DropIndexInput struct {
-	Database   string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
+	Database   string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string `json:"collection" jsonschema:"Collection name"`
 	IndexName  string `json:"index_name" jsonschema:"Name of the index to drop"`
 }
 
 type CreateIndexInput struct {
-	Database   string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the server default"`
+	Database   string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string `json:"collection" jsonschema:"Collection name"`
 	IndexName  string `json:"index_name" jsonschema:"Index name: letters, digits, _ and -, starting with a letter or digit, at most 64 characters"`
 	FieldName  string `json:"field_name" jsonschema:"Top-level field to index"`
@@ -216,7 +217,7 @@ type UseDatabaseOutput struct {
 
 type CurrentDatabaseOutput struct {
 	Success         bool   `json:"success" jsonschema:"Always true on success"`
-	CurrentDatabase string `json:"current_database" jsonschema:"The session's use_database choice, or the server default"`
+	CurrentDatabase string `json:"current_database" jsonschema:"The session's use_database choice, else the user's default database, else the server default"`
 }
 
 type ListCollectionsOutput struct {
@@ -283,15 +284,19 @@ type toolSpec struct {
 	// databaseArg: the tool's input has a "database" argument (implements
 	// databaseArg); see validate.
 	databaseArg bool
-	register    func(s *Server, srv *mcp.Server, t *mcp.Tool)
+	// admin: a user-management tool, listed only to server admins (see
+	// adminOnly and filterToolsList).
+	admin    bool
+	register func(s *Server, srv *mcp.Server, t *mcp.Tool)
 }
 
-// schemaOptions renders Operator, FieldType, and SortOrder as string
-// enums.
+// schemaOptions renders Operator, FieldType, SortOrder, and AccessLevel
+// as string enums.
 var schemaOptions = &jsonschema.ForOptions{TypeSchemas: map[reflect.Type]*jsonschema.Schema{
-	reflect.TypeFor[Operator]():  {Type: "string", Enum: toAny(Operators)},
-	reflect.TypeFor[FieldType](): {Type: "string", Enum: toAny(FieldTypes)},
-	reflect.TypeFor[SortOrder](): {Type: "string", Enum: toAny(SortOrders)},
+	reflect.TypeFor[Operator]():    {Type: "string", Enum: toAny(Operators)},
+	reflect.TypeFor[FieldType]():   {Type: "string", Enum: toAny(FieldTypes)},
+	reflect.TypeFor[SortOrder]():   {Type: "string", Enum: toAny(SortOrders)},
+	reflect.TypeFor[AccessLevel](): {Type: "string", Enum: toAny(AccessLevels)},
 }}
 
 func toAny(ss []string) []any {
@@ -364,7 +369,9 @@ func newSpec[In, Out any](
 	}
 }
 
-// toolSpecs returns every tool, in the order they are listed in docs.
+// toolSpecs returns every tool the server always registers, in the order
+// they are listed in docs. The user tools (accessToolSpecs) come on top
+// when the server requires tokens.
 func toolSpecs() []toolSpec {
 	return []toolSpec{
 		newSpec("list_databases",
@@ -386,7 +393,7 @@ func toolSpecs() []toolSpec {
 			writing("Use database", false, true), accessNone, map[string]any{"name": "shop"},
 			func(s *Server) mcp.ToolHandlerFor[UseDatabaseInput, UseDatabaseOutput] { return s.useDatabaseTool }),
 		newSpec("current_database",
-			"Return the database that calls without a database argument use: this session's use_database choice, or the server default.",
+			"Return the database that calls without a database argument use: this session's use_database choice, else the user's default database (when the server requires tokens), else the server default.",
 			readOnly("Current database"), accessNone, map[string]any{},
 			func(s *Server) mcp.ToolHandlerFor[CurrentDatabaseInput, CurrentDatabaseOutput] {
 				return s.currentDatabaseTool
@@ -508,8 +515,10 @@ func toolSpecs() []toolSpec {
 }
 
 // ToolDefinitions returns the definition of every MCP tool the server
-// registers: name, description, annotations, and input and output JSON
-// Schemas. It needs no engine. The returned tools are fresh copies.
+// always registers: name, description, annotations, and input and output
+// JSON Schemas. It needs no engine. The returned tools are fresh copies.
+// The user tools, registered only when the server requires tokens, are
+// documented by AccessToolDocs.
 func ToolDefinitions() []*mcp.Tool {
 	specs := toolSpecs()
 	out := make([]*mcp.Tool, len(specs))
@@ -519,17 +528,26 @@ func ToolDefinitions() []*mcp.Tool {
 	return out
 }
 
-// registerTools registers every tool of toolSpecs on srv. It registers
-// nothing and fails if any tool lacks a valid access level (see
-// toolSpec.validate).
+// registerTools registers every tool of toolSpecs on srv and, when the
+// server requires tokens, the user tools of accessToolSpecs, remembering
+// which of them are admin tools. It registers nothing and fails if any
+// tool lacks a valid access level (see toolSpec.validate).
 func (s *Server) registerTools(srv *mcp.Server) error {
 	specs := toolSpecs()
-	for _, sp := range specs {
+	access := accessToolSpecs()
+	for _, sp := range slices.Concat(specs, access) {
 		if err := sp.validate(); err != nil {
 			return err
 		}
 	}
+	if s.tokensRequired {
+		specs = append(specs, access...)
+	}
+	s.adminTools = make(map[string]bool)
 	for _, sp := range specs {
+		if sp.admin {
+			s.adminTools[sp.tool.Name] = true
+		}
 		sp.register(s, srv, sp.tool)
 	}
 	return nil
