@@ -209,6 +209,52 @@ var crashOps = []struct {
 		apply: func(m model) { delete(m["app"]["c"].docs, "d") },
 	},
 	{
+		// One batch record (op 11) with every kind of operation: all of it
+		// lands or none (plan 013 §3.1).
+		name: "batch",
+		run: func(ctx context.Context, _ *Database, c *Collection) error {
+			_, err := c.Batch(ctx, []WriteOp{
+				{Kind: OpInsert, Document: &Document{ID: "new", Data: map[string]any{"g": "z", "v": 9}}},
+				{Kind: OpUpdate, ID: "u", Update: UpdateSpec{Set: map[string]any{"g": "y"}, Unset: []string{"v"}}},
+				{Kind: OpReplace, ID: "m", Document: &Document{Data: map[string]any{"g": "x", "r": true}}},
+				{Kind: OpDelete, ID: "d"},
+				{Kind: OpUpdate, ID: "ups", Update: UpdateSpec{Set: map[string]any{"g": "w"}, Upsert: true}},
+			})
+			return err
+		},
+		apply: func(m model) {
+			docs := m["app"]["c"].docs
+			docs["new"] = map[string]any{"g": "z", "v": 9}
+			docs["u"] = map[string]any{"g": "y"}
+			docs["m"] = map[string]any{"g": "x", "r": true}
+			delete(docs, "d")
+			docs["ups"] = map[string]any{"g": "w"}
+		},
+	},
+	{
+		name: "update_many",
+		run: func(ctx context.Context, _ *Database, c *Collection) error {
+			_, _, err := c.UpdateMany(ctx, &Query{Filters: []QueryFilter{eqf("g", "x")}}, UpdateSpec{Set: map[string]any{"h": 1}, Unset: []string{"v"}}, 0)
+			return err
+		},
+		apply: func(m model) {
+			docs := m["app"]["c"].docs
+			docs["u"] = map[string]any{"g": "x", "h": 1}
+			docs["d"] = map[string]any{"g": "x", "h": 1}
+		},
+	},
+	{
+		name: "delete_many",
+		run: func(ctx context.Context, _ *Database, c *Collection) error {
+			_, _, err := c.DeleteMany(ctx, &Query{Filters: []QueryFilter{eqf("g", "y")}}, 0)
+			return err
+		},
+		apply: func(m model) {
+			delete(m["app"]["c"].docs, "k")
+			delete(m["app"]["c"].docs, "m")
+		},
+	},
+	{
 		name: "create_coll_schema",
 		meta: true,
 		run: func(ctx context.Context, d *Database, _ *Collection) error {

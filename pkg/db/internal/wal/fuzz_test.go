@@ -20,6 +20,7 @@ func fuzzRecords() []Record {
 		{Offset: 3, Time: time.Unix(0, 1_700_000_000_000_000_002), Op: OpPutDoc, DB: "main", Coll: "users", ID: "u1", Payload: []byte(`{"_id":"u1","name":"Ann","tags":["a","b"]}`)},
 		{Offset: 4, Time: time.Unix(0, 1_700_000_000_000_000_003), Op: OpDeleteDoc, DB: "main", Coll: "users", ID: "u1"},
 		{Offset: 5, Time: time.Unix(0, -1), Op: OpRenameColl, DB: "main", Coll: "users", Payload: []byte(`{"new_name":"people"}`)},
+		{Offset: 6, Time: time.Unix(0, 1_700_000_000_000_000_004), Op: OpBatch, DB: "main", Coll: "users", Payload: testBatchPayload()},
 	}
 }
 
@@ -160,6 +161,63 @@ func FuzzWALSegmentRead(f *testing.F) {
 			if r.Offset != uint64(i+1) {
 				t.Fatalf("record %d has offset %d", i, r.Offset)
 			}
+		}
+	})
+}
+
+// FuzzBatchPayload checks that DecodeBatch never panics, fails only with
+// errBadBatch, and that every payload it accepts holds only valid items
+// and re-encodes (AppendBatch) to exactly the same bytes, whose size
+// BatchPayloadSize predicts.
+func FuzzBatchPayload(f *testing.F) {
+	valid, err := AppendBatch(nil, testBatchItems())
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(valid)
+	f.Add(valid[:len(valid)-1])           // truncated
+	f.Add(append(bytes.Clone(valid), 0))  // trailing byte
+	f.Add([]byte{0, 0, 0, 0})             // empty batch
+	f.Add([]byte{0xff, 0xff, 0xff, 0xff}) // a huge count
+	f.Add([]byte{})
+	for _, at := range []int{0, 4, 5, 7, len(valid) / 2} {
+		b := bytes.Clone(valid)
+		b[at] ^= 0x10
+		f.Add(b)
+	}
+
+	f.Fuzz(func(t *testing.T, payload []byte) {
+		items, err := DecodeBatch(payload)
+		if err != nil {
+			if !errors.Is(err, errBadBatch) {
+				t.Fatalf("DecodeBatch error %v does not wrap errBadBatch", err)
+			}
+			return
+		}
+		for i := range items {
+			if err := checkBatchItem(&items[i]); err != nil {
+				t.Fatalf("accepted item %d is invalid: %v", i, err)
+			}
+		}
+		enc, err := AppendBatch(nil, items)
+		if err != nil {
+			t.Fatalf("AppendBatch of accepted items: %v", err)
+		}
+		if !bytes.Equal(enc, payload) {
+			t.Fatalf("re-encoded payload differs:\n got %x\nwant %x", enc, payload)
+		}
+		if n := BatchPayloadSize(items); n != int64(len(payload)) {
+			t.Fatalf("BatchPayloadSize = %d, payload is %d bytes", n, len(payload))
+		}
+		// A batch record carrying the payload is a valid WAL record that
+		// round-trips through the record codec.
+		r := Record{Offset: 1, Op: OpBatch, DB: "d", Coll: "c", Payload: payload}
+		if err := validateRecord(&r); err != nil {
+			t.Fatalf("batch record with an accepted payload does not validate: %v", err)
+		}
+		got, err := decodeBody(appendRecord(nil, &r)[recordHeaderSize:])
+		if err != nil || !bytes.Equal(got.Payload, payload) {
+			t.Fatalf("batch record does not round-trip: %v", err)
 		}
 	})
 }

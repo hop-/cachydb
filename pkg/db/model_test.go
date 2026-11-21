@@ -889,10 +889,21 @@ type writeOp struct {
 	apply func(m mState) // applied to a clone when want is "ok"
 }
 
-func (r *modelRun) docWrite() writeOp {
-	cn := modelColls[r.pick(len(modelColls))]
+// docItem is one random document write of id in collection cn: the
+// operation (a batch operation; docWrite runs it as the matching single
+// write), and the model's prediction leaving unique indexes aside: the
+// error class, and the after-image when it is "ok" (del: the document is
+// deleted).
+type docItem struct {
+	desc string
+	op   WriteOp
+	want string
+	next map[string]any
+	del  bool
+}
+
+func (r *modelRun) docItem(cn, id string) docItem {
 	mc := r.m[cn]
-	id := r.id()
 	cur, exists := mc.docs[id]
 	var cond Condition
 	if r.chance(0.35) {
@@ -912,20 +923,15 @@ func (r *modelRun) docWrite() writeOp {
 			want = "exists"
 		case !mValid(mc.schema, data):
 			want = "schema"
-		case mc.mUniqueViolation(id, data):
-			want = "unique"
 		}
-		return writeOp{
+		return docItem{
 			desc: fmt.Sprintf("insert %s/%s %s", cn, id, js(data)),
-			run: func(ctx context.Context) error {
-				_, err := r.coll(cn).Insert(ctx, &Document{ID: id, Data: data})
-				return err
-			},
-			want:  want,
-			apply: func(m mState) { m[cn].docs[id] = data },
+			op:   WriteOp{Kind: OpInsert, Document: &Document{ID: id, Data: data}},
+			want: want,
+			next: data,
 		}
 	case 1: // update
-		u := UpdateSpec{Set: map[string]any{}, If: cond, Upsert: r.chance(0.3)}
+		u := UpdateSpec{Set: map[string]any{}, Upsert: r.chance(0.3)}
 		for _, f := range modelFields {
 			switch {
 			case r.chance(0.35):
@@ -933,6 +939,12 @@ func (r *modelRun) docWrite() writeOp {
 			case r.chance(0.2):
 				u.Unset = append(u.Unset, f)
 			}
+		}
+		op := WriteOp{Kind: OpUpdate, ID: id, Update: u}
+		if r.chance(0.5) {
+			op.Update.If = cond // UpdateSpec.If; otherwise WriteOp.If
+		} else {
+			op.If = cond
 		}
 		var next map[string]any
 		want := "ok"
@@ -953,17 +965,11 @@ func (r *modelRun) docWrite() writeOp {
 		if want == "ok" && !mValid(mc.schema, next) {
 			want = "schema"
 		}
-		if want == "ok" && mc.mUniqueViolation(id, next) {
-			want = "unique"
-		}
-		return writeOp{
+		return docItem{
 			desc: fmt.Sprintf("update %s/%s set=%s unset=%v if=%s upsert=%v", cn, id, js(u.Set), u.Unset, js(cond), u.Upsert),
-			run: func(ctx context.Context) error {
-				_, _, err := r.coll(cn).UpdateWith(ctx, id, u)
-				return err
-			},
-			want:  want,
-			apply: func(m mState) { m[cn].docs[id] = next },
+			op:   op,
+			want: want,
+			next: next,
 		}
 	case 2: // replace
 		data := r.data()
@@ -975,17 +981,12 @@ func (r *modelRun) docWrite() writeOp {
 			want = "not found"
 		case !mValid(mc.schema, data):
 			want = "schema"
-		case mc.mUniqueViolation(id, data):
-			want = "unique"
 		}
-		return writeOp{
+		return docItem{
 			desc: fmt.Sprintf("replace %s/%s %s if=%s", cn, id, js(data), js(cond)),
-			run: func(ctx context.Context) error {
-				_, err := r.coll(cn).Replace(ctx, id, &Document{Data: data}, cond)
-				return err
-			},
-			want:  want,
-			apply: func(m mState) { m[cn].docs[id] = data },
+			op:   WriteOp{Kind: OpReplace, ID: id, Document: &Document{Data: data}, If: cond},
+			want: want,
+			next: data,
 		}
 	default: // delete
 		want := "ok"
@@ -995,12 +996,271 @@ func (r *modelRun) docWrite() writeOp {
 		case !exists:
 			want = "not found"
 		}
-		return writeOp{
-			desc:  fmt.Sprintf("delete %s/%s if=%s", cn, id, js(cond)),
-			run:   func(ctx context.Context) error { return r.coll(cn).DeleteWith(ctx, id, cond) },
-			want:  want,
-			apply: func(m mState) { delete(m[cn].docs, id) },
+		return docItem{
+			desc: fmt.Sprintf("delete %s/%s if=%s", cn, id, js(cond)),
+			op:   WriteOp{Kind: OpDelete, ID: id, If: cond},
+			want: want,
+			del:  true,
 		}
+	}
+}
+
+// docWrite is one random single-document write.
+func (r *modelRun) docWrite() writeOp {
+	cn := modelColls[r.pick(len(modelColls))]
+	mc := r.m[cn]
+	id := r.id()
+	it := r.docItem(cn, id)
+	want := it.want
+	if want == "ok" && !it.del && mc.mUniqueViolation(id, it.next) {
+		want = "unique"
+	}
+	op := it.op
+	return writeOp{
+		desc: it.desc,
+		run: func(ctx context.Context) error {
+			c := r.coll(cn)
+			var err error
+			switch op.Kind {
+			case OpInsert:
+				_, err = c.Insert(ctx, op.Document)
+			case OpUpdate:
+				u := op.Update
+				if len(op.If) > 0 {
+					u.If = op.If
+				}
+				_, _, err = c.UpdateWith(ctx, id, u)
+			case OpReplace:
+				_, err = c.Replace(ctx, id, op.Document, op.If)
+			default:
+				err = c.DeleteWith(ctx, id, op.If)
+			}
+			return err
+		},
+		want: want,
+		apply: func(m mState) {
+			if it.del {
+				delete(m[cn].docs, id)
+			} else {
+				m[cn].docs[id] = it.next
+			}
+		},
+	}
+}
+
+// mUniqueBroken reports whether docs, the documents of c after a change,
+// give a unique index's value to two documents.
+func (c *mColl) mUniqueBroken(docs map[string]map[string]any) bool {
+	after := &mColl{indexes: c.indexes, unique: c.unique, docs: docs}
+	for name, field := range c.indexes {
+		if c.unique[name] && after.mHasDuplicates(field) {
+			return true
+		}
+	}
+	return false
+}
+
+// batchWrite is one random Collection.Batch of 1 to 4 document writes of
+// one collection (plan 013 §3.1): every operation applies or none. The
+// model's prediction follows the documented order: an id repeated in the
+// batch fails that operation with ErrExists; otherwise the first operation
+// that fails (in order) fails the batch; otherwise unique indexes are
+// checked on the batch's final state. A failure must be a *BatchItemError
+// naming the failing operation.
+func (r *modelRun) batchWrite() writeOp {
+	cn := modelColls[r.pick(len(modelColls))]
+	mc := r.m[cn]
+	items := make([]docItem, 1+r.pick(4))
+	ops := make([]WriteOp, len(items))
+	descs := make([]string, len(items))
+	seen := map[string]bool{}
+	dupAt := -1
+	for i := range items {
+		id := r.id()
+		for try := 0; seen[id] && try < 3 && r.chance(0.8); try++ {
+			id = r.id() // repeated ids are rarer than random picks make them
+		}
+		items[i] = r.docItem(cn, id)
+		for try := 0; items[i].want != "ok" && try < 3 && r.chance(0.7); try++ {
+			items[i] = r.docItem(cn, id) // most batches should apply
+		}
+		ops[i], descs[i] = items[i].op, items[i].desc
+		if seen[id] && dupAt < 0 {
+			dupAt = i
+		}
+		seen[id] = true
+	}
+	want, failAt := "ok", -1
+	if dupAt >= 0 {
+		want, failAt = "exists", dupAt
+	} else {
+		for i, it := range items {
+			if it.want != "ok" {
+				want, failAt = it.want, i
+				break
+			}
+		}
+	}
+	final := maps.Clone(mc.docs) // documents are never changed in place
+	if want == "ok" {
+		for i, it := range items {
+			if it.del {
+				delete(final, ops[i].ID)
+			} else {
+				final[docItemID(&ops[i])] = it.next
+			}
+		}
+		if mc.mUniqueBroken(final) {
+			want = "unique"
+		}
+	}
+	return writeOp{
+		desc: fmt.Sprintf("batch %s [%s]", cn, strings.Join(descs, "; ")),
+		run: func(ctx context.Context) error {
+			res, err := r.coll(cn).Batch(ctx, ops)
+			switch {
+			case errors.Is(err, errSimulatedCrash):
+				return err
+			case err == nil && len(res.IDs) != len(ops):
+				return fmt.Errorf("batch result has %d ids for %d operations", len(res.IDs), len(ops))
+			case err == nil:
+				return nil
+			}
+			bie, ok := errors.AsType[*BatchItemError](err)
+			switch {
+			case !ok:
+				return fmt.Errorf("batch error is not a *BatchItemError: %s", err.Error())
+			case failAt >= 0 && bie.Index != failAt:
+				return fmt.Errorf("batch failed at operation %d, want %d: %s", bie.Index, failAt, err.Error())
+			}
+			return err
+		},
+		want: want,
+		apply: func(m mState) {
+			for i, it := range items {
+				if it.del {
+					delete(m[cn].docs, ops[i].ID)
+				} else {
+					m[cn].docs[docItemID(&ops[i])] = it.next
+				}
+			}
+		},
+	}
+}
+
+// docItemID returns the id a docItem operation writes.
+func docItemID(op *WriteOp) string {
+	if op.Kind == OpInsert {
+		return op.Document.ID
+	}
+	return op.ID
+}
+
+// manyWrite is one random UpdateMany or DeleteMany (plan 013 §3.1, "Writes
+// by filter"): every matching document, or the first limit of them in _id
+// order, is changed by one batch. The counts must equal the matches.
+func (r *modelRun) manyWrite() writeOp {
+	cn := modelColls[r.pick(len(modelColls))]
+	mc := r.m[cn]
+	q := &Query{Filters: r.filters(cn, 2)}
+	if r.chance(0.3) {
+		for range 1 + r.pick(2) {
+			q.Any = append(q.Any, r.filters(cn, 2))
+		}
+	}
+	limit := 0
+	if r.chance(0.4) {
+		limit = 1 + r.pick(4)
+	}
+	match := func(extra Condition) []string {
+		var ids []string
+		for _, id := range slices.Sorted(maps.Keys(mc.docs)) {
+			if mMatchQuery(id, mc.docs[id], q) && mMatchAll(id, mc.docs[id], extra) {
+				ids = append(ids, id)
+			}
+		}
+		if limit > 0 && len(ids) > limit {
+			ids = ids[:limit]
+		}
+		return ids
+	}
+	counts := func(ids []string, run func(ctx context.Context) (int, int, error)) func(ctx context.Context) error {
+		return func(ctx context.Context) error {
+			matched, changed, err := run(ctx)
+			if err == nil && (matched != len(ids) || changed != len(ids)) {
+				return fmt.Errorf("matched %d, changed %d; want %d, %d (%v)", matched, changed, len(ids), len(ids), ids)
+			}
+			return err
+		}
+	}
+	if r.chance(0.4) {
+		ids := match(nil)
+		return writeOp{
+			desc: fmt.Sprintf("delete_many %s %s limit=%d -> %v", cn, js(q), limit, ids),
+			run: counts(ids, func(ctx context.Context) (int, int, error) {
+				return r.coll(cn).DeleteMany(ctx, q, limit)
+			}),
+			want: "ok",
+			apply: func(m mState) {
+				for _, id := range ids {
+					delete(m[cn].docs, id)
+				}
+			},
+		}
+	}
+	u := UpdateSpec{Set: map[string]any{}}
+	for _, f := range modelFields {
+		switch {
+		case r.chance(0.35):
+			u.Set[f] = r.value(f)
+		case r.chance(0.2):
+			u.Unset = append(u.Unset, f)
+		}
+	}
+	if r.chance(0.2) {
+		u.If = r.filters(cn, 1)
+	}
+	ids := match(u.If)
+	final := maps.Clone(mc.docs)
+	want := "ok"
+	for _, id := range ids {
+		next := maps.Clone(mc.docs[id])
+		maps.Copy(next, u.Set)
+		for _, f := range u.Unset {
+			delete(next, f)
+		}
+		if !mValid(mc.schema, next) {
+			want = "schema"
+			break
+		}
+		final[id] = next
+	}
+	if want == "ok" && mc.mUniqueBroken(final) {
+		want = "unique"
+	}
+	return writeOp{
+		desc: fmt.Sprintf("update_many %s %s set=%s unset=%v if=%s limit=%d -> %v", cn, js(q), js(u.Set), u.Unset, js(u.If), limit, ids),
+		run: counts(ids, func(ctx context.Context) (int, int, error) {
+			return r.coll(cn).UpdateMany(ctx, q, u, limit)
+		}),
+		want: want,
+		apply: func(m mState) {
+			for _, id := range ids {
+				m[cn].docs[id] = final[id]
+			}
+		},
+	}
+}
+
+// anyDocWrite picks a single write, a batch, or a write by filter.
+func (r *modelRun) anyDocWrite() writeOp {
+	switch n := r.pick(100); {
+	case n < 70:
+		return r.docWrite()
+	case n < 88:
+		return r.batchWrite()
+	default:
+		return r.manyWrite()
 	}
 }
 
@@ -1075,6 +1335,9 @@ func (r *modelRun) doWrite(w writeOp) {
 		w.apply(r.m)
 	}
 	r.stats["result "+w.want]++
+	if kind := strings.Fields(w.desc)[0]; kind == "batch" || strings.HasSuffix(kind, "_many") {
+		r.stats["result "+kind+" "+w.want]++
+	}
 }
 
 func (r *modelRun) checkFind() {
@@ -1229,7 +1492,7 @@ func (r *modelRun) crash() {
 	ctx := context.Background()
 	switch p {
 	case hookAfterWALSync, hookMetaWrite:
-		w := r.docWrite()
+		w := r.anyDocWrite()
 		if p == hookMetaWrite {
 			w = r.metaWrite()
 		}
@@ -1281,7 +1544,7 @@ func (r *modelRun) crash() {
 func (r *modelRun) randomOp() {
 	switch n := r.pick(100); {
 	case n < 40:
-		r.doWrite(r.docWrite())
+		r.doWrite(r.anyDocWrite())
 	case n < 47:
 		r.doWrite(r.metaWrite())
 	case n < 67:

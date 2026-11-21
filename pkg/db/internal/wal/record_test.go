@@ -21,7 +21,20 @@ func allOpsRecords() []Record {
 		{Op: OpDropIndex, DB: "shop", Coll: "users", Payload: []byte(`{"name":"by_age"}`)},
 		{Op: OpUpdateSchema, DB: "shop", Coll: "users", Payload: []byte(`{"schema":null}`)},
 		{Op: OpRenameColl, DB: "shop", Coll: "users", Payload: []byte(`{"new_name":"people"}`)},
+		{Op: OpBatch, DB: "shop", Coll: "users", Payload: testBatchPayload()},
 	}
+}
+
+// testBatchPayload returns a batch payload with a put and a delete.
+func testBatchPayload() []byte {
+	p, err := AppendBatch(nil, []BatchItem{
+		{Op: OpPutDoc, ID: "u-2", Doc: []byte(`{"_id":"u-2","name":"Bo"}`)},
+		{Op: OpDeleteDoc, ID: "u-3"},
+	})
+	if err != nil {
+		panic(err) // a fixed, valid batch
+	}
+	return p
 }
 
 func assertRecordEqual(t *testing.T, got, want Record) {
@@ -64,6 +77,13 @@ func TestDecodeBodyRejectsMalformed(t *testing.T) {
 	body := appendRecord(nil, &r)[recordHeaderSize:]
 	badOp := append([]byte(nil), body...)
 	badOp[16] = 99
+	batch := Record{Offset: 1, Time: time.Unix(0, 1), Op: OpBatch, DB: "d", Coll: "c", Payload: testBatchPayload()}
+	batchWithID := appendRecord(nil, &Record{Offset: 1, Time: time.Unix(0, 1), Op: OpPutDoc, DB: "d", Coll: "c", ID: "i", Payload: batch.Payload})[recordHeaderSize:]
+	batchWithID = append([]byte(nil), batchWithID...)
+	batchWithID[16] = byte(OpBatch) // a batch record that carries an id
+	shortBatch := appendRecord(nil, &Record{Offset: 1, Time: time.Unix(0, 1), Op: OpPutDoc, DB: "d", Coll: "c", ID: "", Payload: []byte{1, 2}})[recordHeaderSize:]
+	shortBatch = append([]byte(nil), shortBatch...)
+	shortBatch[16] = byte(OpBatch) // a batch payload too short for its count
 	tests := []struct {
 		name string
 		body []byte
@@ -72,6 +92,8 @@ func TestDecodeBodyRejectsMalformed(t *testing.T) {
 		{name: "truncated payload", body: body[:len(body)-1]},
 		{name: "trailing bytes", body: append(append([]byte(nil), body...), 0)},
 		{name: "unknown op", body: badOp},
+		{name: "batch with an id", body: batchWithID},
+		{name: "batch payload too short", body: shortBatch},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -92,7 +114,10 @@ func TestValidateRecord(t *testing.T) {
 		{name: "valid", rec: Record{Op: OpCreateDB, DB: "d"}},
 		{name: "max name length", rec: Record{Op: OpPutDoc, DB: strings.Repeat("x", maxNameLen)}},
 		{name: "op zero", rec: Record{Op: 0, DB: "d"}, wantErr: true},
-		{name: "op out of range", rec: Record{Op: OpRenameColl + 1, DB: "d"}, wantErr: true},
+		{name: "op out of range", rec: Record{Op: OpBatch + 1, DB: "d"}, wantErr: true},
+		{name: "batch", rec: Record{Op: OpBatch, DB: "d", Coll: "c", Payload: []byte{0, 0, 0, 0}}},
+		{name: "batch with an id", rec: Record{Op: OpBatch, DB: "d", Coll: "c", ID: "x", Payload: []byte{0, 0, 0, 0}}, wantErr: true},
+		{name: "batch payload too short for the count", rec: Record{Op: OpBatch, DB: "d", Coll: "c", Payload: []byte{0, 0, 0}}, wantErr: true},
 		{name: "db too long", rec: Record{Op: OpCreateDB, DB: long}, wantErr: true},
 		{name: "coll too long", rec: Record{Op: OpCreateColl, DB: "d", Coll: long}, wantErr: true},
 		{name: "id too long", rec: Record{Op: OpPutDoc, DB: "d", Coll: "c", ID: long}, wantErr: true},
