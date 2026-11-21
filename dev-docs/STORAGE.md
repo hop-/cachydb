@@ -53,6 +53,13 @@ them (see "Format file and old data directories").
 - Root files contain a `.`; database, collection, and index names cannot
   (`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`, `pkg/db/names.go`), so names never
   collide with engine files and never escape the root.
+- `_system/` is the one reserved database directory
+  (`db.SystemDatabaseName`, `Engine.SystemDatabase`): an ordinary database
+  (users and token digests of `internal/auth`) whose name breaks the
+  public rule, so `ValidateName` and every public call reject it.
+  Loading, recovery, leftover removal, flush, compaction, the format
+  upgrade, and `Verify` include it; `ListDatabases` (and so `utils list`,
+  `list_databases`, export) and `MigrateAll` leave it out.
 - File names: `pkg/db/engine.go` (`cachydb.lock`), `pkg/db/format.go`,
   `pkg/db/metacp.go`,
   `pkg/db/meta.go`, `pkg/db/internal/wal/segment.go`,

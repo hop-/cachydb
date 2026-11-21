@@ -22,6 +22,20 @@ func ValidateName(kind, name string) error {
 	return nil
 }
 
+// SystemDatabaseName is the name of the reserved system database (see
+// Engine.SystemDatabase). It breaks the public name rule on purpose (a
+// leading underscore), so ValidateName rejects it and every path that
+// checks names through ValidateName cannot reach it.
+const SystemDatabaseName = "_system"
+
+// validDatabaseDir reports whether name is a database directory the engine
+// loads: a valid public name or SystemDatabaseName. Only the engine's
+// internal machinery (loading, recovery, leftover removal, verification)
+// uses it; public calls keep ValidateName.
+func validDatabaseDir(name string) bool {
+	return name == SystemDatabaseName || validName(name)
+}
+
 func validName(name string) bool {
 	if len(name) == 0 || len(name) > maxNameLen {
 		return false

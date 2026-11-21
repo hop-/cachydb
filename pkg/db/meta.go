@@ -164,7 +164,7 @@ func removeDeletedLeftovers(root string) error {
 		return entries
 	}
 	for _, e := range removeIn(root) {
-		if e.IsDir() && validName(e.Name()) {
+		if e.IsDir() && validDatabaseDir(e.Name()) {
 			removeIn(filepath.Join(root, e.Name()))
 		}
 	}

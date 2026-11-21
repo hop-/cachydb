@@ -103,8 +103,10 @@ func (e *Engine) migrateDatabase(ctx context.Context, dbName string, targetVersi
 	return nil
 }
 
-// MigrateAll migrates every database to targetVersion. Databases dropped
-// while it runs are skipped.
+// MigrateAll migrates every database ListDatabases returns to
+// targetVersion. Databases dropped while it runs are skipped. The reserved
+// system database is not included: migrations change a user database's
+// layout, and its owner (internal/auth) manages its own.
 func (e *Engine) MigrateAll(ctx context.Context, targetVersion int) error {
 	if err := e.enter(); err != nil {
 		return err

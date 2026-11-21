@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -209,7 +208,7 @@ func (e *Engine) loadMetadata(ctx context.Context) error {
 		return fmt.Errorf("reading data directory: %w", err)
 	}
 	for _, ent := range entries {
-		if !ent.IsDir() || !validName(ent.Name()) {
+		if !ent.IsDir() || !validDatabaseDir(ent.Name()) {
 			continue
 		}
 		if err := ctx.Err(); err != nil {
@@ -430,6 +429,20 @@ func (e *Engine) CreateDatabase(ctx context.Context, name string) (*Database, er
 	if err := ValidateName("database", name); err != nil {
 		return nil, err
 	}
+	return e.createDatabase(ctx, name)
+}
+
+// SystemDatabase creates or returns the reserved database
+// SystemDatabaseName, which holds the server's own data (users and
+// tokens). It is durable like any database, but ListDatabases leaves it
+// out, and Database, CreateDatabase, and DropDatabase reject its name, so
+// no tool, export, or listing reaches it.
+func (e *Engine) SystemDatabase(ctx context.Context) (*Database, error) {
+	return e.createDatabase(ctx, SystemDatabaseName)
+}
+
+// createDatabase is CreateDatabase for a name the caller has checked.
+func (e *Engine) createDatabase(ctx context.Context, name string) (*Database, error) {
 	if err := e.enter(); err != nil {
 		return nil, err
 	}
@@ -488,11 +501,19 @@ func (e *Engine) lookupDatabase(name string) *Database {
 	return e.databases[name]
 }
 
-// ListDatabases returns the database names in sorted order.
+// ListDatabases returns the database names in sorted order. The reserved
+// system database (SystemDatabase) is not listed.
 func (e *Engine) ListDatabases() []string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return slices.Sorted(maps.Keys(e.databases))
+	var names []string
+	for name := range e.databases {
+		if name != SystemDatabaseName {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	return names
 }
 
 // DropDatabase drops the database name and all its collections. It waits

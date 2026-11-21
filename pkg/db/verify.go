@@ -336,7 +336,7 @@ func (v *verifier) loadMetadata(ctx context.Context) error {
 		return fmt.Errorf("reading data directory: %w", err)
 	}
 	for _, ent := range entries {
-		if !ent.IsDir() || !validName(ent.Name()) {
+		if !ent.IsDir() || !validDatabaseDir(ent.Name()) {
 			continue
 		}
 		if err := ctx.Err(); err != nil {

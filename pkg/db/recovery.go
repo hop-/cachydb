@@ -671,8 +671,10 @@ func (e *Engine) replayRecord(ctx context.Context, r wal.Record) (bool, error) {
 }
 
 func (e *Engine) replayCreateDB(r wal.Record) error {
-	if err := ValidateName("database", r.DB); err != nil {
-		return err
+	if r.DB != SystemDatabaseName {
+		if err := ValidateName("database", r.DB); err != nil {
+			return err
+		}
 	}
 	dir := dbDir(e.root, r.DB)
 	if err := makeDir(dir); err != nil {

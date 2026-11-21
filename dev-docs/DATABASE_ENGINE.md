@@ -66,10 +66,11 @@ on-disk format versions this build reads and writes.
 | `Close(ctx) error` | Idempotent; if `ctx` ends, remaining flushes are skipped (data stays in the WAL) |
 | `CreateDatabase(ctx, name) (*Database, error)` | Returns the existing database without writing a WAL record if it exists |
 | `Database(name) (*Database, error)` | `ErrNotFound` if missing |
-| `ListDatabases() []string` | Sorted; nil when empty |
+| `ListDatabases() []string` | Sorted; nil when empty; never lists the system database |
+| `SystemDatabase(ctx) (*Database, error)` | Creates or returns the reserved database `SystemDatabaseName` (`_system`), which holds `internal/auth`'s users and tokens. `Database`, `CreateDatabase`, and `DropDatabase` reject its name (`ErrInvalidName`), and `ListDatabases` and `MigrateAll` skip it; recovery, flush, compaction, and `Verify` treat it like any database |
 | `DropDatabase(ctx, name) error` | Waits for in-flight writes in the database |
 | `MigrateDatabase(ctx, name, target) error` | See [Migrations](#migrations) |
-| `MigrateAll(ctx, target) error` | |
+| `MigrateAll(ctx, target) error` | Every database `ListDatabases` returns (not the system database) |
 
 ### Database (`database.go`)
 
