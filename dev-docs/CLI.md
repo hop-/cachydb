@@ -120,6 +120,8 @@ therefore **fail while a server is running** on the same directory. Stop
 the server first, or use `cachydb client` against it: the data commands
 (`export`, `import`, `find`, `get`) add a hint naming the `cachydb client`
 command to the data-directory-in-use error (`clientHint` in `export.go`).
+`utils verify` is the exception: it takes the lock but reads the files
+without running recovery (`db.Verify`), and has no client equivalent.
 
 ### `cachydb utils list`
 
@@ -200,6 +202,51 @@ cachydb utils get -d DB -c COLL --id ID
 unknown keys are rejected). Output is one document per line (default) or
 a JSON array. `get` exits 1 when the document does not exist.
 
+### `cachydb utils verify` (`verify.go`)
+
+```
+cachydb utils verify [-d DB [-c COLL]] [--deep] [--rebuild-index] [--format text|json]
+```
+
+An offline integrity check of a data directory (`db.Verify`,
+`pkg/db/verify.go`; storage details in
+[STORAGE.md](STORAGE.md#offline-verification-utils-verify)). It takes the
+data-directory lock (so stop the server first; the in-use error carries a
+hint that there is no `cachydb client` equivalent), runs no recovery,
+starts no background work, and writes nothing unless `--rebuild-index` is
+given. It checks the WAL (headers, checksums, offset continuity, that
+every `put_doc` and `batch` record decodes as replay decodes it), every
+data segment record (checksum, decompression, the live documents' JSON),
+each `index.db` with idxstore's full `Store.Check`, that every key-table
+entry points at a put of its id with its WAL offset, that `index.db` is
+not older than the segments, and that the data `index.db` does not cover
+(which `Open` deletes or truncates) is still in the WAL.
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--database` | `-d` | all | Check (or rebuild) only this database's collections; the WAL is always checked |
+| `--collection` | `-c` | all | Only this collection (requires `-d`) |
+| `--deep` | | `false` | Also check every index entry against the documents, and the `complex` and `arrays` counters |
+| `--rebuild-index` | | `false` | Delete and rebuild `index.db` from the data segments (the routine `Open` uses for a damaged file), then verify; refused on a format-2 directory |
+| `--format` | `-f` | `text` | `text` or `json` |
+
+- **Text output** (stdout): `rebuilt: <db>/<coll>/index.db` per rebuilt
+  file, one line per problem (`<file or db/coll>: <what>`, the file
+  relative to the data directory), `note: …` lines for what the next
+  `Open` repairs by itself (a torn WAL tail, a leftover segment of an
+  interrupted flush or compaction, an index that is not built, a format-2
+  directory), and last a one-line summary: `verify: ok: …` or `verify: N
+  problem(s): …` with the database, collection, document, data segment,
+  and WAL counts.
+- **JSON** (`--format json`): the `db.VerifyReport` (`ok`, `dir`,
+  `format`, the counts, `wal_first`, `wal_next`, `rebuilt`, `problems` and
+  `notices` as `[{file, database, collection, message}]`,
+  `omitted_problems`).
+- **Exit status**: 0 when there is no problem (notices do not count); 1
+  when there is one (stderr then says `Error: verify found problems: N`),
+  or when the check could not run (a locked or incompatible directory, an
+  unknown `-d`/`-c`). At most 1,000 problems are listed.
+
 ### `cachydb client` (`client.go`)
 
 An MCP client (go-sdk `mcp.NewClient` + `StreamableClientTransport`, no
@@ -270,6 +317,7 @@ main.go → cmd.Execute()
       App.Stop(WithoutCancel(ctx))      # 10s: sessions, Engine.Close
     runList / runMigrate                # utils: withEngine(Open … Close)
     utils export/import/find/get        # withEngine; exportfmt.Engine adapter
+    utils verify                        # db.Verify: lock, read-only checks (or rebuild); no recovery
     client tools/call/export/import     # withClient: MCP over Streamable HTTP; never opens the engine
     runDocs / version                   # print to stdout; never open the engine
     runHealthcheck                      # GET /healthz (3s); never opens the engine

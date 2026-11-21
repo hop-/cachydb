@@ -23,7 +23,8 @@ The suite covers:
 - **The MCP server:** all 21 tools, per-session `use_database`, an
   end-to-end tool flow, and the docs resources.
 - **The CLI:** `docs`, `healthcheck`, `utils` (including export/import
-  round trips), and `client` against a live test server.
+  round trips, and `verify` on healthy and damaged directories), and
+  `client` against a live test server.
 - **The examples:** `examples/basic` and `examples/mcp-client` run end to
   end as smoke tests, and check their own results. The `mcp-client` test
   builds the server binary first; `-short` skips it.
@@ -383,6 +384,24 @@ kill -9 %1                                   # 3. crash without a flush
 
 A clean stop (Ctrl-C / SIGTERM, or closing stdin in stdio mode) flushes
 everything before exit; the next start has nothing to re-apply.
+
+## Integrity Check
+
+`cachydb utils verify` (offline; stop the server first) checks a data
+directory and exits 1 on damage. To try it by hand on a copy:
+
+```bash
+cp -a /tmp/cdb /tmp/cdb-copy
+./cachydb utils verify -R /tmp/cdb-copy --deep          # 1. "verify: ok: ...", exit 0
+rm /tmp/cdb-copy/<db>/<coll>/index.db
+./cachydb utils verify -R /tmp/cdb-copy                 # 2. one line naming index.db, exit 1
+./cachydb utils verify -R /tmp/cdb-copy --rebuild-index # 3. rebuilt, then "verify: ok", exit 0
+./cachydb utils find -R /tmp/cdb-copy -d <db> -c <coll> # 4. the same documents as before
+```
+
+A flipped byte in a sealed `seg-*.data` file or in the middle of a
+`wal-*.log` file is reported the same way (the file and the byte
+position); those cannot be repaired.
 
 ## Direct Library Usage
 

@@ -21,7 +21,7 @@ CachyDB is a lightweight document database with a built-in MCP (Model Context Pr
 - **Stress test**: `go test -race -count=200 -run 'Crash|Recovery|Torn|Concurrent|Condition|Rename|Schema|Model|Compat' ./pkg/db/...` (slow)
 - **Heavy test layers** (opt-in, nightly in CI; see `TESTING.md`): fuzz targets (`go test -run '^$' -fuzz '^FuzzX$' -fuzztime 30s ./<pkg>`), the model test (`CACHYDB_MODEL_SEEDS`/`CACHYDB_MODEL_OPS`/`CACHYDB_MODEL_SEED`), the real-process kill test (`TMPDIR=$HOME/.cache/cachydb-e2e go test -tags e2e -run TestKill ./test/e2e/`, `CACHYDB_E2E_ROUNDS`); upgrade fixtures in `pkg/db/testdata/compat/` (one per release)
 - **CI**: `.github/workflows/test.yml` (lint, race tests on min/stable Go (Linux runners only), cross-builds, 85% coverage floor) and `nightly.yml`
-- **Client / offline data**: `./cachydb client call <tool> '<json>'` (also `tools`, `export`, `import`; `--url`/`CACHYDB_URL`) talks to a running HTTP server; `./cachydb utils export|import|find|get` work offline (they take the lock)
+- **Client / offline data**: `./cachydb client call <tool> '<json>'` (also `tools`, `export`, `import`; `--url`/`CACHYDB_URL`) talks to a running HTTP server; `./cachydb utils export|import|find|get` work offline (they take the lock); `./cachydb utils verify [--deep] [--rebuild-index]` checks a stopped data directory (exit 1 on damage) and can rebuild `index.db` from the segments
 
 ## Developer Documentation
 
@@ -33,7 +33,7 @@ Detailed docs live in `dev-docs/`. **Read before modifying code.**
 | [`dev-docs/DATABASE_ENGINE.md`](dev-docs/DATABASE_ENGINE.md) | `pkg/db` public API, options, errors, documents, schemas, query and index semantics, migrations |
 | [`dev-docs/STORAGE.md`](dev-docs/STORAGE.md) | On-disk layout and formats, WAL, data segments, `index.db`, flush and checkpoints, recovery, format upgrade, compaction, lock order, test hooks |
 | [`dev-docs/MCP_SERVER.md`](dev-docs/MCP_SERVER.md) | The 21 MCP tools, typed schemas and annotations, instructions and docs resources, transports, per-session `use_database`, errors |
-| [`dev-docs/CLI.md`](dev-docs/CLI.md) | Commands (incl. `docs`, `version --json`, `healthcheck`, `client`, `utils export/import/find/get`), flags, environment variables, known issues |
+| [`dev-docs/CLI.md`](dev-docs/CLI.md) | Commands (incl. `docs`, `version --json`, `healthcheck`, `client`, `utils export/import/find/get/verify`), flags, environment variables, known issues |
 | [`dev-docs/DEVELOPMENT.md`](dev-docs/DEVELOPMENT.md) | Rules, patterns, testing, benchmarks (incl. the recorded 1M/10M scale runs), releasing (Docker image), known limitations |
 
 Start with `dev-docs/PROJECT.md`, then `dev-docs/DEVELOPMENT.md`. User-facing docs: [`README.md`](README.md), [`DOCKERHUB.md`](DOCKERHUB.md) (Docker Hub overview), [`TESTING.md`](TESTING.md), [`examples/README.md`](examples/README.md).
@@ -47,12 +47,13 @@ Start with `dev-docs/PROJECT.md`, then `dev-docs/DEVELOPMENT.md`. User-facing do
 | `pkg/db/query.go`, `plan.go`, `compare.go`, `index.go`, `unique.go` | `Find` (OR groups, sort, projection), `CountDocuments`, `Distinct`; query plans and snapshots; compiled operators and `$now`; index entries; unique indexes (field paths: `types.go` `GetPath`) |
 | `pkg/db/collection.go`, `database.go` | Schema/index metadata ops incl. `UpdateSchema` (WAL op 9), `RenameCollection` (WAL op 10), `CopyCollection` (through batches) |
 | `pkg/db/flush.go`, `recovery.go`, `upgrade.go`, `compact.go` | Parallel flusher (segment append, then one `index.db` transaction with the checkpoint), recovery (index file open, segment alignment, rebuild) and replay, format 2 → 3 upgrade, compaction (incl. small-segment merges) |
+| `pkg/db/verify.go` | `Verify`: offline integrity check (WAL, data segments, `index.db` with `Store.Check`, key table against the segments, stale `index.db`, `Deep` index entries) and `RebuildIndex`; backs `cachydb utils verify` |
 | `pkg/db/backpressure.go`, `metacp.go` | `MaxPendingBytes` write backpressure; `cachydb.metacp` metadata checkpoint |
 | `pkg/db/internal/wal/`, `internal/segment/`, `internal/idxstore/` | WAL and data-segment file formats; `index.db` (the only bbolt importer: key table, index entries and key encoding, counters, checkpoint) |
 | `internal/mcp/server.go` | MCP tool handlers, sessions, transports |
 | `internal/mcp/tools.go`, `docs.go` | Tool definitions (typed schemas, annotations), instructions, docs resources |
 | `internal/docs/` | Embedded agent docs topics |
-| `internal/cmd/` | CLI commands and flags (incl. `healthcheck`, which probes `GET /healthz`; `client.go`, the MCP client over HTTP; `export.go`, `import.go`, `find.go`) |
+| `internal/cmd/` | CLI commands and flags (incl. `healthcheck`, which probes `GET /healthz`; `client.go`, the MCP client over HTTP; `export.go`, `import.go`, `find.go`, `verify.go`) |
 | `internal/exportfmt/` | JSONL export format, `Export`/`Import` over a Source/Target (engine adapter here, also a `BatchTarget` that imports in batches; MCP client adapter in `internal/cmd/client.go`) |
 | `internal/config/` | Environment configuration, `ByteSize` |
 | `internal/app/` | Builder and application lifecycle |

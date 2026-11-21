@@ -12,6 +12,11 @@ import (
 // limit is not positive.
 const DefaultCheckLimit = 100
 
+// PageProblemPrefix starts every problem Check reports from bbolt's own
+// page check. When Check reports one, the tree is damaged: it reports
+// nothing else, and walking the file further could fault.
+const PageProblemPrefix = "bbolt: "
+
 // checkLayout verifies what Open promises about an opened file (see
 // Open): the layout version, the complete mark, and that every meta value
 // decodes and matches the buckets. Its cost depends on the number of
@@ -106,7 +111,7 @@ func (s *Store) Check(limit int) (problems []string, err error) {
 
 	p := &problemList{limit: limit}
 	for cerr := range btx.Check() { // drain it: the checker blocks on every send
-		p.add("bbolt: %v", cerr)
+		p.add("%s%v", PageProblemPrefix, cerr)
 	}
 	if len(p.list) > 0 {
 		return p.list, nil // the tree is damaged; walking it could fault

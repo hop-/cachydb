@@ -62,6 +62,7 @@ on-disk format versions this build reads and writes.
 | Method | Notes |
 |--------|-------|
 | `Open(ctx, Options) (*Engine, error)` | See above |
+| `Verify(ctx, Options, VerifyOptions) (*VerifyReport, error)` | Offline integrity check of a directory that is not open (takes the lock, `ErrDataDirInUse` otherwise; no recovery; writes only with `RebuildIndex`). `VerifyOptions`: `Database`, `Collection` (scope; the WAL is always checked), `Deep` (every index entry), `RebuildIndex` (rebuild `index.db` from the segments first), `MaxProblems` (default 1,000). `VerifyReport.OK` is false when `Problems` is not empty; `Notices` are repairs `Open` makes itself. Damage is in the report, not the error. See [STORAGE.md](STORAGE.md#offline-verification-utils-verify) |
 | `Close(ctx) error` | Idempotent; if `ctx` ends, remaining flushes are skipped (data stays in the WAL) |
 | `CreateDatabase(ctx, name) (*Database, error)` | Returns the existing database without writing a WAL record if it exists |
 | `Database(name) (*Database, error)` | `ErrNotFound` if missing |

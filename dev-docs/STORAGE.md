@@ -1,8 +1,8 @@
 # Storage Engine Internals
 
 How `pkg/db` stores data: on-disk layout and formats, the write-ahead log,
-data segments, flush and checkpoints, recovery, compaction, and the lock
-order. For the public Go API and query semantics see
+data segments, flush and checkpoints, recovery, compaction, the lock
+order, and offline verification. For the public Go API and query semantics see
 [DATABASE_ENGINE.md](DATABASE_ENGINE.md); for the big picture see
 [PROJECT.md](PROJECT.md).
 
@@ -256,8 +256,8 @@ same goroutine (deadlock on remap).
 `Store.Check` (bbolt's page check plus the invariants: entries well
 formed, every key in a registered segment, `count` equal to the keys,
 segment bytes equal to the referenced bytes, every index entry belonging
-to a key, the counters) reads the whole file; it is for tests and tools,
-not for `Open`. `Open` runs a cheap check only (file length against the
+to a key, the counters) reads the whole file; it is for tests and
+`cachydb utils verify`, not for `Open`. `Open` runs a cheap check only (file length against the
 newest transaction, the meta pages, the `meta` bucket and layout).
 
 ## In-memory state per collection (`pkg/db/collection.go`)
@@ -507,7 +507,9 @@ segment to its old `covered`. Replay restores only the records still in
 the WAL; if retention has already removed them, those documents are lost
 without a warning. To repair a damaged `index.db`, delete it and let
 `Open` rebuild it from the segments. See Known Limitations in
-`DEVELOPMENT.md`.
+`DEVELOPMENT.md`. `cachydb utils verify` detects such a file before
+`Open` acts on it (see "Offline verification"), and `utils verify
+--rebuild-index` replaces it.
 
 Open no longer scans the data segments (unless it rebuilds an index file
 or builds an index). Its cost is the WAL open (every retained WAL segment
@@ -517,6 +519,64 @@ open log line reports `recoveryStats`: `collections_upgraded` (format 2 → 3
 builds), `index_files_rebuilt` (format-3 repairs only), `segments_scanned`
 (by the upgrade and those rebuilds), and the replayed and skipped record
 counts.
+
+## Offline verification (`utils verify`, `pkg/db/verify.go`)
+
+`db.Verify(ctx, Options, VerifyOptions)` checks a data directory without
+`Open`: it takes the data-directory lock, reads the format file and the
+metadata (`loadDatabase`; an unreadable database is a problem, not the end
+of the check), runs no recovery, starts no goroutine, and writes nothing
+unless `RebuildIndex` is set. It returns a `VerifyReport` with
+**problems** (damage, or data `Open` would lose or fail on) and
+**notices** (what `Open` repairs by itself without losing data).
+
+1. **WAL** (`wal.Verify`, `internal/wal/verify.go`): the checks of
+   `wal.Open` (header, checksums, offset continuity across segments, the
+   torn-tail rule of the newest segment, which is a notice), but it reads
+   on after damage, starting the next segment at its name. Every
+   `put_doc` payload and every put item of a `batch` record (op 11,
+   `wal.DecodeBatch`) must decode as replay decodes it
+   (`decodeDocument`); metadata payloads must be JSON. With damage the end
+   of the WAL is unknown, so the checks that need it are skipped.
+2. **Per collection** (format 3): `idxstore.Open`, then the full
+   `Store.Check` (a missing, damaged, or incomplete file is a problem;
+   with bbolt page damage, `idxstore.PageProblemPrefix`, the file is not
+   read further). The segment files are compared with the registered
+   segments and `covered` as `alignSegments` would: a registered segment
+   without its file, or a covered segment shorter than `covered`, is a
+   problem; an unregistered file or bytes past `covered` are notices.
+3. **Every data segment record** (`segment.Scan`: checksum,
+   decompression) in one read transaction. Damage in the data `index.db`
+   covers is a problem (the records after it cannot be scanned); damage
+   past it is a notice. Each record is looked up in the key table:
+   - a put the entry points at must have the entry's size and WAL offset
+     and lie in covered data; its document must decode;
+   - a covered record newer than the key table's version of its id (or a
+     covered put of an id the key table lacks, with no newer tombstone)
+     means `index.db` is **older than the segments**: one problem per
+     collection with the count and the oldest such change;
+   - an uncovered record newer than the key table that replay will not
+     restore (its offset is at or below the checkpoint, or no longer in
+     the WAL) is data `Open` would **discard** (follow-up F-010): one
+     problem per collection.
+   Key-table entries the scan did not meet at their record are then read
+   by location (only when there are some) and reported when the record
+   is not a put of their id with their offset.
+4. **`Deep`**: for every ready index of `coll.meta`, each live document's
+   entries (`indexKeysOf`) must be in the bucket with the same flags, the
+   bucket must hold no other entry (found by reading the documents of the
+   entries only when the bucket is larger than expected), and the
+   `complex` and `arrays` counters must match. Indexes that are missing,
+   not ready, or not defined are notices (`syncIndexes` handles them).
+5. **References**: no meta file or index file may reference a WAL offset
+   at or past the end of the WAL (the check of `recover`).
+
+`RebuildIndex` runs `rebuildIndex` (the routine of a damaged file at
+`Open` and of the format upgrade) for each collection in scope through a
+minimal `Engine` (metadata and a disabled cache, no WAL), closes the
+files, and then verifies. It refuses a format-2 directory. The rebuilt
+file's checkpoint is the newest old marker or 0, so the next `Open`
+replays what the WAL still holds for the collection.
 
 ## Compaction (`pkg/db/compact.go`)
 

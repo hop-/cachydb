@@ -21,7 +21,7 @@ A lightweight document-based database with Model Context Protocol (MCP) support,
 - **Query operations**: Type-aware filters (eq, ne, gt, gte, lt, lte, in), case-insensitive `contains`, array matching (`has`, `has_any`, `has_all`), OR groups, sort by any field, projection, deterministic skip/limit, `count_documents`, `distinct`
 - **Safe writes**: Conditional writes (`if`, compare-and-set), `unset`, upsert, atomic `replace_document`, and `{"$now": true}` server timestamps
 - **Schema evolution**: Every violation reported at once; `describe_collection`, `update_schema`, `rename_collection`, `copy_collection`, `delete_collection`, `drop_index`
-- **Export and client**: JSON Lines export/import (`cachydb utils export|import`), offline `utils find|get`, and `cachydb client` to call any tool of a running HTTP server from the shell
+- **Export and client**: JSON Lines export/import (`cachydb utils export|import`), offline `utils find|get`, an offline integrity check (`utils verify`, which can also rebuild index files), and `cachydb client` to call any tool of a running HTTP server from the shell
 - **MCP integration**: Built-in MCP server supporting stdio and Streamable HTTP transports, with `use_database` per session
 - **Durable writes**: Every acknowledged write is fsynced to a write-ahead log; concurrent writes share fsyncs (group commit)
 - **Append-only storage**: zstd-compressed, append-only data segments with background compaction; the key table and indexes live on disk in one index file per collection, so memory use does not grow with the number of documents (tested with 10 million)
@@ -134,6 +134,8 @@ cachydb utils export -d kb -o kb.jsonl                 # JSON Lines: header, dat
 cachydb utils import -i kb.jsonl --on-conflict skip -R /new/data
 cachydb utils find -d kb -c notes --query '{"filters":[{"field":"tags","operator":"has","value":"wal"}]}'
 cachydb utils get -d kb -c notes --id wal-design
+cachydb utils verify --deep                            # integrity check of the data directory; exit 1 on damage
+cachydb utils verify --rebuild-index -d kb -c notes    # rebuild a damaged or stale index.db from the data segments
 
 # Through a running HTTP server (--url or CACHYDB_URL, default http://127.0.0.1:7601/mcp)
 cachydb client tools
@@ -500,7 +502,7 @@ cachydb/
 ├── main.go                 # Entry point
 ├── internal/
 │   ├── app/               # Application setup (opens the engine, starts the MCP server)
-│   ├── cmd/               # CLI commands (server, docs, version, utils list/migrate)
+│   ├── cmd/               # CLI commands (server, docs, version, utils list/migrate/export/import/find/get/verify, client)
 │   ├── config/            # Configuration (env vars, size parsing)
 │   ├── docs/              # Built-in agent docs topics (cachydb docs, MCP resources)
 │   └── mcp/

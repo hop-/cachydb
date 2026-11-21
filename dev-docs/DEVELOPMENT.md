@@ -600,6 +600,10 @@ environment configuration from `os.Getenv`; neither needs a module.
     position. If WAL retention has already removed those records, the
     documents are lost silently. Back up and restore the whole data
     directory, never `index.db` alone; to repair a damaged `index.db`,
-    delete it so `Open` rebuilds it from the segments. A fix (check that
+    delete it so `Open` rebuilds it from the segments, or run `cachydb
+    utils verify --rebuild-index`. Before opening a directory whose
+    `index.db` may be stale, run `cachydb utils verify`: it reports such a
+    file ("older than the data segments", and "opening would discard ..."
+    when the WAL no longer holds the changes). A fix in `Open` (check that
     the collection's checkpoint + 1 is still in the WAL before deleting or
     truncating, otherwise rebuild) is an open follow-up.
