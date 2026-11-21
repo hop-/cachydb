@@ -88,13 +88,16 @@ The server communicates over stdin/stdout — suitable for local MCP clients suc
 ./cachydb --transport http
 ```
 
-The server listens on port 7601 on all interfaces (`http://localhost:7601/mcp`) and implements the [MCP Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports). This is the recommended transport for networked or multi-client deployments.
+The server listens on `127.0.0.1:7601` (`http://localhost:7601/mcp`), this machine only, and implements the [MCP Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports). This is the recommended transport for networked or multi-client deployments.
 
-Change the port with `--port`:
+Change the port with `--port`, the listen host with `--host`, and serve HTTPS with a certificate and key:
 
 ```bash
 ./cachydb --transport http --port 8080
+./cachydb --transport http --host 0.0.0.0 --tls-cert cert.pem --tls-key key.pem
 ```
+
+**Authentication** (`--auth` / `AUTH`): with the default `auto`, stdio and loopback HTTP (`127.0.0.1`, `::1`, `localhost`) need no token, and HTTP on any other host requires one. `required` requires tokens for all HTTP; `off` never does (on a non-loopback host it logs a warning). When tokens are required and no user exists, the server refuses to start and names the ways out: create the first admin with `cachydb utils user add NAME --admin` (server stopped), set `BOOTSTRAP_ADMIN_TOKEN`, or opt out with `AUTH=off` on a trusted network. `/healthz` never needs a token.
 
 ### Configuration
 
@@ -103,6 +106,9 @@ CLI flags (override environment variables, which override the defaults):
 ```none
   -t, --transport            MCP transport: stdio (default) or http
   -p, --port                 Port for HTTP transport (default 7601)
+      --host                 HTTP listen host (default 127.0.0.1; 0.0.0.0 = every interface)
+      --auth                 auto (default), required, or off
+      --tls-cert, --tls-key  PEM certificate and key; with both, serve HTTPS
   -R, --root                 Data directory (default ~/.cachydb)
   -d, --db                   Default database, created at startup (default main)
       --wal-retention-age    Keep processed WAL for this long, e.g. 24h (0 = no age limit)
@@ -114,6 +120,9 @@ Environment variables:
 
 - `TRANSPORT`: `stdio` or `http` (default: `stdio`)
 - `PORT`: Port for the HTTP transport (default: `7601`)
+- `HOST`: HTTP listen host (default: `127.0.0.1`)
+- `AUTH`: `auto`, `required`, or `off` (default: `auto`); any other value is a start-up error
+- `TLS_CERT`, `TLS_KEY`: PEM certificate and key files; both or neither
 - `ROOT_DIR`: Data directory (default: `~/.cachydb`)
 - `DB_NAME`: Default database (default: `main`)
 - `WAL_RETENTION_AGE`: How long processed WAL segments are kept, as a Go duration (default: `24h`, `0` = no age limit)
@@ -202,22 +211,25 @@ Then point your MCP client at the endpoint:
 }
 ```
 
-The HTTP endpoint implements the MCP Streamable HTTP transport — clients POST JSON-RPC messages to `/mcp` and receive responses via SSE. Idle sessions expire after 30 minutes. There is no authentication; do not expose the port to untrusted networks.
+The HTTP endpoint implements the MCP Streamable HTTP transport — clients POST JSON-RPC messages to `/mcp` and receive responses via SSE. Idle sessions expire after 30 minutes. By default it listens on loopback only; on another host it requires tokens (see [Authentication](#http-streamable-http-transport) above) unless `AUTH=off`, and serves HTTPS with `--tls-cert` and `--tls-key`.
 
 The HTTP server also answers `GET /healthz`: `200 {"status":"ok","version":"..."}` while the database is open, `503` while it shuts down. `cachydb healthcheck` probes it and exits 0 (healthy) or 1, for container and service-manager healthchecks:
 
 ```bash
 TRANSPORT=http cachydb healthcheck                    # http://127.0.0.1:$PORT/healthz (with TRANSPORT=stdio it exits 0 without probing)
+TRANSPORT=http TLS_CERT=c.pem TLS_KEY=k.pem cachydb healthcheck   # https://127.0.0.1:$PORT/healthz, certificate not verified on loopback
 cachydb healthcheck --url http://db.internal:7601/healthz
 ```
 
 ## Docker
 
-The official image [`hovhannespalyan/cachydb`](https://hub.docker.com/r/hovhannespalyan/cachydb) is a small distroless image for `linux/amd64` and `linux/arm64`. It runs as the non-root user `65532`, keeps data in the `/data` volume, and is configured with the [environment variables](#configuration). Its defaults are `TRANSPORT=http`, `PORT=7601`, `ROOT_DIR=/data`, `DB_NAME=main`. Tags: `latest`, `X.Y`, `X.Y.Z`.
+The official image [`hovhannespalyan/cachydb`](https://hub.docker.com/r/hovhannespalyan/cachydb) is a small distroless image for `linux/amd64` and `linux/arm64`. It runs as the non-root user `65532`, keeps data in the `/data` volume, and is configured with the [environment variables](#configuration). Its defaults are `TRANSPORT=http`, `HOST=0.0.0.0`, `PORT=7601`, `ROOT_DIR=/data`, `DB_NAME=main`. Tags: `latest`, `X.Y`, `X.Y.Z`.
+
+Because the container listens on every interface, clients need a token under the default `AUTH=auto`, and **the container refuses to start until a user exists** (`cachydb utils user add`, or `BOOTSTRAP_ADMIN_TOKEN`). For local use without tokens, publish the port on localhost and set `AUTH=off`:
 
 ```bash
-# HTTP server at http://localhost:7601/mcp, data in the cachydb-data volume
-docker run -d --name cachydb -p 7601:7601 -v cachydb-data:/data hovhannespalyan/cachydb
+# HTTP server at http://localhost:7601/mcp, data in the cachydb-data volume, no tokens
+docker run -d --name cachydb -p 127.0.0.1:7601:7601 -v cachydb-data:/data -e AUTH=off hovhannespalyan/cachydb
 
 # stdio, started by an MCP client (keep -i, no -t)
 docker run -i --rm -v cachydb-data:/data -e TRANSPORT=stdio hovhannespalyan/cachydb
@@ -226,7 +238,7 @@ docker run -i --rm -v cachydb-data:/data -e TRANSPORT=stdio hovhannespalyan/cach
 docker run --rm hovhannespalyan/cachydb version --json
 ```
 
-With Docker Compose, the repository's [`docker-compose.yml`](docker-compose.yml) runs the HTTP server with a named volume: `docker compose up -d`.
+With Docker Compose, the repository's [`docker-compose.yml`](docker-compose.yml) runs the HTTP server with a named volume, published on localhost with `AUTH=off`: `docker compose up -d`.
 
 For an agent, point the client at the HTTP container, or let it start a stdio container:
 
@@ -239,7 +251,7 @@ Notes:
 
 - **Volume permissions**: named volumes work as they are. A bind mount keeps the host directory's owner, so `chown 65532:65532` it first, or run with `--user "$(id -u):$(id -g)"`.
 - **One container per volume**: the data-directory lock allows one cachydb process per volume. Share data between agents through one HTTP container.
-- **Healthcheck**: the image's `HEALTHCHECK` runs `cachydb healthcheck`. It reads `PORT` and `TRANSPORT` from the environment, so set those as environment variables rather than flags.
+- **Healthcheck**: the image's `HEALTHCHECK` runs `cachydb healthcheck`. It reads `PORT`, `TRANSPORT`, `TLS_CERT` and `TLS_KEY` from the environment, so set those as environment variables rather than flags.
 - **Shutdown**: `docker stop` sends SIGTERM; cachydb flushes and exits 0.
 - **Build locally**: `docker build --build-arg VERSION=$(git describe --tags --always) -t cachydb .`
 

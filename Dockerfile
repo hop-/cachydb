@@ -3,6 +3,9 @@
 # Official cachydb image: a static Go binary on distroless, running as the
 # non-root user 65532 with its data in the /data volume. Configure it with
 # environment variables (TRANSPORT, PORT, DB_NAME, ...); see DOCKERHUB.md.
+# HOST=0.0.0.0 makes the server reachable from outside the container, so
+# under AUTH=auto clients need a token and the container exits at start
+# while no user exists: create one, or set AUTH=off on a trusted network.
 #
 # Build:   docker build --build-arg VERSION=v0.0.4 -t cachydb .
 # Release: .github/workflows/docker.yml builds linux/amd64 and linux/arm64
@@ -33,12 +36,12 @@ COPY --from=build --chown=65532:65532 /out/data /data
 # No flags in CMD: flags override environment variables, so the image is
 # configured through the environment. Arguments after the image name are
 # passed to cachydb (e.g. "version --json").
-ENV TRANSPORT=http PORT=7601 ROOT_DIR=/data DB_NAME=main
+ENV TRANSPORT=http HOST=0.0.0.0 PORT=7601 ROOT_DIR=/data DB_NAME=main
 EXPOSE 7601
 VOLUME ["/data"]
 USER 65532:65532
-# Probes http://127.0.0.1:$PORT/healthz; exits 0 without probing when
-# TRANSPORT=stdio.
+# Probes http://127.0.0.1:$PORT/healthz (https with TLS_CERT and TLS_KEY;
+# no token needed); exits 0 without probing when TRANSPORT=stdio.
 HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
   CMD ["/usr/local/bin/cachydb", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/cachydb"]

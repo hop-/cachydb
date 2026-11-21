@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,10 +11,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/hop-/cachydb/internal/auth"
 	"github.com/hop-/cachydb/pkg/db"
+	sdkauth "github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -34,10 +38,16 @@ type Server struct {
 	server        *mcp.Server
 	defaultDBName string
 	transport     string
-	httpAddr      string
-	version       string        // build version, reported by /healthz
-	stderr        io.Writer     // startup/shutdown messages; never stdout
-	stdio         mcp.Transport // the stdio transport; tests replace it
+	httpAddr      string // host:port the HTTP transport listens on
+	tlsCert       string // PEM files; both set = HTTPS
+	tlsKey        string
+	version       string // build version, reported by /healthz
+	// tokensRequired means every /mcp request must carry the token of a
+	// user in users; /healthz never needs one.
+	tokensRequired bool
+	users          *auth.Store   // set when tokensRequired, may be nil otherwise
+	stderr         io.Writer     // startup/shutdown messages; never stdout
+	stdio          mcp.Transport // the stdio transport; tests replace it
 
 	// sessions maps *mcp.ServerSession to *sessionState: the database the
 	// session selected with use_database.
@@ -66,32 +76,84 @@ func (st *sessionState) set(name string) {
 	st.database = name
 }
 
-// NewServer creates an MCP server on the opened engine. It creates the
-// default database if it does not exist. transport is "http" or anything
-// else for stdio; httpAddr is the listen address for HTTP; version is the
-// build version reported in the server's implementation info.
+// Config is the configuration of a Server.
+type Config struct {
+	// DefaultDatabase is created if missing and used when a tool call
+	// names no database and the session chose none.
+	DefaultDatabase string
+	// Transport is "http", or anything else for stdio.
+	Transport string
+	// Listen is where the HTTP transport listens, and whether it serves
+	// TLS.
+	Listen ListenConfig
+	// Version is the build version reported in the server's
+	// implementation info and by /healthz.
+	Version string
+	// TokensRequired makes every HTTP request to /mcp present the token
+	// of a user in Users (the start-up decision of auth.Decide). /healthz
+	// never needs a token, and stdio is never affected.
+	TokensRequired bool
+	// Users is the auth store; it must be set when TokensRequired is.
+	Users *auth.Store
+}
+
+// NewServer creates a server without TLS or tokens: New with the given
+// default database, transport, HTTP listen address ("host:port"; empty
+// means DefaultHost on a free port), and version.
 func NewServer(ctx context.Context, engine *db.Engine, defaultDBName, transport, httpAddr, version string) (*Server, error) {
+	var listen ListenConfig
+	if httpAddr != "" {
+		host, port, err := net.SplitHostPort(httpAddr)
+		if err != nil {
+			return nil, fmt.Errorf("creating MCP server: listen address: %w", err)
+		}
+		if listen.Port, err = strconv.Atoi(port); err != nil {
+			return nil, fmt.Errorf("creating MCP server: listen address %q: invalid port", httpAddr)
+		}
+		listen.Host = host
+	}
+	return New(ctx, engine, Config{
+		DefaultDatabase: defaultDBName,
+		Transport:       transport,
+		Listen:          listen,
+		Version:         version,
+	})
+}
+
+// New creates an MCP server on the opened engine. It creates the default
+// database if it does not exist.
+func New(ctx context.Context, engine *db.Engine, cfg Config) (*Server, error) {
 	if engine == nil {
 		return nil, errors.New("creating MCP server: engine is nil")
 	}
-	if _, err := engine.CreateDatabase(ctx, defaultDBName); err != nil {
-		return nil, fmt.Errorf("creating default database %q: %w", defaultDBName, err)
+	if err := cfg.Listen.Validate(); err != nil {
+		return nil, fmt.Errorf("creating MCP server: %w", err)
+	}
+	if cfg.TokensRequired && cfg.Users == nil {
+		return nil, errors.New("creating MCP server: tokens are required but there is no auth store")
+	}
+	if _, err := engine.CreateDatabase(ctx, cfg.DefaultDatabase); err != nil {
+		return nil, fmt.Errorf("creating default database %q: %w", cfg.DefaultDatabase, err)
 	}
 
 	s := &Server{
-		engine:        engine,
-		defaultDBName: defaultDBName,
-		transport:     transport,
-		httpAddr:      httpAddr,
-		version:       version,
-		stderr:        os.Stderr,
-		stdio:         &mcp.StdioTransport{},
+		engine:         engine,
+		defaultDBName:  cfg.DefaultDatabase,
+		transport:      cfg.Transport,
+		httpAddr:       cfg.Listen.Addr(),
+		tlsCert:        cfg.Listen.TLSCert,
+		tlsKey:         cfg.Listen.TLSKey,
+		version:        cfg.Version,
+		tokensRequired: cfg.TokensRequired,
+		users:          cfg.Users,
+		stderr:         os.Stderr,
+		stdio:          &mcp.StdioTransport{},
 	}
 
 	s.server = mcp.NewServer(&mcp.Implementation{
 		Name:    "cachydb",
 		Title:   "CachyDB document database",
-		Version: version,
+		Version: cfg.Version,
 	}, &mcp.ServerOptions{
 		Instructions: Instructions(),
 		InitializedHandler: func(_ context.Context, req *mcp.InitializedRequest) {
@@ -246,14 +308,38 @@ func (s *Server) startStdio(ctx context.Context) error {
 }
 
 // httpHandler returns the HTTP handler: the Streamable HTTP transport
-// serving s.server at /mcp, and the health endpoint at /healthz.
+// serving s.server at /mcp, and the health endpoint at /healthz. When
+// tokens are required, /mcp answers 401 to a request without a valid
+// bearer token; /healthz stays open.
 func (s *Server) httpHandler() http.Handler {
-	mux := http.NewServeMux()
-	mux.Handle("/mcp", mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+	var mcpHandler http.Handler = mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return s.server
-	}, &mcp.StreamableHTTPOptions{SessionTimeout: httpSessionTimeout}))
+	}, &mcp.StreamableHTTPOptions{SessionTimeout: httpSessionTimeout})
+	if s.tokensRequired {
+		mcpHandler = sdkauth.RequireBearerToken(s.verifyToken, &sdkauth.RequireBearerTokenOptions{
+			// Tokens do not expire.
+			AllowMissingExpiration: true,
+		})(mcpHandler)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", mcpHandler)
 	mux.HandleFunc("/healthz", s.healthz)
 	return mux
+}
+
+// verifyToken is the bearer-token verifier of /mcp. It accepts only the
+// tokens of server admins for now: tools do not check per-database
+// access levels yet, so any other user would get more access than its
+// grants allow. The SDK binds each session to TokenInfo.UserID.
+func (s *Server) verifyToken(_ context.Context, token string, _ *http.Request) (*sdkauth.TokenInfo, error) {
+	p, err := s.users.Authenticate(token)
+	if err != nil {
+		return nil, fmt.Errorf("%w: unknown or revoked token", sdkauth.ErrInvalidToken)
+	}
+	if !p.ServerAdmin {
+		return nil, fmt.Errorf("%w: only server admin tokens are accepted until per-database access is enforced", sdkauth.ErrInvalidToken)
+	}
+	return &sdkauth.TokenInfo{UserID: p.Name}, nil
 }
 
 // HTTPHandler returns the HTTP handler the http transport serves: the
@@ -295,15 +381,27 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 // startHTTP serves the Streamable HTTP transport (MCP spec 2025-03-26+) at
-// /mcp, and /healthz, until ctx is cancelled.
+// /mcp, and /healthz, until ctx is cancelled; over TLS when a certificate
+// and key are configured.
 func (s *Server) startHTTP(ctx context.Context) error {
-	ln, err := net.Listen("tcp", s.httpAddr)
-	if err != nil {
-		return fmt.Errorf("listening on %s: %w", s.httpAddr, err)
-	}
 	httpServer := &http.Server{
 		Handler:           s.httpHandler(),
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+	scheme := "http"
+	if s.tlsCert != "" || s.tlsKey != "" {
+		// Loaded before listening, so a bad file fails the start-up
+		// instead of the first connection.
+		cert, err := tls.LoadX509KeyPair(s.tlsCert, s.tlsKey)
+		if err != nil {
+			return fmt.Errorf("loading the TLS certificate and key: %w", err)
+		}
+		httpServer.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+		scheme = "https"
+	}
+	ln, err := net.Listen("tcp", s.httpAddr)
+	if err != nil {
+		return fmt.Errorf("listening on %s: %w", s.httpAddr, err)
 	}
 
 	stop := make(chan struct{})
@@ -330,10 +428,19 @@ func (s *Server) startHTTP(ctx context.Context) error {
 		shutdownDone <- err
 	}()
 
-	addr := ln.Addr().String()
-	fmt.Fprintf(s.stderr, "CachyDB MCP server listening on http://%s/mcp (Streamable HTTP transport)\n", addr)
+	access := "no token needed"
+	if s.tokensRequired {
+		access = "tokens required"
+	}
+	fmt.Fprintf(s.stderr, "CachyDB MCP server listening on %s://%s/mcp (Streamable HTTP transport, %s)\n", scheme, ln.Addr(), access)
 
-	serveErr := httpServer.Serve(ln)
+	var serveErr error
+	if httpServer.TLSConfig != nil {
+		// The certificate is in TLSConfig, so no file names.
+		serveErr = httpServer.ServeTLS(ln, "", "")
+	} else {
+		serveErr = httpServer.Serve(ln)
+	}
 	close(stop)
 	shutdownErr := <-shutdownDone
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {

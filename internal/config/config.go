@@ -14,6 +14,16 @@ import (
 type Config struct {
 	// Port is the HTTP transport port (env PORT).
 	Port int
+	// Host is the HTTP listen host (env HOST): 127.0.0.1 serves this
+	// machine only, 0.0.0.0 every interface.
+	Host string
+	// Auth is the authentication mode, "auto", "required" or "off" (env
+	// AUTH); internal/auth.ParseMode validates it.
+	Auth string
+	// TLSCert and TLSKey are the PEM certificate and key files of the
+	// HTTP transport (env TLS_CERT, TLS_KEY); both or neither.
+	TLSCert string
+	TLSKey  string
 	// RootDir is the data directory (env ROOT_DIR); empty means
 	// $HOME/<RootDirName>.
 	RootDir     string
@@ -39,6 +49,8 @@ type Config struct {
 func defaults() Config {
 	return Config{
 		Port:             7601,
+		Host:             "127.0.0.1",
+		Auth:             "auto",
 		RootDirName:      ".cachydb",
 		DBName:           "main",
 		Transport:        "stdio",
@@ -66,6 +78,10 @@ func Init() error {
 
 	err := errors.Join(
 		fromEnv("PORT", &cfg.Port, strconv.Atoi),
+		fromEnv("HOST", &cfg.Host, asIs),
+		fromEnv("AUTH", &cfg.Auth, asIs),
+		fromEnv("TLS_CERT", &cfg.TLSCert, asIs),
+		fromEnv("TLS_KEY", &cfg.TLSKey, asIs),
 		fromEnv("ROOT_DIR", &cfg.RootDir, asIs),
 		fromEnv("DB_NAME", &cfg.DBName, asIs),
 		fromEnv("TRANSPORT", &cfg.Transport, asIs),

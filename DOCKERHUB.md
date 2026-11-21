@@ -17,15 +17,22 @@ MCP tools (create collections, insert, find, update, delete, index).
 ### HTTP (a long-running server)
 
 ```bash
-docker run -d --name cachydb -p 7601:7601 -v cachydb-data:/data hovhannespalyan/cachydb
+docker run -d --name cachydb -p 127.0.0.1:7601:7601 -v cachydb-data:/data \
+  -e AUTH=off hovhannespalyan/cachydb
 ```
 
 The MCP endpoint is `http://localhost:7601/mcp` (Streamable HTTP). Many
 clients can connect at once. Data lives in the `cachydb-data` volume and
 survives container restarts and upgrades.
 
-There is no authentication or TLS: publish the port only on a trusted
-network, for example `-p 127.0.0.1:7601:7601` for local use.
+**A container needs a user or `AUTH=off`.** The image listens on every
+interface of the container (`HOST=0.0.0.0`), so by default (`AUTH=auto`)
+clients need a token, and the container exits at start with *"refusing
+to start: ... no user exists"* until a user exists. Create the first
+admin with `cachydb utils user add NAME --admin` on the stopped volume,
+or set `BOOTSTRAP_ADMIN_TOKEN`; or, as above, set `AUTH=off`, which is
+only safe when the port is published on localhost or a trusted network
+(cachydb logs a warning). `/healthz` never needs a token.
 
 ### stdio (the agent starts the container)
 
@@ -56,7 +63,10 @@ Configure the container with environment variables:
 | Variable | Image default | Meaning |
 | --- | --- | --- |
 | `TRANSPORT` | `http` | `http` or `stdio` |
+| `HOST` | `0.0.0.0` | HTTP listen host inside the container; every interface, so clients need a token unless `AUTH=off` |
 | `PORT` | `7601` | HTTP port inside the container (path `/mcp`) |
+| `AUTH` | `auto` | `auto`: tokens for HTTP on a non-loopback host (the image's case); `required`: always for HTTP; `off`: never (logs a warning on a non-loopback host) |
+| `TLS_CERT`, `TLS_KEY` | none | PEM certificate and key files (mount them); with both, the server serves HTTPS. One without the other is an error |
 | `ROOT_DIR` | `/data` | Data directory. Keep it at `/data`, the volume |
 | `DB_NAME` | `main` | Default database, created at startup if missing |
 | `WAL_RETENTION_AGE` | `24h` | Keep processed WAL this long; `0` = no age limit |
@@ -64,15 +74,15 @@ Configure the container with environment variables:
 | `CACHE_SIZE` | `64MiB` | Document cache size; `0` disables the cache |
 
 ```bash
-docker run -d -p 8080:8080 -v cachydb-data:/data \
-  -e PORT=8080 -e DB_NAME=app -e CACHE_SIZE=256MiB \
+docker run -d -p 127.0.0.1:8080:8080 -v cachydb-data:/data \
+  -e PORT=8080 -e DB_NAME=app -e CACHE_SIZE=256MiB -e AUTH=off \
   hovhannespalyan/cachydb
 ```
 
 Arguments after the image name go to `cachydb`, and flags win over
-environment variables. Prefer environment variables for `TRANSPORT` and
-`PORT`: the healthcheck reads them, not the flags. Other commands work
-too:
+environment variables. Prefer environment variables for `TRANSPORT`,
+`PORT`, `TLS_CERT` and `TLS_KEY`: the healthcheck reads them, not the
+flags. Other commands work too:
 
 ```bash
 docker run --rm hovhannespalyan/cachydb version --json
@@ -125,10 +135,11 @@ docker run --rm -v cachydb-data:/from -v cachydb-data-backup:/to alpine cp -a /f
 ## Healthcheck
 
 The image has a built-in `HEALTHCHECK` that runs `cachydb healthcheck`.
-It probes `GET http://127.0.0.1:$PORT/healthz`, which answers
-`200 {"status":"ok","version":"…"}` while the database is open and `503`
-while it shuts down. With `TRANSPORT=stdio` there is nothing to probe and
-the check always passes.
+It probes `GET http://127.0.0.1:$PORT/healthz` (`https://` when
+`TLS_CERT` and `TLS_KEY` are set, without verifying the certificate),
+which answers `200 {"status":"ok","version":"…"}` while the database is
+open and `503` while it shuts down; it never needs a token. With
+`TRANSPORT=stdio` there is nothing to probe and the check always passes.
 
 ```bash
 docker inspect -f '{{.State.Health.Status}}' cachydb   # starting, healthy, unhealthy
@@ -142,11 +153,12 @@ services:
   cachydb:
     image: hovhannespalyan/cachydb:latest
     ports:
-      - "127.0.0.1:7601:7601"   # drop 127.0.0.1: to listen on all interfaces
+      - "127.0.0.1:7601:7601"   # localhost only: there is no token (AUTH=off)
     volumes:
       - cachydb-data:/data
     environment:
       DB_NAME: main
+      AUTH: "off"               # or create a user and remove this line
     restart: unless-stopped
 
 volumes:
@@ -154,7 +166,9 @@ volumes:
 ```
 
 The service inherits the image's healthcheck. Other services in the same
-Compose project reach it at `http://cachydb:7601/mcp`.
+Compose project reach it at `http://cachydb:7601/mcp`, without a token
+while `AUTH` is `off`; without that line the container needs a user (see
+Quick start).
 
 ## MCP client configuration
 

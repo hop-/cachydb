@@ -17,6 +17,10 @@ var (
 
 	generalRootDir          string
 	generalServerPort       int
+	generalHost             string
+	generalAuth             string
+	generalTLSCert          string
+	generalTLSKey           string
 	generalTransport        string
 	generalDBName           string
 	generalWALRetentionAge  time.Duration

@@ -12,11 +12,48 @@ engine's job (see [STORAGE.md](STORAGE.md)). Overview:
 | Setting | How to set it | Default |
 |---------|---------------|---------|
 | Transport | `-t` / `--transport` flag, or `TRANSPORT` env var (`stdio` or `http`) | `stdio` |
+| HTTP listen host | `--host` flag, or `HOST` env var | `127.0.0.1` (this machine only; the Docker image sets `0.0.0.0`) |
 | HTTP port | `-p` / `--port` flag, or `PORT` env var | `7601` |
+| Authentication | `--auth` flag, or `AUTH` env var: `auto`, `required`, `off` (anything else is a start-up error) | `auto` |
+| TLS | `--tls-cert` and `--tls-key` flags, or `TLS_CERT` and `TLS_KEY` env vars (PEM files; both or neither) | none: plain HTTP |
 | Data directory | `-R` / `--root` flag, or `ROOT_DIR` env var | `~/.cachydb` |
 | Default database | `-d` / `--db` flag, or `DB_NAME` env var | `main` |
 
 Precedence: flag > environment variable > default.
+
+The listener settings travel as one `mcpserver.ListenConfig` (`Host`,
+`Port`, `TLSCert`, `TLSKey`; `internal/mcp/listen.go`) from
+`app.Builder.WithListen` to `mcpserver.New(ctx, engine, Config)`.
+`NewServer(ctx, engine, db, transport, "host:port", version)` remains as a
+shorthand for a server without TLS or tokens (tests use it).
+
+### When tokens are required
+
+`auth.Decide(mode, http, host)` (`internal/auth/policy.go`) applies the
+start-up matrix; loopback means the host is `127.0.0.1`, `::1`, or
+`localhost` (`auth.IsLoopback`):
+
+| Transport | Listener | `auto` | `required` | `off` |
+| --- | --- | --- | --- | --- |
+| stdio | — | no tokens | no tokens | no tokens |
+| HTTP | loopback host | no tokens | tokens required | no tokens |
+| HTTP | any other host | tokens required | tokens required | no tokens, WARN at start |
+
+`app.Builder.Build` validates the mode and the TLS pair before opening the
+engine. When tokens are required it opens the `auth.Store` (`_system`) and,
+if no user exists, returns `app.ErrNoUsers` with a message naming
+`cachydb utils user add`, `BOOTSTRAP_ADMIN_TOKEN`, and `AUTH=off`; the
+process exits 1 and the default database is not created. Anything that
+creates users at start-up belongs in `openUsers`, before that check.
+`AUTH=off` on a non-loopback host logs a WARN through the engine logger.
+
+With tokens required, `httpHandler()` wraps only `/mcp` in the SDK's
+`auth.RequireBearerToken` (`AllowMissingExpiration`, tokens do not expire):
+a request without a valid bearer token gets 401; the verifier
+(`Server.verifyToken`) calls `Store.Authenticate` and returns
+`TokenInfo{UserID: name}`, which the SDK binds to the session. Until tools
+check per-database access, the verifier accepts only server-admin tokens.
+`/healthz` never needs a token.
 
 ## Transports
 
@@ -39,9 +76,14 @@ initialize + tools/call piped and stdin closed at once: no output, exit 0).
 ### Streamable HTTP
 
 `cachydb -t http -p 7601` serves the MCP Streamable HTTP transport (spec
-2025-03-26+) at `http://<host>:7601/mcp`, listening on all interfaces.
+2025-03-26+) at `http://127.0.0.1:7601/mcp` (`--host` changes the host).
 Multiple concurrent sessions are supported. Idle sessions are closed after
-**30 minutes** (`httpSessionTimeout`). There is no authentication or TLS.
+**30 minutes** (`httpSessionTimeout`). With both TLS files, `startHTTP`
+loads the key pair before listening (a bad file fails the start-up) and
+serves `http.Server.ServeTLS`. The start-up line on stderr names the
+scheme, the address, and whether tokens are required, for example
+`CachyDB MCP server listening on https://0.0.0.0:7601/mcp (Streamable HTTP
+transport, tokens required)`.
 
 ```json
 { "mcpServers": { "cachydb": { "url": "http://localhost:7601/mcp" } } }

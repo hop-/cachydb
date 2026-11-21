@@ -5,19 +5,27 @@
 # The MCP endpoint is http://localhost:7601/mcp (from other services in
 # this project: http://cachydb:7601/mcp). Data is kept in the named volume
 # cachydb-data. The healthcheck comes from the image (cachydb healthcheck).
+#
+# The image listens on every interface of the container (HOST=0.0.0.0), so
+# by default (AUTH=auto) clients need a token, and the container refuses
+# to start while no user exists. This example sets AUTH=off instead; that
+# is only safe because the port is published on localhost and the
+# project's network is trusted. To require tokens, remove AUTH and create
+# a user ("cachydb utils user add", or BOOTSTRAP_ADMIN_TOKEN).
 # Settings are environment variables; see DOCKERHUB.md or
 # "docker run --rm hovhannespalyan/cachydb docs config".
 services:
   cachydb:
     image: hovhannespalyan/cachydb:latest
     ports:
-      # No authentication or TLS: publish on localhost only, or keep the
-      # service on a trusted network.
+      # No authentication (AUTH=off) and no TLS: publish on localhost only,
+      # or keep the service on a trusted network.
       - "127.0.0.1:7601:7601"
     volumes:
       - cachydb-data:/data
     environment:
       DB_NAME: main
+      AUTH: "off"
       # CACHE_SIZE: 256MiB
       # WAL_RETENTION_AGE: 24h
     restart: unless-stopped

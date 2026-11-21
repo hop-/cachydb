@@ -1,7 +1,7 @@
 ---
 name: mcp
 title: Using cachydb as an MCP server
-summary: stdio vs Streamable HTTP, client configuration examples (incl. Docker), health checks, per-session databases, the data-directory lock, cachydb client, and the 21 tools by task
+summary: stdio vs Streamable HTTP, listen host, tokens and TLS, client configuration examples (incl. Docker), health checks, per-session databases, the data-directory lock, cachydb client, and the 21 tools by task
 ---
 <!--
 Client config formats checked on 2026-11-01 against the official docs:
@@ -20,9 +20,22 @@ cachydb speaks MCP over two transports:
   MCP messages; logs go to stderr. The server exits (status 0) when the
   client closes stdin.
 - **Streamable HTTP**: `cachydb -t http -p 7601` serves
-  `http://localhost:7601/mcp`, listening on all interfaces. Many clients
-  can connect at once; idle sessions are closed after 30 minutes. There is
-  no authentication or TLS, so keep it on a trusted network.
+  `http://localhost:7601/mcp`, listening on `127.0.0.1` (this machine
+  only; `--host 0.0.0.0` for every interface). Many clients can connect at
+  once; idle sessions are closed after 30 minutes. `--tls-cert` and
+  `--tls-key` serve HTTPS.
+
+## Tokens (`AUTH`)
+
+stdio and loopback HTTP need no token. HTTP on any other host needs one
+(`AUTH=auto`, the default), as does all HTTP with `AUTH=required`;
+`AUTH=off` never asks for one and logs a warning on a non-loopback host.
+Clients send `Authorization: Bearer <token>`; without a valid token
+`/mcp` answers 401. When a token is needed and no user exists, cachydb
+refuses to start: create the first admin with
+`cachydb utils user add NAME --admin` (server stopped), set
+`BOOTSTRAP_ADMIN_TOKEN`, or set `AUTH=off` on a trusted network only.
+See `cachydb docs config`.
 
 Use absolute paths in client configs. Replace `/path/to/cachydb` with the
 binary's location (`which cachydb`) and `/path/to/data` with the data
@@ -116,9 +129,14 @@ runs the HTTP transport on port 7601 by default, as the non-root user
 65532, with its data in the `/data` volume. Configure it with environment
 variables (see `cachydb docs config`).
 
+The image listens on every interface (`HOST=0.0.0.0`), so **a container
+needs a user or `AUTH=off`**: without either it exits at start with the
+refusal message. For local use, publish the port on localhost and set
+`AUTH=off`:
+
 ```bash
-# HTTP server: http://localhost:7601/mcp
-docker run -d --name cachydb -p 7601:7601 -v cachydb-data:/data hovhannespalyan/cachydb
+# HTTP server: http://localhost:7601/mcp, no tokens
+docker run -d --name cachydb -p 127.0.0.1:7601:7601 -v cachydb-data:/data -e AUTH=off hovhannespalyan/cachydb
 
 # Claude Code against the HTTP container
 claude mcp add --transport http cachydb http://localhost:7601/mcp
@@ -160,9 +178,12 @@ cachydb healthcheck --url http://db.internal:7601/healthz
 ```
 
 Without `--url`, it reads `PORT` and `TRANSPORT` (or `-p`, `-t`); if the
-transport is `stdio` there is nothing to probe and it exits 0. It never
-opens the database. The Docker image uses it as its `HEALTHCHECK`, so set
-`PORT` and `TRANSPORT` in a container as environment variables, not
+transport is `stdio` there is nothing to probe and it exits 0. With
+`TLS_CERT` and `TLS_KEY` (or `--tls-cert`, `--tls-key`) it probes
+`https://` and, on loopback, does not verify the certificate.
+`/healthz` never needs a token. It never opens the database. The Docker
+image uses it as its `HEALTHCHECK`, so set `PORT`, `TRANSPORT`,
+`TLS_CERT` and `TLS_KEY` in a container as environment variables, not
 flags.
 
 ## Choosing the database

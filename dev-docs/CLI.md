@@ -22,7 +22,11 @@ cachydb app [flags]
 |------|-------|---------|-------------|
 | `--transport` | `-t` | `stdio` (or `TRANSPORT`) | `stdio` or `http`; any other value fails |
 | `--db` | `-d` | `main` (or `DB_NAME`) | Default database; created at startup if missing |
-| `--port` | `-p` | `7601` (or `PORT`) | HTTP port (listens on all interfaces, path `/mcp`) |
+| `--port` | `-p` | `7601` (or `PORT`) | HTTP port (path `/mcp`) |
+| `--host` | | `127.0.0.1` (or `HOST`) | HTTP listen host; `0.0.0.0` or `::` = every interface |
+| `--auth` | | `auto` (or `AUTH`) | `auto`, `required`, or `off`; any other value fails |
+| `--tls-cert` | | none (or `TLS_CERT`) | PEM certificate; with `--tls-key`, serve HTTPS |
+| `--tls-key` | | none (or `TLS_KEY`) | PEM private key; with `--tls-cert`, serve HTTPS |
 | `--root` | `-R` | `~/.cachydb` (or `ROOT_DIR`) | Data directory |
 | `--wal-retention-age` | | `24h` (or `WAL_RETENTION_AGE`) | Keep processed WAL segments this long; Go duration; `0` = no age limit |
 | `--wal-retention-size` | | `1GiB` (or `WAL_RETENTION_SIZE`) | Keep at most this much processed WAL; `0` = no size limit |
@@ -33,7 +37,17 @@ command) on the same directory fails with *"data directory is in use by
 another cachydb process"*.
 
 Unknown transports fail at startup (`invalid transport "x": use stdio or
-http`).
+http`), and so do an unknown `--auth` value and one TLS file without the
+other (checked by `app.Builder.Build` before the engine opens).
+
+Tokens are required for HTTP under `--auth required`, and under `auto`
+when the host is not loopback (`127.0.0.1`, `::1`, `localhost`); stdio
+never needs one (matrix: [MCP_SERVER.md](MCP_SERVER.md#when-tokens-are-required)).
+When tokens are required and no user exists the server exits 1 with
+*"refusing to start: ... no user exists. Create the first admin with
+"cachydb utils user add NAME --admin" ..., or set BOOTSTRAP_ADMIN_TOKEN
+...; or ... AUTH=off (--auth off)"*. `--auth off` on a non-loopback host
+starts and logs a WARN.
 
 ### `cachydb docs`
 
@@ -89,6 +103,7 @@ never opens the engine or takes the data-directory lock.
 
 ```bash
 TRANSPORT=http cachydb healthcheck                    # GET http://127.0.0.1:$PORT/healthz
+TRANSPORT=http TLS_CERT=c.pem TLS_KEY=k.pem cachydb healthcheck   # GET https://127.0.0.1:$PORT/healthz
 cachydb healthcheck --url http://db.internal:7601/healthz
 cachydb healthcheck                                   # TRANSPORT unset (stdio): exits 0, nothing to probe
 ```
@@ -98,6 +113,12 @@ cachydb healthcheck                                   # TRANSPORT unset (stdio):
 | `--url` | | `http://127.0.0.1:<port>/healthz` | Endpoint to probe; an explicit URL is always probed |
 | `--port` | `-p` | `7601` (or `PORT`) | Port for the default URL |
 | `--transport` | `-t` | `stdio` (or `TRANSPORT`) | Without `--url`, `stdio` means nothing to probe |
+| `--tls-cert`, `--tls-key` | | none (or `TLS_CERT`, `TLS_KEY`) | With both set, the default URL is `https://`; the files are not read |
+
+An `https://` URL on a loopback host is probed without certificate
+verification (`healthClient`): the certificate names the public host and
+is often self-signed, and the probe sends nothing secret. `/healthz` never
+needs a token.
 
 - **Exit 0**: the endpoint answered `200`. Nothing is written.
 - **Exit 1**: connection error, another status (`503` while the server
@@ -276,6 +297,10 @@ status 1 and an error that names the variable.
 | Environment variable | Default | Flag |
 |----------------------|---------|------|
 | `PORT` | `7601` | `-p, --port` |
+| `HOST` | `127.0.0.1` | `--host` |
+| `AUTH` | `auto` | `--auth` |
+| `TLS_CERT` | none | `--tls-cert` (server and `healthcheck`) |
+| `TLS_KEY` | none | `--tls-key` (server and `healthcheck`) |
 | `ROOT_DIR` | `~/.cachydb` | `-R, --root` |
 | `DB_NAME` | `main` | `-d, --db` |
 | `TRANSPORT` | `stdio` | `-t, --transport` |

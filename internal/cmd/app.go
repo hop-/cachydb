@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/hop-/cachydb/internal/config"
+	mcpserver "github.com/hop-/cachydb/internal/mcp"
 	"github.com/spf13/cobra"
 )
 
@@ -14,10 +15,17 @@ var appCmd = &cobra.Command{
 	Short: "Run the MCP server (same as running cachydb with no command)",
 	Long: `Open the data directory and run the MCP server until the client closes
 stdin (stdio), or SIGINT/SIGTERM arrives. On shutdown every change is
-flushed to the data segments. See "cachydb docs mcp" for client setup.`,
+flushed to the data segments. See "cachydb docs mcp" for client setup.
+
+HTTP listens on 127.0.0.1 (this machine only) unless --host says
+otherwise. Clients need a token when --auth is required, or when it is
+auto (the default) and the host is not loopback (127.0.0.1, ::1,
+localhost); the server then refuses to start while no user exists. stdio
+never needs a token. With --tls-cert and --tls-key it serves HTTPS.`,
 	Example: `  cachydb app -R /path/to/data             # stdio
   cachydb app -t http -p 8080              # Streamable HTTP at http://localhost:8080/mcp
-  TRANSPORT=http PORT=8080 cachydb app     # the same settings from the environment`,
+  TRANSPORT=http PORT=8080 cachydb app     # the same settings from the environment
+  cachydb app -t http --host 0.0.0.0 --tls-cert cert.pem --tls-key key.pem   # HTTPS on every interface, tokens required`,
 	Args: cobra.NoArgs,
 	RunE: runApp,
 }
@@ -39,7 +47,31 @@ func setAllFlagsToCmd(cmd *cobra.Command) {
 		&generalServerPort,
 		"port", "p",
 		c.Port,
-		"HTTP port; the server listens on all interfaces at /mcp (env PORT)",
+		"HTTP port, path /mcp (env PORT)",
+	)
+	cmd.Flags().StringVar(
+		&generalHost,
+		"host",
+		c.Host,
+		"HTTP listen host: 127.0.0.1 = this machine only, 0.0.0.0 = every interface (needs a user or --auth off) (env HOST)",
+	)
+	cmd.Flags().StringVar(
+		&generalAuth,
+		"auth",
+		c.Auth,
+		"auto: HTTP clients need a token unless the host is loopback; required: always for HTTP; off: never (env AUTH)",
+	)
+	cmd.Flags().StringVar(
+		&generalTLSCert,
+		"tls-cert",
+		c.TLSCert,
+		"TLS certificate file (PEM); with --tls-key, serve HTTPS (env TLS_CERT)",
+	)
+	cmd.Flags().StringVar(
+		&generalTLSKey,
+		"tls-key",
+		c.TLSKey,
+		"TLS private key file (PEM); with --tls-cert, serve HTTPS (env TLS_KEY)",
 	)
 	cmd.Flags().StringVarP(
 		&generalRootDir,
@@ -86,7 +118,13 @@ func runApp(cmd *cobra.Command, _ []string) error {
 	application, err := newBuilder().
 		WithDBName(dbName()).
 		WithTransport(generalTransport).
-		WithPort(generalServerPort).
+		WithListen(mcpserver.ListenConfig{
+			Host:    generalHost,
+			Port:    generalServerPort,
+			TLSCert: generalTLSCert,
+			TLSKey:  generalTLSKey,
+		}).
+		WithAuth(generalAuth).
 		WithVersion(getVersion()).
 		Build(ctx)
 	if err != nil {

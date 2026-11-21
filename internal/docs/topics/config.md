@@ -1,7 +1,7 @@
 ---
 name: config
 title: Configuration
-summary: Every flag and environment variable, defaults, precedence (flag > env > default), value formats, cachydb client (CACHYDB_URL), and the export format
+summary: Every flag and environment variable, defaults, precedence (flag > env > default), listen host, AUTH and TLS, value formats, cachydb client (CACHYDB_URL), and the export format
 ---
 # Configuration
 
@@ -13,9 +13,31 @@ environment variable, which wins over the default.**
 | Flag | Env var | Default | Meaning |
 | --- | --- | --- | --- |
 | `-t, --transport` | `TRANSPORT` | `stdio` | `stdio` or `http`; any other value is an error |
-| `-p, --port` | `PORT` | `7601` | HTTP port; listens on all interfaces, path `/mcp` |
+| `-p, --port` | `PORT` | `7601` | HTTP port, path `/mcp` |
+| `--host` | `HOST` | `127.0.0.1` | HTTP listen host; `127.0.0.1` = this machine only, `0.0.0.0` = every interface |
+| `--auth` | `AUTH` | `auto` | `auto`, `required`, or `off` (see below); any other value is an error |
+| `--tls-cert` | `TLS_CERT` | none | PEM certificate file; with `--tls-key`, serve HTTPS |
+| `--tls-key` | `TLS_KEY` | none | PEM private key file; with `--tls-cert`, serve HTTPS |
 | `-R, --root` | `ROOT_DIR` | `~/.cachydb` | Data directory (one server per directory) |
 | `-d, --db` | `DB_NAME` | `main` | Default database; created at startup if missing |
+
+### When clients need a token
+
+| Transport | Listen host | `AUTH=auto` | `AUTH=required` | `AUTH=off` |
+| --- | --- | --- | --- | --- |
+| stdio | - | no token | no token | no token |
+| HTTP | loopback (`127.0.0.1`, `::1`, `localhost`) | no token | token | no token |
+| HTTP | any other host | token | token | no token (warning logged) |
+
+When clients need a token and no user exists, cachydb refuses to start
+(exit 1) and says how to go on: create the first admin with
+`cachydb utils user add NAME --admin` while the server is stopped, set
+`BOOTSTRAP_ADMIN_TOKEN`, or, on a trusted network only, set `AUTH=off`.
+Clients send the token as `Authorization: Bearer <token>`; without a
+valid one, `/mcp` answers 401. `/healthz` never needs a token.
+
+TLS needs both files; setting only one is a start-up error. The
+certificate and key are read once at start-up.
 
 ## Engine tuning (server and `cachydb utils`)
 
@@ -85,20 +107,27 @@ the same file except the header's `created`. A header with another
 | `--url` | | `http://127.0.0.1:<port>/healthz` | Endpoint to probe; always probed when given |
 | `-p, --port` | `PORT` | `7601` | Port for the default URL |
 | `-t, --transport` | `TRANSPORT` | `stdio` | Without `--url`, `stdio` means nothing to probe (exit 0) |
+| `--tls-cert`, `--tls-key` | `TLS_CERT`, `TLS_KEY` | none | With both, the default URL is `https://` |
 
-Exit 0 on HTTP 200; exit 1 otherwise (3-second timeout). See
+Exit 0 on HTTP 200; exit 1 otherwise (3-second timeout). An `https://`
+URL on a loopback host is probed without verifying the certificate. See
 `cachydb docs mcp`.
 
 ## Docker image
 
-The image `hovhannespalyan/cachydb` sets `TRANSPORT=http`, `PORT=7601`,
-`ROOT_DIR=/data` and `DB_NAME=main`, and passes no flags, so every
-variable above works with `-e`. Keep `ROOT_DIR=/data` (the volume).
-Arguments after the image name are passed to cachydb; flags still win
-over variables, but the image's healthcheck reads only the variables.
+The image `hovhannespalyan/cachydb` sets `TRANSPORT=http`,
+`HOST=0.0.0.0`, `PORT=7601`, `ROOT_DIR=/data` and `DB_NAME=main`, and
+passes no flags, so every variable above works with `-e`. Keep
+`ROOT_DIR=/data` (the volume). Arguments after the image name are passed
+to cachydb; flags still win over variables, but the image's healthcheck
+reads only the variables.
+
+**A container needs a user or `AUTH=off`:** with `HOST=0.0.0.0` and the
+default `AUTH=auto`, clients need a token, so a container without a user
+exits at start with the refusal message above.
 
 ```bash
-docker run -d -p 8080:8080 -v cachydb-data:/data -e PORT=8080 -e DB_NAME=app hovhannespalyan/cachydb
+docker run -d -p 127.0.0.1:8080:8080 -v cachydb-data:/data -e PORT=8080 -e DB_NAME=app -e AUTH=off hovhannespalyan/cachydb
 docker run -i --rm -v cachydb-data:/data -e TRANSPORT=stdio hovhannespalyan/cachydb
 ```
 
@@ -122,6 +151,7 @@ docker run -i --rm -v cachydb-data:/data -e TRANSPORT=stdio hovhannespalyan/cach
 cachydb -R /srv/cachydb -d app                 # stdio, custom directory and default database
 ROOT_DIR=/srv/cachydb TRANSPORT=http cachydb   # same settings from the environment
 cachydb -t http -p 8080 --cache-size 256MiB    # HTTP on port 8080 with a bigger cache
+cachydb -t http --host 0.0.0.0 --tls-cert cert.pem --tls-key key.pem   # HTTPS on every interface; needs a user
 ```
 
 ## Exit status and output
