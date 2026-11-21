@@ -441,7 +441,10 @@ func (s *Server) startHTTP(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("loading the TLS certificate and key: %w", err)
 		}
-		httpServer.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+		httpServer.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
 		scheme = "https"
 	}
 	ln, err := net.Listen("tcp", s.httpAddr)

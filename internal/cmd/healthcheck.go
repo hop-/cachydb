@@ -137,12 +137,18 @@ func healthcheck(ctx context.Context, stderr io.Writer, url, transport string, p
 // healthClient returns the client that probes u. An HTTPS URL on a
 // loopback host skips certificate verification: the certificate names
 // the server's public host, not 127.0.0.1, and often is self-signed, and
-// the probe sends no secret and only reads the status.
+// the probe sends no secret and only reads the status. That client does
+// not follow redirects, so only the loopback answer counts.
 func healthClient(u *url.URL) *http.Client {
 	if u.Scheme != "https" || !auth.IsLoopback(u.Hostname()) {
 		return http.DefaultClient
 	}
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	return &http.Client{Transport: t}
+	return &http.Client{
+		Transport: t,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }

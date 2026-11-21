@@ -89,6 +89,10 @@ type Store struct {
 
 	mu   sync.Mutex // serializes changes and refreshes
 	snap atomic.Pointer[snapshot]
+	// broken is set when the refresh after a change failed, so snap may
+	// be stale (a revoked token or deleted user still in it). Until a
+	// refresh succeeds, Authenticate and Principal fail closed.
+	broken atomic.Bool
 }
 
 // snapshot is an immutable copy of the stored users and tokens.
@@ -172,20 +176,46 @@ func (s *Store) refresh(ctx context.Context) error {
 		slices.SortFunc(u.tokens, func(a, b Token) int { return strings.Compare(a.Label, b.Label) })
 	}
 	s.snap.Store(snap)
+	s.broken.Store(false)
 	return nil
 }
 
 // change runs fn under the change lock and refreshes the in-memory copy
 // afterwards, also when fn fails (it may have written part of a change).
-// The refresh ignores ctx's cancellation so the copy cannot be left stale.
+// The refresh ignores ctx's cancellation and is retried once. If it still
+// fails, the store is marked broken: Authenticate and Principal then fail
+// closed, retrying the refresh, until one succeeds.
 func (s *Store) change(ctx context.Context, fn func() error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	err := fn()
-	if rerr := s.refresh(context.WithoutCancel(ctx)); rerr != nil {
-		return errors.Join(err, rerr)
+	rctx := context.WithoutCancel(ctx)
+	rerr := s.refresh(rctx)
+	if rerr != nil {
+		rerr = s.refresh(rctx)
+	}
+	if rerr != nil {
+		s.broken.Store(true)
+		return errors.Join(err, fmt.Errorf("reloading the users after a change (authentication fails until a reload succeeds): %w", rerr))
 	}
 	return err
+}
+
+// current returns the in-memory copy. If the store is broken it first
+// retries the refresh, and returns an error wrapping ErrUnauthenticated if
+// that fails too.
+func (s *Store) current() (*snapshot, error) {
+	if !s.broken.Load() {
+		return s.snap.Load(), nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.broken.Load() {
+		if err := s.refresh(context.Background()); err != nil {
+			return nil, fmt.Errorf("%w: the user store could not be reloaded", ErrUnauthenticated)
+		}
+	}
+	return s.snap.Load(), nil
 }
 
 // HasUsers reports whether at least one user exists.
@@ -224,7 +254,11 @@ func (u *userRec) user() User {
 // Principal returns the current principal of the user name, or an error
 // wrapping ErrUnauthenticated if the user does not exist.
 func (s *Store) Principal(name string) (Principal, error) {
-	u, ok := s.snap.Load().users[name]
+	snap, err := s.current()
+	if err != nil {
+		return Principal{}, err
+	}
+	u, ok := snap.users[name]
 	if !ok {
 		return Principal{}, fmt.Errorf("%w: user %q does not exist", ErrUnauthenticated, name)
 	}
@@ -238,7 +272,10 @@ func (s *Store) Principal(name string) (Principal, error) {
 // may have any form ValidateBootstrapToken accepts.
 func (s *Store) Authenticate(token string) (Principal, error) {
 	if token != "" {
-		snap := s.snap.Load()
+		snap, err := s.current()
+		if err != nil {
+			return Principal{}, err
+		}
 		if t, ok := snap.tokens[digest(token)]; ok {
 			if u, ok := snap.users[t.user]; ok {
 				return u.principal.clone(), nil

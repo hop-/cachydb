@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -197,16 +198,29 @@ func clientToken() string {
 	return os.Getenv("CACHYDB_TOKEN")
 }
 
-// bearerTransport sends token (if any) as a bearer token on every request
-// and remembers whether the server answered 401 Unauthorized.
+// bearerTransport sends token (if any) as a bearer token on requests to
+// the endpoint's scheme and host only, and remembers whether the server
+// answered 401 Unauthorized.
 type bearerTransport struct {
 	token        string
+	scheme, host string // the endpoint's; the token is sent nowhere else
 	base         http.RoundTripper
 	unauthorized atomic.Bool
 }
 
+// newBearerTransport returns a bearerTransport that sends token to
+// endpoint only. An endpoint that does not parse gets no token; connecting
+// to it fails anyway.
+func newBearerTransport(endpoint, token string) *bearerTransport {
+	t := &bearerTransport{token: token, base: http.DefaultTransport}
+	if u, err := url.Parse(endpoint); err == nil {
+		t.scheme, t.host = u.Scheme, u.Host
+	}
+	return t
+}
+
 func (t *bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	if t.token != "" {
+	if t.token != "" && t.host != "" && r.URL.Scheme == t.scheme && strings.EqualFold(r.URL.Host, t.host) {
 		// A RoundTripper must not modify the caller's request.
 		r = r.Clone(r.Context())
 		r.Header.Set("Authorization", "Bearer "+t.token)
@@ -234,7 +248,7 @@ func (t *bearerTransport) authHint() string {
 // clientToken, calls fn, and closes the session. An error after a 401
 // answer carries a hint that names --token.
 func withClient(ctx context.Context, url string, fn func(*mcp.ClientSession) error) (err error) {
-	rt := &bearerTransport{token: clientToken(), base: http.DefaultTransport}
+	rt := newBearerTransport(url, clientToken())
 	defer func() {
 		if hint := rt.authHint(); err != nil && hint != "" {
 			err = fmt.Errorf("%s: %w", hint, err)
@@ -243,7 +257,7 @@ func withClient(ctx context.Context, url string, fn func(*mcp.ClientSession) err
 	client := mcp.NewClient(&mcp.Implementation{Name: "cachydb-client", Version: getVersion()}, nil)
 	cs, err := client.Connect(ctx, &mcp.StreamableClientTransport{
 		Endpoint:             url,
-		HTTPClient:           &http.Client{Transport: rt},
+		HTTPClient:           &http.Client{Transport: rt, CheckRedirect: refuseRedirect},
 		DisableStandaloneSSE: true,
 		MaxRetries:           -1,
 	}, nil)
@@ -259,6 +273,13 @@ func withClient(ctx context.Context, url string, fn func(*mcp.ClientSession) err
 		}
 	}()
 	return fn(cs)
+}
+
+// refuseRedirect is the client's redirect policy: the MCP endpoint never
+// needs a redirect, and following one could send the request, token
+// included, to another host or over plain HTTP.
+func refuseRedirect(req *http.Request, _ []*http.Request) error {
+	return fmt.Errorf("the server redirected to %s; cachydb client does not follow redirects: set --url / CACHYDB_URL to the final endpoint", req.URL.Redacted())
 }
 
 // listClientTools prints the server's tools.

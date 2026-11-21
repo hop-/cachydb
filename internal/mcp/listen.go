@@ -24,10 +24,14 @@ type ListenConfig struct {
 	TLSKey  string
 }
 
-// HostOrDefault returns Host, or DefaultHost if it is empty.
+// HostOrDefault returns Host without one pair of surrounding brackets (so
+// "[::1]" and "::1" are the same), or DefaultHost if it is empty.
 func (c ListenConfig) HostOrDefault() string {
 	if c.Host == "" {
 		return DefaultHost
+	}
+	if len(c.Host) > 2 && c.Host[0] == '[' && c.Host[len(c.Host)-1] == ']' {
+		return c.Host[1 : len(c.Host)-1]
 	}
 	return c.Host
 }
