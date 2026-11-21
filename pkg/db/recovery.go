@@ -993,9 +993,8 @@ func (c *Collection) replayItem(op wal.Op, id string, doc []byte, off uint64, sk
 		}
 	}
 
-	size := int64(len(id)+len(doc)) + memEntryOverhead
 	c.mu.Lock()
-	c.applyLocked(id, existed, base, baseOff, next, off, size)
+	c.applyLocked(id, existed, base, baseOff, next, doc, off)
 	c.mu.Unlock()
 	return true, nil
 }

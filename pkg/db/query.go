@@ -64,6 +64,13 @@ func (c *Collection) FindWithPlan(ctx context.Context, q *Query) ([]*Document, Q
 	if err != nil {
 		return nil, QueryPlan{}, err
 	}
+	return c.runQuery(ctx, cq)
+}
+
+// runQuery runs a compiled query, planning it again (up to maxReadRetries
+// times) when a compaction or an index change interrupted it. Callers are
+// inside an enter/exit pair.
+func (c *Collection) runQuery(ctx context.Context, cq *compiledQuery) ([]*Document, QueryPlan, error) {
 	for attempt := 0; ; attempt++ {
 		docs, plan, err := c.findOnce(ctx, cq, attempt < maxReadRetries/2)
 		if errors.Is(err, errQueryRetry) {
@@ -103,6 +110,7 @@ type compiledQuery struct {
 	fields      []string
 	fieldPaths  []fieldPath // the fields of the projection, split once
 	skip, limit int
+	now         string // the time $now values resolved to (RFC 3339)
 }
 
 // compileQuery compiles q (nil matches everything).
@@ -121,6 +129,7 @@ func compileQuery(q *Query) (*compiledQuery, error) {
 		fieldPaths: compilePaths(q.Fields),
 		skip:       max(q.Skip, 0),
 		limit:      max(q.Limit, 0),
+		now:        ts,
 	}
 	for _, g := range resolveNowGroups(q.Any, ts) {
 		cg, err := compileFilters(g)

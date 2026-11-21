@@ -3,7 +3,6 @@ package db
 import (
 	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -438,8 +437,10 @@ func (c *Collection) flush() error {
 
 // flushRecords returns the flushing entries sorted by WAL offset and the
 // segment records to append for them: one put or tombstone per entry, in
-// the same order. (Checkpoint marker records are no longer written; the
-// checkpoint is in the index file.)
+// the same order. A put carries the entry's WAL payload as is: the same
+// JSON the document was decoded from, so nothing is encoded again.
+// (Checkpoint marker records are no longer written; the checkpoint is in
+// the index file.)
 func flushRecords(flushing map[string]memEntry) ([]flushEntry, []segment.Record, error) {
 	entries := make([]flushEntry, 0, len(flushing))
 	for id, me := range flushing {
@@ -453,11 +454,10 @@ func flushRecords(flushing map[string]memEntry) ([]flushEntry, []segment.Record,
 			recs = append(recs, segment.Record{Type: segment.TypeTombstone, WALOffset: en.me.walOffset, ID: en.id})
 			continue
 		}
-		data, err := json.Marshal(en.me.doc)
-		if err != nil {
-			return nil, nil, fmt.Errorf("encoding document %q: %w", en.id, err)
+		if len(en.me.payload) == 0 {
+			return nil, nil, fmt.Errorf("document %q at WAL offset %d has no encoded payload", en.id, en.me.walOffset)
 		}
-		recs = append(recs, segment.Record{Type: segment.TypePut, WALOffset: en.me.walOffset, ID: en.id, Doc: data})
+		recs = append(recs, segment.Record{Type: segment.TypePut, WALOffset: en.me.walOffset, ID: en.id, Doc: en.me.payload})
 	}
 	return entries, recs, nil
 }

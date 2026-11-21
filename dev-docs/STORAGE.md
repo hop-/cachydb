@@ -265,7 +265,7 @@ newest transaction, the meta pages, the `meta` bucket and layout).
 | Field | Role |
 |-------|------|
 | `store` | the open `index.db` (`*idxstore.Store`); nil before load, after drop/detach/close, and on a renamed collection until first use (`indexStore` opens it lazily, under `storeMu`) |
-| `memtable` | changes durable in the WAL but not yet in the index file (nil doc = tombstone); each `memEntry` also carries `base`/`baseOff` (below) |
+| `memtable` | changes durable in the WAL but not yet in the index file (nil doc = tombstone); each `memEntry` also carries the after-image's WAL `payload` bytes (written to the segment by the flush as is, never encoded again), `base`/`baseOff` (below), and its `size` (`memEntrySize`: id + 2 × payload, for the payload bytes and the decoded document, + 64; what `MemtableSize` and `MaxPendingBytes` count) |
 | `flushing` | the immutable memtable being flushed (still readable) |
 | `indexes` | the secondary index definitions (`indexDef{name, field, unique}`); the entries are in `index.db` |
 | `uniquePending` | unique index → encoded value → ids of unflushed documents holding it (hints for the uniqueness check) |
@@ -329,6 +329,12 @@ and `index.db` leaving out the batch's own ids, 6. register inflight
 once, one WAL append + fsync (`hookAfterWALSync`), 7. apply every item
 under one `Collection.mu` section, each with the record's offset. The
 memtable, flush, and segments see ordinary puts and tombstones.
+`UpdateMany`/`DeleteMany` find the ids on a snapshot first
+(`hookAfterMatch` follows), then run one batch whose build callbacks
+re-check the query under the document locks and return `errSkipWrite` for
+a document that no longer matches: `writeBatch` leaves it out (and out
+of the batch's unique-check exclusions); if every write is skipped,
+nothing is appended.
 
 Writes become visible only after they are durable. If the append fails,
 nothing is applied. Writes to different documents commit concurrently and
@@ -380,7 +386,8 @@ collection are still serialized by its `flushMu`:
 1. Under `Collection.mu`: `flushing = memtable`, new memtable, compute the
    checkpoint `cp` (one below the smallest offset of this collection's
    records the flush does not cover).
-2. Append the entries (sorted by WAL offset) to the active segment; one
+2. Append the entries (sorted by WAL offset) to the active segment, each
+   put with the WAL payload bytes its entry kept (no re-encoding); one
    fsync. No collection lock is held. (`hookAfterSegWrite`,
    `hookAfterSegSync`.)
 3. One `index.db` transaction (`applyFlush`), no collection lock held: for
@@ -592,6 +599,7 @@ The engine calls it at the points in `pkg/db/hooks.go`:
 | `hookRenameDir` | `rename_coll`: after the directory rename, before `coll.meta` |
 | `hookUpgradeCollection` | format upgrade: after each collection's `index.db` is built |
 | `hookUpgradeBeforeFormat` | format upgrade: after the format-2 files are removed, before `cachydb.format` is rewritten |
+| `hookAfterMatch` | `UpdateMany`/`DeleteMany`: after the snapshot found the ids, before the batch locks them (not a crash point: a test changes documents here to exercise skipping) |
 
 A hook can simulate a crash; the test then reopens the directory
 (`pkg/db/crash_test.go`). It is always nil outside tests.

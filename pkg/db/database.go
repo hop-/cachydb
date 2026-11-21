@@ -363,20 +363,19 @@ func renameDir(from, to string) error {
 	return nil
 }
 
-// copyWorkers is how many documents CopyCollection inserts at once, so
-// the WAL group commit batches them.
-const copyWorkers = 32
-
 // CopyCollection creates the collection newName in target (nil = this
 // database) with the schema and index definitions of the collection name
-// and inserts every document of it, with the same ids, through the normal
-// write path (plan 004 §3.5). It returns how many documents it copied. It
-// fails with ErrExists if the target exists.
+// and inserts every document of it, with the same ids, in ascending id
+// order through atomic batches (Collection.Batch): each batch holds at most
+// Options.MaxBatchDocs documents and about Options.MaxBatchBytes bytes and
+// costs one WAL record and fsync (plan 004 §3.5, plan 013 §3.1). It returns
+// how many documents it copied. It fails with ErrExists if the target
+// exists.
 //
-// It is not atomic: on an error (or a crash) the target may hold only
-// part of the documents; drop it and retry. The source is read as of the
-// start of the copy: documents written to it meanwhile may or may not be
-// included.
+// The copy as a whole is not atomic: on an error (or a crash) the target
+// may hold only the batches written before it; drop it and retry. The
+// source is read as of the start of the copy: documents written to it
+// meanwhile may or may not be included.
 func (d *Database) CopyCollection(ctx context.Context, name, newName string, target *Database) (int, error) {
 	if target == nil {
 		target = d
@@ -402,54 +401,119 @@ func (d *Database) CopyCollection(ctx context.Context, name, newName string, tar
 	if err != nil {
 		return 0, fmt.Errorf("copying collection %q: %w", name, err)
 	}
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var (
-		wg       sync.WaitGroup
-		mu       sync.Mutex
-		firstErr error
-		copied   int
-	)
-	work := make(chan string)
-	for range min(copyWorkers, max(len(ids), 1)) {
-		wg.Go(func() {
-			for id := range work {
-				doc, err := src.Get(ctx, id)
-				if errors.Is(err, ErrNotFound) {
-					continue // deleted since the copy started
-				}
-				if err == nil {
-					_, err = dst.Insert(ctx, doc)
-				}
-				mu.Lock()
-				if err != nil && firstErr == nil {
-					firstErr = fmt.Errorf("copying document %q: %w", id, err)
-					cancel()
-				} else if err == nil {
-					copied++
-				}
-				mu.Unlock()
-			}
-		})
-	}
-	var aborted error
-feed:
-	for _, id := range ids {
-		select {
-		case work <- id:
-		case <-ctx.Done():
-			aborted = ctx.Err()
-			break feed
-		}
-	}
-	close(work)
-	wg.Wait()
-	if firstErr == nil {
-		firstErr = aborted
-	}
-	if firstErr != nil {
-		return copied, fmt.Errorf("copying collection %q to %q (partial copy of %d documents; drop the target and retry): %w", name, newName, copied, firstErr)
+	copied, err := copyDocuments(ctx, src, dst, ids)
+	if err != nil {
+		return copied, fmt.Errorf("copying collection %q to %q (partial copy of %d documents; drop the target and retry): %w", name, newName, copied, err)
 	}
 	return copied, nil
+}
+
+// copyDocuments inserts the documents ids of src into dst in batches of at
+// most MaxBatchDocs documents and about MaxBatchBytes bytes (estimated
+// with approxJSONSize), skipping documents deleted since ids was taken. It
+// returns how many documents it inserted.
+func copyDocuments(ctx context.Context, src, dst *Collection, ids []string) (int, error) {
+	opts := &dst.db.e.opts
+	var (
+		ops    = make([]WriteOp, 0, min(len(ids), opts.MaxBatchDocs))
+		est    int64 // estimated payload bytes of ops
+		copied int
+	)
+	flush := func() error {
+		n, err := copyBatch(ctx, dst, ops)
+		copied += n
+		clear(ops) // drop the documents
+		ops, est = ops[:0], 0
+		return err
+	}
+	for _, id := range ids {
+		doc, err := src.Get(ctx, id)
+		if errors.Is(err, ErrNotFound) {
+			continue // deleted since the copy started
+		}
+		if err != nil {
+			return copied, fmt.Errorf("copying document %q: %w", id, err)
+		}
+		size := int64(approxJSONSize(doc.Data) + 2*len(id) + batchOpOverhead)
+		if len(ops) > 0 && est+size > opts.MaxBatchBytes {
+			if err := flush(); err != nil {
+				return copied, err
+			}
+		}
+		ops = append(ops, WriteOp{Kind: OpInsert, Document: doc})
+		est += size
+		if len(ops) == opts.MaxBatchDocs {
+			if err := flush(); err != nil {
+				return copied, err
+			}
+		}
+	}
+	if len(ops) > 0 {
+		if err := flush(); err != nil {
+			return copied, err
+		}
+	}
+	return copied, nil
+}
+
+// batchOpOverhead estimates the bytes a batch item takes besides its id and
+// document: the item header and the "_id" key in the JSON.
+const batchOpOverhead = 16
+
+// copyBatch inserts the documents of ops (inserts) into c as one batch. When
+// the batch's payload exceeds MaxBatchBytes (approxJSONSize is only an
+// estimate) it splits it in halves, and a single document over the limit
+// is inserted alone through Insert. It returns how many documents it
+// inserted; a failing document's error names it.
+func copyBatch(ctx context.Context, c *Collection, ops []WriteOp) (int, error) {
+	_, err := c.Batch(ctx, ops)
+	switch {
+	case err == nil:
+		return len(ops), nil
+	case errors.Is(err, ErrBatchTooLarge) && len(ops) > 1:
+		h := len(ops) / 2
+		n, err := copyBatch(ctx, c, ops[:h])
+		if err != nil {
+			return n, err
+		}
+		m, err := copyBatch(ctx, c, ops[h:])
+		return n + m, err
+	case errors.Is(err, ErrBatchTooLarge):
+		if _, err := c.Insert(ctx, ops[0].Document); err != nil {
+			return 0, fmt.Errorf("copying document %q: %w", ops[0].Document.ID, err)
+		}
+		return 1, nil
+	}
+	if bie, ok := errors.AsType[*BatchItemError](err); ok {
+		return 0, fmt.Errorf("copying document %q: %w", ops[bie.Index].Document.ID, bie.Err)
+	}
+	return 0, err
+}
+
+// approxJSONSize estimates the length of v, a decoded JSON value, encoded
+// as JSON, without encoding it: strings count without escapes and every
+// number as 16 bytes.
+func approxJSONSize(v any) int {
+	switch x := v.(type) {
+	case nil:
+		return 4
+	case bool:
+		return 5
+	case string:
+		return len(x) + 2
+	case map[string]any:
+		n := 2
+		for k, e := range x {
+			n += len(k) + 4 + approxJSONSize(e) // quotes, colon, comma
+		}
+		return n
+	case []any:
+		n := 2
+		for _, e := range x {
+			n += approxJSONSize(e) + 1
+		}
+		return n
+	default:
+		return 16
+	}
 }

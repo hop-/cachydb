@@ -43,9 +43,9 @@ Start with `dev-docs/PROJECT.md`, then `dev-docs/DEVELOPMENT.md`. User-facing do
 | Path | Role |
 |------|------|
 | `pkg/db/engine.go` | `Engine`, `Open`/`Close`, database operations |
-| `pkg/db/document.go`, `batch.go` | Document write path (WAL commit point; `UpdateWith`, `Replace`, `DeleteWith`, conditions), read path, candidate selection; `Collection.Batch` (WAL op 11, one record and fsync for many writes) |
+| `pkg/db/document.go`, `batch.go` | Document write path (WAL commit point; `UpdateWith`, `Replace`, `DeleteWith`, conditions), read path, candidate selection; `Collection.Batch` (WAL op 11, one record and fsync for many writes), `UpdateMany`/`DeleteMany` (writes by filter) |
 | `pkg/db/query.go`, `plan.go`, `compare.go`, `index.go`, `unique.go` | `Find` (OR groups, sort, projection), `CountDocuments`, `Distinct`; query plans and snapshots; compiled operators and `$now`; index entries; unique indexes (field paths: `types.go` `GetPath`) |
-| `pkg/db/collection.go`, `database.go` | Schema/index metadata ops incl. `UpdateSchema` (WAL op 9), `RenameCollection` (WAL op 10), `CopyCollection` |
+| `pkg/db/collection.go`, `database.go` | Schema/index metadata ops incl. `UpdateSchema` (WAL op 9), `RenameCollection` (WAL op 10), `CopyCollection` (through batches) |
 | `pkg/db/flush.go`, `recovery.go`, `upgrade.go`, `compact.go` | Parallel flusher (segment append, then one `index.db` transaction with the checkpoint), recovery (index file open, segment alignment, rebuild) and replay, format 2 → 3 upgrade, compaction (incl. small-segment merges) |
 | `pkg/db/backpressure.go`, `metacp.go` | `MaxPendingBytes` write backpressure; `cachydb.metacp` metadata checkpoint |
 | `pkg/db/internal/wal/`, `internal/segment/`, `internal/idxstore/` | WAL and data-segment file formats; `index.db` (the only bbolt importer: key table, index entries and key encoding, counters, checkpoint) |
@@ -53,7 +53,7 @@ Start with `dev-docs/PROJECT.md`, then `dev-docs/DEVELOPMENT.md`. User-facing do
 | `internal/mcp/tools.go`, `docs.go` | Tool definitions (typed schemas, annotations), instructions, docs resources |
 | `internal/docs/` | Embedded agent docs topics |
 | `internal/cmd/` | CLI commands and flags (incl. `healthcheck`, which probes `GET /healthz`; `client.go`, the MCP client over HTTP; `export.go`, `import.go`, `find.go`) |
-| `internal/exportfmt/` | JSONL export format, `Export`/`Import` over a Source/Target (engine adapter here, MCP client adapter in `internal/cmd/client.go`) |
+| `internal/exportfmt/` | JSONL export format, `Export`/`Import` over a Source/Target (engine adapter here, also a `BatchTarget` that imports in batches; MCP client adapter in `internal/cmd/client.go`) |
 | `internal/config/` | Environment configuration, `ByteSize` |
 | `internal/app/` | Builder and application lifecycle |
 | `test/e2e/`, `test/compat/` | Real-process kill test (build tag `e2e`); upgrade-fixture generator and helpers |

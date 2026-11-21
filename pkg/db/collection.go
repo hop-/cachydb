@@ -30,10 +30,15 @@ const numDocLocks = 256
 // the capture, see forgetBaseLocked), or a baseOff that no longer matches
 // the key table when the flush runs, makes the flush read the version from
 // its data segment instead.
+//
+// payload is the document's encoded after-image as the WAL record holds it
+// (nil for a tombstone); the flush writes it to the data segment as is,
+// without encoding doc again (approach-toolchain-and-storage §3.2).
 type memEntry struct {
 	doc       *Document
+	payload   []byte // read only; may alias a batch record's payload
 	walOffset uint64
-	size      int64 // approximate encoded size, for the MemtableSize flush trigger
+	size      int64 // approximate memory cost (memEntrySize), for MemtableSize and MaxPendingBytes
 	base      indexBase
 	baseOff   uint64
 }

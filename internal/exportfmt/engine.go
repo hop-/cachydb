@@ -15,8 +15,8 @@ type Engine struct {
 }
 
 var (
-	_ Source = Engine{}
-	_ Target = Engine{}
+	_ Source      = Engine{}
+	_ BatchTarget = Engine{}
 )
 
 func (a Engine) coll(database, collection string) (*db.Collection, error) {
@@ -174,4 +174,58 @@ func (a Engine) ReplaceDocument(ctx context.Context, database, collection string
 	d := docFromMap(doc)
 	_, err = c.Replace(ctx, d.ID, d, nil)
 	return err
+}
+
+// InsertDocuments implements BatchTarget with one db.Collection.Batch. In
+// Skip and Replace mode it first looks up which _ids exist (one query);
+// a document created or deleted by another writer between that lookup and
+// the batch fails the call.
+func (a Engine) InsertDocuments(ctx context.Context, database, collection string, docs []map[string]any, mode OnConflict) (Stats, error) {
+	c, err := a.coll(database, collection)
+	if err != nil {
+		return Stats{}, err
+	}
+	exists := make(map[string]bool)
+	if mode != Fail {
+		ids := make([]any, 0, len(docs))
+		for _, m := range docs {
+			ids = append(ids, m["_id"])
+		}
+		found, err := c.Find(ctx, &db.Query{Filters: []db.QueryFilter{{Field: "_id", Operator: "in", Value: ids}}, Fields: []string{"_id"}})
+		if err != nil {
+			return Stats{}, err
+		}
+		for _, d := range found {
+			exists[d.ID] = true
+		}
+	}
+	var st Stats
+	ops := make([]db.WriteOp, 0, len(docs))
+	pos := make([]int, 0, len(docs)) // operation → position in docs
+	for i, m := range docs {
+		d := docFromMap(m)
+		switch {
+		case !exists[d.ID]:
+			ops = append(ops, db.WriteOp{Kind: db.OpInsert, Document: d})
+			st.Inserted++
+		case mode == Skip:
+			st.Skipped++
+			continue
+		default:
+			ops = append(ops, db.WriteOp{Kind: db.OpReplace, ID: d.ID, Document: d})
+			st.Replaced++
+		}
+		pos = append(pos, i)
+	}
+	if _, err := c.Batch(ctx, ops); err != nil {
+		if bie, ok := errors.AsType[*db.BatchItemError](err); ok {
+			itemErr := bie.Err
+			if errors.Is(itemErr, db.ErrExists) {
+				itemErr = errors.Join(ErrDocumentExists, itemErr)
+			}
+			return Stats{}, &db.BatchItemError{Index: pos[bie.Index], Err: itemErr}
+		}
+		return Stats{}, err
+	}
+	return st, nil
 }

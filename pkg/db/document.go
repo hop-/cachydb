@@ -53,8 +53,17 @@ const maxReadRetries = 8
 const findCtxCheckEvery = 256
 
 // memEntryOverhead approximates the fixed memory cost of a memtable entry
-// beyond its id and encoded document, for the MemtableSize trigger.
+// beyond its id and document, for the MemtableSize trigger.
 const memEntryOverhead = 64
+
+// memEntrySize is the size a memtable entry for id with the encoded
+// after-image payload (nil for a tombstone) is charged, for MemtableSize
+// and MaxPendingBytes: the id, the payload bytes the entry keeps for the
+// flush, the decoded document (estimated at the payload's length, as
+// before the payload was kept), and the fixed overhead.
+func memEntrySize(id string, payload []byte) int64 {
+	return int64(len(id)+2*len(payload)) + memEntryOverhead
+}
 
 // errSegmentRetired reports that a data segment was retired between the
 // key-table lookup and the read; the caller looks the document up again.
@@ -107,6 +116,8 @@ type docWrite struct {
 	build func(cur *Document) (*Document, error)
 	// upserted is set by build when an update created the document.
 	upserted bool
+	// skipped is set by writeBatch when build returned errSkipWrite.
+	skipped bool
 }
 
 // prepareInsert checks an insert of doc and returns its write. id, when
@@ -201,16 +212,8 @@ func (c *Collection) UpdateWith(ctx context.Context, id string, u UpdateSpec) (d
 // write. extra holds more filters the stored version must match, besides
 // u.If. $now values resolve to ts.
 func (c *Collection) prepareUpdate(id string, u UpdateSpec, extra Condition, ts string) (*docWrite, error) {
-	if _, ok := u.Set["_id"]; ok {
-		return nil, fmt.Errorf("%w: updating document %q: field \"_id\" cannot be changed", ErrSchemaValidation, id)
-	}
-	for _, f := range u.Unset {
-		if f == "_id" {
-			return nil, fmt.Errorf("%w: updating document %q: field \"_id\" cannot be unset", ErrSchemaValidation, id)
-		}
-		if _, ok := u.Set[f]; ok {
-			return nil, fmt.Errorf("%w: updating document %q: field %q in both updates and unset", ErrSchemaValidation, id, f)
-		}
+	if p := updateFieldsProblem(u); p != "" {
+		return nil, fmt.Errorf("%w: updating document %q: %s", ErrSchemaValidation, id, p)
 	}
 	if u.Upsert {
 		if err := checkDocID(id); err != nil {
@@ -239,18 +242,41 @@ func (c *Collection) prepareUpdate(id string, u UpdateSpec, extra Condition, ts 
 			w.upserted = true
 			return &Document{ID: id, Data: set}, nil
 		}
-		// A new top-level map: cur is shared (memtable) and must not
-		// change. Nested values are only read; write re-encodes the
-		// after-image into fresh values.
-		data := make(map[string]any, len(cur.Data)+len(set))
-		maps.Copy(data, cur.Data)
-		maps.Copy(data, set)
-		for _, k := range u.Unset {
-			delete(data, k)
-		}
-		return &Document{ID: id, Data: data}, nil
+		return mergeUpdate(cur, set, u.Unset), nil
 	}
 	return w, nil
+}
+
+// updateFieldsProblem describes what is wrong with the fields u sets and
+// unsets ("" if nothing): "_id" cannot be set or unset, and no field may
+// be in both.
+func updateFieldsProblem(u UpdateSpec) string {
+	if _, ok := u.Set["_id"]; ok {
+		return `field "_id" cannot be changed`
+	}
+	for _, f := range u.Unset {
+		if f == "_id" {
+			return `field "_id" cannot be unset`
+		}
+		if _, ok := u.Set[f]; ok {
+			return fmt.Sprintf("field %q in both updates and unset", f)
+		}
+	}
+	return ""
+}
+
+// mergeUpdate returns cur with the fields of set replaced or added, then
+// the fields of unset removed. It builds a new top-level map: cur is
+// shared (memtable) and must not change. Nested values of cur and set are
+// only read; the write path re-encodes the after-image into fresh values.
+func mergeUpdate(cur *Document, set map[string]any, unset []string) *Document {
+	data := make(map[string]any, len(cur.Data)+len(set))
+	maps.Copy(data, cur.Data)
+	maps.Copy(data, set)
+	for _, k := range unset {
+		delete(data, k)
+	}
+	return &Document{ID: cur.ID, Data: data}
 }
 
 // Replace atomically replaces the whole document id with doc and returns
@@ -428,7 +454,6 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 		return nil, err
 	}
 
-	size := int64(len(id)+len(rec.Payload)) + memEntryOverhead
 	lb := c.registerInflight()
 	off, err := e.appendWAL(context.WithoutCancel(ctx), rec) // commit point
 	if err != nil {
@@ -441,7 +466,7 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 	// The index keys of the version this write replaces, for the flush
 	// (memEntry.base); computed outside mu. The index set cannot change:
 	// Database.mu is held shared.
-	c.apply(id, cur != nil, c.indexKeysAll(cur), curOff, next, off, lb, size)
+	c.apply(id, cur != nil, c.indexKeysAll(cur), curOff, next, rec.Payload, off, lb)
 	return next, nil
 }
 
@@ -497,13 +522,13 @@ func (c *Collection) removeInflightLocked(lb uint64) {
 // apply makes a durable write visible (§5.2 step 5). existed reports
 // whether the write replaced a live version; base and baseOff are that
 // version's index keys and WAL offset (nil and 0 if there was none); next
-// is the after-image (nil for a delete); size is the entry's approximate
-// size for the MemtableSize flush trigger. Memory only.
-func (c *Collection) apply(id string, existed bool, base indexBase, baseOff uint64, next *Document, off, lb uint64, size int64) {
+// is the after-image (nil for a delete) and payload its encoding as written
+// to the WAL (nil for a delete), kept for the flush. Memory only.
+func (c *Collection) apply(id string, existed bool, base indexBase, baseOff uint64, next *Document, payload []byte, off, lb uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.removeInflightLocked(lb)
-	c.applyLocked(id, existed, base, baseOff, next, off, size)
+	c.applyLocked(id, existed, base, baseOff, next, payload, off)
 }
 
 // applyLocked is apply without the inflight bookkeeping, shared with WAL
@@ -511,12 +536,14 @@ func (c *Collection) apply(id string, existed bool, base indexBase, baseOff uint
 // write (decided from the overlay first, then the key table). base and
 // baseOff describe the version the write replaced (see memEntry); they
 // are used only when id has no memtable entry yet, since an existing entry
-// keeps the base it captured first. Callers hold mu exclusively.
-func (c *Collection) applyLocked(id string, existed bool, base indexBase, baseOff uint64, next *Document, off uint64, size int64) {
+// keeps the base it captured first. payload is next's encoding (nil for a
+// delete); it is kept, not copied. Callers hold mu exclusively.
+func (c *Collection) applyLocked(id string, existed bool, base indexBase, baseOff uint64, next *Document, payload []byte, off uint64) {
 	me, ok := c.memtable[id]
 	if ok && me.walOffset >= off {
 		return // never happens under the doc lock; replay relies on the same rule
 	}
+	size := memEntrySize(id, payload)
 	delta := size
 	if ok {
 		c.memBytes -= me.size
@@ -532,7 +559,7 @@ func (c *Collection) applyLocked(id string, existed bool, base indexBase, baseOf
 	if len(c.memtable) == 0 || off < c.memMin {
 		c.memMin = off
 	}
-	c.memtable[id] = memEntry{doc: next, walOffset: off, size: size, base: base, baseOff: baseOff}
+	c.memtable[id] = memEntry{doc: next, payload: payload, walOffset: off, size: size, base: base, baseOff: baseOff}
 	c.memBytes += size
 	if c.memBytes > c.db.e.opts.MemtableSize {
 		c.db.e.kickFlush()

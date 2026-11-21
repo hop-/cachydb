@@ -80,7 +80,7 @@ on-disk format versions this build reads and writes.
 | `ListCollections() []string` | Sorted; nil when empty |
 | `DropCollection(ctx, name) error` | MCP `delete_collection` |
 | `RenameCollection(ctx, old, new) error` | Same database; flushes the collection, then WAL op 10 (`rename_coll`) + directory rename + `coll.meta` rewrite; `ErrNotFound`, `ErrExists`; old handles return `ErrNotFound` afterwards |
-| `CopyCollection(ctx, name, newName, target *Database) (int, error)` | `target` nil = same database; creates the target with the schema and indexes, then inserts every document (same ids) through the write path, 32 at a time; **not atomic** (drop the partial target on error); `ErrExists` |
+| `CopyCollection(ctx, name, newName, target *Database) (int, error)` | `target` nil = same database; creates the target with the schema and indexes, then inserts every document (same ids, ascending) through `Collection.Batch`, each batch at most `MaxBatchDocs` documents and about `MaxBatchBytes` (sizes estimated, a batch over the limit is split in halves); **not atomic** as a whole (on error the target holds the batches written before it; drop it); `ErrExists` |
 
 ### Collection (`document.go`, `collection.go`)
 
@@ -98,6 +98,8 @@ on-disk format versions this build reads and writes.
 | `Delete(ctx, id) error` | `DeleteWith(ctx, id, nil)` |
 | `DeleteWith(ctx, id, Condition) error` | `ErrNotFound`, `ErrConditionFailed` |
 | `Batch(ctx, []WriteOp) (BatchResult, error)` | Many writes of this collection, all or nothing, as one WAL record (op 11) with one fsync; see [Batches](#batches-batchgo) |
+| `UpdateMany(ctx, *Query, UpdateSpec, limit int) (matched, modified int, err error)` | Update every match as one batch; see [Writes by filter](#writes-by-filter) |
+| `DeleteMany(ctx, *Query, limit int) (matched, deleted int, err error)` | Delete every match as one batch; see [Writes by filter](#writes-by-filter) |
 | `CreateIndex(ctx, name, field, ...IndexOption) error` | `field` may be a nested path; `Unique(true)` makes it unique (see [Unique indexes](#unique-indexes)); builds from existing documents; blocks writes to the whole database while it runs; `ErrExists`; `ErrUniqueViolation` if a unique index would cover shared values |
 | `DropIndex(ctx, name) error` | MCP `drop_index`; `ErrNotFound` |
 | `Schema() *Schema`, `Indexes() []IndexInfo` | Copies; indexes sorted by name, with `Unique` (MCP `describe_collection`) |
@@ -160,6 +162,34 @@ type BatchResult struct{ IDs []string; Upserted []bool } // per operation
 - An empty batch writes nothing. `ops` is not modified or retained.
 - Locking and replay: [STORAGE.md](STORAGE.md#write-path-pkgdbdocumentgo).
 
+### Writes by filter
+
+`UpdateMany(ctx, q, u, limit)` and `DeleteMany(ctx, q, limit)` change every
+document matching `q` as one atomic batch (one WAL record and fsync) and
+return how many documents matched and how many they changed.
+
+- Only `q.Filters` and `q.Any` apply; `Sort`, `Fields`, `Skip`, or `Limit`
+  in `q` is an error (the limit is the call's argument). A nil or empty
+  query matches every document.
+- `UpdateSpec`: `Set` and `Unset` as in `UpdateWith`; `If` adds filters to
+  the query (a document that does not match them is not matched);
+  `Upsert` is an error. `$now` resolves to one time for the query and the
+  update.
+- The ids are found on a snapshot in `_id` order (only the ids are kept).
+  Each is then written only if, under its document lock, it still exists
+  and matches the query; one that stopped matching or was deleted is
+  skipped, not an error, so `modified`/`deleted` can be below `matched`.
+  When every match is skipped nothing is written.
+- `limit > 0` changes at most the first `limit` matches in `_id` order
+  (`matched` then counts at most `limit`); repeat the call to work through a larger set in atomic chunks. With no
+  limit (or one above `MaxBatchDocs`), more than `MaxBatchDocs` matches
+  fail with `ErrBatchTooLarge`; the text states the match count (also
+  returned as `matched`) and nothing is written. A payload over
+  `MaxBatchBytes` fails the same way.
+- A document the update makes invalid (schema, unique index) fails the
+  whole call with that document's error (the `*BatchItemError` wrapper is
+  removed: the error names the document).
+
 Every acknowledged write is fsynced to the WAL before the call returns.
 Returned documents are deep copies: mutating them never changes stored data.
 
@@ -175,7 +205,7 @@ Errors are wrapped with context; test them with `errors.Is`.
 | `ErrSchemaValidation` | Invalid schema, document violates the schema (a `*SchemaError` listing every violation wraps it), a reserved `_id` misuse, or `UpdateSchema` found non-matching documents |
 | `ErrConditionFailed` | An `if` condition did not match the stored document (or it is missing); nothing was written |
 | `ErrUniqueViolation` | A write's value for a unique index belongs to another document, or `CreateIndex` with `Unique(true)` found documents sharing a value; nothing was written |
-| `ErrBatchTooLarge` | A `Batch` has more operations than `MaxBatchDocs` or a larger payload than `MaxBatchBytes`; the text states the limit; nothing was written |
+| `ErrBatchTooLarge` | A `Batch` has more operations than `MaxBatchDocs` or a larger payload than `MaxBatchBytes`, or `UpdateMany`/`DeleteMany` without a limit match more than `MaxBatchDocs` documents; the text states the limit (and the match count); nothing was written |
 | `ErrClosed` | Engine closed |
 | `ErrDataDirInUse` | Another process (or engine) holds `cachydb.lock` |
 | `ErrIncompatibleDataDir` | Old-format or newer-format data directory |

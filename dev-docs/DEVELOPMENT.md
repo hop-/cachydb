@@ -401,7 +401,9 @@ What the runs answered (plan 013 open questions):
   fill only pays for append-ordered keys.
 - **Transaction size.** Kept one `index.db` transaction per flush, as large
   as the memtable it flushes (at most `MemtableSize`, 16 MiB, about 50,000
-  documents of this size; usually what one `FlushInterval` collected). The
+  documents of this size when measured, about half that since a memtable
+  entry also counts the WAL payload it keeps for the flush; usually what
+  one `FlushInterval` collected). The
   cost per document falls as transactions grow, because a page touched by
   several documents is written once and the fsync is shared: at 1M with
   UUID ids, 5,747 random updates took 1.61 s (285 µs each) and 25,332 took

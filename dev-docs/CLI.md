@@ -182,7 +182,11 @@ Import creates missing databases and collections (schema and indexes);
 lines were applied, `skip` keeps existing documents, `replace` replaces
 them and also updates a differing schema (via `UpdateSchema`) and adds
 missing indexes. With `fail`/`skip` a collection whose schema or index set
-differs is an error. A summary goes to stderr. Export → import into an
+differs is an error. Offline import writes the document lines of a
+collection in atomic batches of up to 1,000 documents or 4 MiB of lines
+(`exportfmt.BatchTarget`, one WAL fsync each); a batch that fails is
+applied not at all, so the reported count of applied lines leaves out
+that batch's earlier lines. A summary goes to stderr. Export → import into an
 empty directory → export gives identical output apart from `created`.
 
 ### `cachydb utils find` / `get` (`find.go`)

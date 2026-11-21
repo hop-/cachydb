@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -104,6 +105,7 @@ func (e *BatchItemError) Unwrap() error { return e.Err }
 
 // batchItem is one operation of a batch being written.
 type batchItem struct {
+	op      int // the operation's index in the batch
 	w       *docWrite
 	cur     *Document // the version it replaces (nil if none); shared, read only
 	curOff  uint64    // cur's WAL offset (0 if none)
@@ -143,7 +145,7 @@ func (c *Collection) Batch(ctx context.Context, ops []WriteOp) (BatchResult, err
 		index[w.id] = i
 		writes[i] = w
 	}
-	if err := c.writeBatch(ctx, writes, index); err != nil {
+	if err := c.writeBatch(ctx, writes); err != nil {
 		return BatchResult{}, err
 	}
 	res := BatchResult{IDs: make([]string, len(writes)), Upserted: make([]bool, len(writes))}
@@ -151,6 +153,174 @@ func (c *Collection) Batch(ctx context.Context, ops []WriteOp) (BatchResult, err
 		res.IDs[i], res.Upserted[i] = w.id, w.upserted
 	}
 	return res, nil
+}
+
+// UpdateMany applies the update u to every document that matches q, as
+// one atomic batch (Batch), and returns how many documents matched and how
+// many it changed (approach-toolchain-and-storage §3.1, "Writes by
+// filter").
+//
+// Only q.Filters and q.Any apply; a query with Sort, Fields, Skip, or
+// Limit is an error. A nil or empty query matches every document. u.Set
+// and u.Unset work as in UpdateWith; u.If adds filters to the query (a
+// document that does not match them is not matched); u.Upsert is an
+// error. $now values resolve to one time.
+//
+// The matching ids are found on a snapshot, in ascending _id order. Each
+// is then written only if, under its write lock, it still exists and
+// matches the query; one that stopped matching (or was deleted) is
+// skipped, not an error, so modified may be lower than matched. Every
+// change is applied by one WAL record, so all of them are durable or none
+// is.
+//
+// limit > 0 changes at most the first limit matching documents in _id
+// order (matched then counts at most limit); a caller repeats the call to
+// work through a larger set in atomic chunks. Without a limit (limit <= 0), or with a limit above
+// Options.MaxBatchDocs, more than MaxBatchDocs matches fail with
+// ErrBatchTooLarge, stating the match count (also returned as matched),
+// and nothing is written. A batch whose payload exceeds MaxBatchBytes
+// fails with ErrBatchTooLarge as well. A document the update would make
+// invalid (schema, unique index) fails the whole call with that
+// document's error.
+func (c *Collection) UpdateMany(ctx context.Context, q *Query, u UpdateSpec, limit int) (matched, modified int, err error) {
+	e := c.db.e
+	if err := e.enter(); err != nil {
+		return 0, 0, err
+	}
+	defer e.exit()
+	if u.Upsert {
+		return 0, 0, errors.New("updating documents: upsert is not supported by UpdateMany; use UpdateWith")
+	}
+	if p := updateFieldsProblem(u); p != "" {
+		return 0, 0, fmt.Errorf("%w: updating documents: %s", ErrSchemaValidation, p)
+	}
+	wq, cq, err := compileWriteQuery(q, u.If, "updating documents")
+	if err != nil {
+		return 0, 0, err
+	}
+	ids, matched, err := c.matchingIDs(ctx, wq, cq, limit)
+	if err != nil {
+		return matched, 0, fmt.Errorf("updating documents: %w", err)
+	}
+	if err := e.hook(hookAfterMatch); err != nil {
+		return matched, 0, err
+	}
+	set := resolveNowData(u.Set, cq.now)
+	writes := make([]*docWrite, len(ids))
+	for i, id := range ids {
+		writes[i] = &docWrite{id: id, build: func(cur *Document) (*Document, error) {
+			if cur == nil || !cq.matches(cur) {
+				return nil, errSkipWrite
+			}
+			return mergeUpdate(cur, set, u.Unset), nil
+		}}
+	}
+	n, err := c.writeMatched(ctx, writes)
+	return matched, n, err
+}
+
+// DeleteMany deletes every document that matches q, as one atomic batch
+// (Batch), and returns how many documents matched and how many it deleted.
+// The query, the snapshot, skipping documents that stopped matching, limit,
+// and the limits work as in UpdateMany.
+func (c *Collection) DeleteMany(ctx context.Context, q *Query, limit int) (matched, deleted int, err error) {
+	e := c.db.e
+	if err := e.enter(); err != nil {
+		return 0, 0, err
+	}
+	defer e.exit()
+	wq, cq, err := compileWriteQuery(q, nil, "deleting documents")
+	if err != nil {
+		return 0, 0, err
+	}
+	ids, matched, err := c.matchingIDs(ctx, wq, cq, limit)
+	if err != nil {
+		return matched, 0, fmt.Errorf("deleting documents: %w", err)
+	}
+	if err := e.hook(hookAfterMatch); err != nil {
+		return matched, 0, err
+	}
+	writes := make([]*docWrite, len(ids))
+	for i, id := range ids {
+		writes[i] = &docWrite{id: id, build: func(cur *Document) (*Document, error) {
+			if cur == nil || !cq.matches(cur) {
+				return nil, errSkipWrite
+			}
+			return nil, nil
+		}}
+	}
+	n, err := c.writeMatched(ctx, writes)
+	return matched, n, err
+}
+
+// compileWriteQuery checks the query of UpdateMany or DeleteMany (what
+// names the call in errors), adds the filters extra, and compiles it. It
+// returns the query that was compiled and the compiled query.
+func compileWriteQuery(q *Query, extra Condition, what string) (*Query, *compiledQuery, error) {
+	if q == nil {
+		q = &Query{}
+	}
+	if len(q.Sort) > 0 || len(q.Fields) > 0 || q.Skip != 0 || q.Limit != 0 {
+		return nil, nil, fmt.Errorf("%s: only the query's filters and any apply; sort, fields, skip, and limit are not allowed (pass the limit to the call)", what)
+	}
+	wq := &Query{Filters: slices.Concat(q.Filters, extra), Any: q.Any}
+	cq, err := compileQuery(wq)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", what, err)
+	}
+	return wq, cq, nil
+}
+
+// matchingIDs returns the ids of the documents matching cq (compiled from
+// q), in ascending order, and their number: the first limit of them when
+// 0 < limit <= MaxBatchDocs. Otherwise, when more than MaxBatchDocs
+// documents match, it returns no ids, the match count, and an error
+// wrapping ErrBatchTooLarge.
+func (c *Collection) matchingIDs(ctx context.Context, q *Query, cq *compiledQuery, limit int) ([]string, int, error) {
+	maxDocs := c.db.e.opts.MaxBatchDocs
+	bounded := limit > 0 && limit <= maxDocs
+	cq.limit = maxDocs + 1 // one more than allowed, to detect too many
+	if bounded {
+		cq.limit = limit
+	}
+	cq.fieldPaths = []fieldPath{compilePath("_id")} // read the ids only
+	docs, _, err := c.runQuery(ctx, cq)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !bounded && len(docs) > maxDocs {
+		n, _, err := c.countDocuments(ctx, q)
+		if err != nil {
+			return nil, 0, err
+		}
+		return nil, n, fmt.Errorf("%w: %d documents match, more than %d (MaxBatchDocs); pass a limit of at most %d and repeat the call to change them in chunks",
+			ErrBatchTooLarge, n, maxDocs, maxDocs)
+	}
+	ids := make([]string, len(docs))
+	for i, d := range docs {
+		ids[i] = d.ID
+	}
+	return ids, len(ids), nil
+}
+
+// writeMatched writes the batch of UpdateMany or DeleteMany and returns
+// how many writes it applied (those not skipped). The error of a failing
+// write is returned without its *BatchItemError wrapper: it names the
+// document, and the write's position means nothing to the caller.
+func (c *Collection) writeMatched(ctx context.Context, writes []*docWrite) (int, error) {
+	if err := c.writeBatch(ctx, writes); err != nil {
+		if bie, ok := errors.AsType[*BatchItemError](err); ok {
+			return 0, bie.Err
+		}
+		return 0, err
+	}
+	n := 0
+	for _, w := range writes {
+		if !w.skipped {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // prepareOp checks op and returns its write; $now values resolve to ts.
@@ -186,11 +356,18 @@ func (c *Collection) prepareOp(op *WriteOp, ts string) (*docWrite, error) {
 	}
 }
 
+// errSkipWrite is returned by the build callback of a batch write that is
+// to be left out of the batch instead of failing it: UpdateMany and
+// DeleteMany return it for a document that no longer matches the query.
+// No other build callback returns it.
+var errSkipWrite = errors.New("document skipped")
+
 // writeBatch runs the prepared writes as one batch (see the top of this
-// file). index maps every id of writes to its operation. Once the WAL
-// append has started, it waits for it even if ctx is cancelled, as write
-// does.
-func (c *Collection) writeBatch(ctx context.Context, writes []*docWrite, index map[string]int) error {
+// file). Their ids are distinct. A write whose build returns errSkipWrite
+// is left out and marked skipped; when every write is skipped, nothing is
+// written. Once the WAL append has started, it waits for it even if ctx
+// is cancelled, as write does.
+func (c *Collection) writeBatch(ctx context.Context, writes []*docWrite) error {
 	d, e := c.db, c.db.e
 	if err := e.enter(); err != nil {
 		return err
@@ -216,7 +393,7 @@ func (c *Collection) writeBatch(ctx context.Context, writes []*docWrite, index m
 	unlockDocs := c.lockDocs(writes)
 	defer unlockDocs()
 
-	items := make([]batchItem, len(writes))
+	items := make([]batchItem, 0, len(writes))
 	size := wal.BatchPayloadSize(nil)
 	for i, w := range writes {
 		cur, curOff, err := c.currentVersion(w.id)
@@ -224,16 +401,20 @@ func (c *Collection) writeBatch(ctx context.Context, writes []*docWrite, index m
 			return &BatchItemError{Index: i, Err: err}
 		}
 		next, err := w.build(cur)
+		if errors.Is(err, errSkipWrite) {
+			w.skipped = true
+			continue
+		}
 		if err != nil {
 			return &BatchItemError{Index: i, Err: err}
 		}
-		it := batchItem{w: w, cur: cur, curOff: curOff}
+		it := batchItem{op: i, w: w, cur: cur, curOff: curOff}
 		if next != nil {
 			if it.payload, it.next, err = c.encodeAfterImage(w.id, next); err != nil {
 				return &BatchItemError{Index: i, Err: err}
 			}
 		}
-		items[i] = it
+		items = append(items, it)
 		wi := batchWALItem(&it)
 		size += wi.EncodedSize()
 		if size > e.opts.MaxBatchBytes {
@@ -241,8 +422,11 @@ func (c *Collection) writeBatch(ctx context.Context, writes []*docWrite, index m
 				ErrBatchTooLarge, e.opts.MaxBatchBytes, i, len(writes))
 		}
 	}
+	if len(items) == 0 {
+		return nil // every write was skipped
+	}
 
-	if unlock, err := c.checkBatchUnique(items, index); err != nil {
+	if unlock, err := c.checkBatchUnique(items); err != nil {
 		return err
 	} else if unlock != nil {
 		defer unlock()
@@ -281,8 +465,7 @@ func (c *Collection) writeBatch(ctx context.Context, writes []*docWrite, index m
 	c.removeInflightLocked(lb)
 	for i := range items {
 		it := &items[i]
-		entrySize := int64(len(it.w.id)+len(it.payload)) + memEntryOverhead
-		c.applyLocked(it.w.id, it.cur != nil, bases[i], it.curOff, it.next, off, entrySize)
+		c.applyLocked(it.w.id, it.cur != nil, bases[i], it.curOff, it.next, it.payload, off)
 	}
 	return nil
 }
@@ -324,8 +507,9 @@ func (c *Collection) lockDocs(writes []*docWrite) func() {
 // returned function unlocks them (nil when nothing was locked) and the
 // caller holds the stripes until the batch is applied. A failure is a
 // *BatchItemError wrapping ErrUniqueViolation, and nothing is left locked.
-// Callers hold Database.mu and the document locks of the batch.
-func (c *Collection) checkBatchUnique(items []batchItem, index map[string]int) (func(), error) {
+// Callers hold Database.mu and the document locks of the batch (skipped
+// writes included).
+func (c *Collection) checkBatchUnique(items []batchItem) (func(), error) {
 	var defs []indexDef
 	for _, def := range c.indexes {
 		if def.Unique {
@@ -345,7 +529,7 @@ func (c *Collection) checkBatchUnique(items []batchItem, index map[string]int) (
 			}
 			k := def.Name + "\x00" + uv.dkey
 			if j, dup := holders[k]; dup {
-				return nil, &BatchItemError{Index: i, Err: fmt.Errorf("document %q in collection %q: %w",
+				return nil, &BatchItemError{Index: it.op, Err: fmt.Errorf("document %q in collection %q: %w",
 					it.w.id, c.name, uniqueErr(uv, items[j].w.id))}
 			}
 			holders[k] = i
@@ -362,14 +546,20 @@ func (c *Collection) checkBatchUnique(items []batchItem, index map[string]int) (
 		return nil, nil
 	}
 	unlock := c.lockUnique(all)
-	inBatch := func(id string) bool { _, ok := index[id]; return ok }
+	// Only the documents the batch writes are left out: a skipped write
+	// keeps its stored values.
+	ids := make(map[string]struct{}, len(items))
+	for i := range items {
+		ids[items[i].w.id] = struct{}{}
+	}
+	inBatch := func(id string) bool { _, ok := ids[id]; return ok }
 	for i, vals := range added {
 		if len(vals) == 0 {
 			continue
 		}
 		if err := c.checkUniqueExcept(inBatch, vals); err != nil {
 			unlock()
-			return nil, &BatchItemError{Index: i, Err: fmt.Errorf("document %q in collection %q: %w", items[i].w.id, c.name, err)}
+			return nil, &BatchItemError{Index: items[i].op, Err: fmt.Errorf("document %q in collection %q: %w", items[i].w.id, c.name, err)}
 		}
 	}
 	return unlock, nil

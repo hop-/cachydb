@@ -21,6 +21,7 @@ const (
 	hookRenameDir           hookPoint = "rename-after-dir-before-meta"      // rename_collection: after the directory rename, before coll.meta (plan 004)
 	hookUpgradeCollection   hookPoint = "upgrade-after-collection"          // format upgrade 2 -> 3 (Open): after each collection's index file was built, before the next collection (or the removal of the format-2 files)
 	hookUpgradeBeforeFormat hookPoint = "upgrade-before-format-write"       // format upgrade 2 -> 3 (Open): after the format-2 files were removed, before cachydb.format is rewritten
+	hookAfterMatch          hookPoint = "write-by-filter-after-match"       // UpdateMany, DeleteMany: after the snapshot found the ids, before the batch locks them (lets a test change a document in between)
 )
 
 // Index-commit sites: the index transactions Options.testIndexCommit can
