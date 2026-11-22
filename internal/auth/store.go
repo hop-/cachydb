@@ -182,12 +182,19 @@ func (s *Store) refresh(ctx context.Context) error {
 
 // change runs fn under the change lock and refreshes the in-memory copy
 // afterwards, also when fn fails (it may have written part of a change).
-// The refresh ignores ctx's cancellation and is retried once. If it still
-// fails, the store is marked broken: Authenticate and Principal then fail
-// closed, retrying the refresh, until one succeeds.
+// fn may decide from s.snap (the last-server-admin rule, token lookups):
+// if the store is broken, change reloads it first and, if that fails,
+// returns the error without running fn, so no change is decided on a
+// stale copy. The refresh after fn ignores ctx's cancellation and is
+// retried once. If it still fails, the store is marked broken:
+// Authenticate and Principal then fail closed, retrying the refresh,
+// until one succeeds.
 func (s *Store) change(ctx context.Context, fn func() error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.reloadIfBrokenLocked(ctx); err != nil {
+		return fmt.Errorf("%w; nothing was changed", err)
+	}
 	err := fn()
 	rctx := context.WithoutCancel(ctx)
 	rerr := s.refresh(rctx)
@@ -210,12 +217,22 @@ func (s *Store) current() (*snapshot, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.broken.Load() {
-		if err := s.refresh(context.Background()); err != nil {
-			return nil, fmt.Errorf("%w: the user store could not be reloaded", ErrUnauthenticated)
-		}
+	if err := s.reloadIfBrokenLocked(context.Background()); err != nil {
+		return nil, fmt.Errorf("%w: the user store could not be reloaded", ErrUnauthenticated)
 	}
 	return s.snap.Load(), nil
+}
+
+// reloadIfBrokenLocked refreshes the in-memory copy if the store is
+// broken. The caller holds s.mu.
+func (s *Store) reloadIfBrokenLocked(ctx context.Context) error {
+	if !s.broken.Load() {
+		return nil
+	}
+	if err := s.refresh(ctx); err != nil {
+		return fmt.Errorf("the user store could not be reloaded after an earlier failure: %w", err)
+	}
+	return nil
 }
 
 // HasUsers reports whether at least one user exists.
@@ -500,8 +517,17 @@ func (s *Store) ForgetDatabase(ctx context.Context, database string) error {
 	if database == AllDatabases {
 		return nil
 	}
+	// The names come from the copy, so reload a broken store first: a
+	// stale copy could miss a user holding a grant on database.
+	s.mu.Lock()
+	err := s.reloadIfBrokenLocked(ctx)
+	snap := s.snap.Load()
+	s.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("removing grants on database %q: %w", database, err)
+	}
 	var names []string
-	for name, u := range s.snap.Load().users {
+	for name, u := range snap.users {
 		if _, ok := u.principal.Grants[database]; ok {
 			names = append(names, name)
 		}

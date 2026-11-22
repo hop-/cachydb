@@ -310,9 +310,12 @@ An MCP client (go-sdk `mcp.NewClient` + `StreamableClientTransport`, no
 standalone SSE, no retries) for a running `cachydb -t http` server.
 `--url` (persistent), else `CACHYDB_URL`, else
 `http://127.0.0.1:7601/mcp`. `--token` (persistent), else
-`CACHYDB_TOKEN`, is sent as `Authorization: Bearer` on every request by
-`bearerTransport`, a `RoundTripper` in
-`StreamableClientTransport.HTTPClient`; it records a 401 answer, and
+`CACHYDB_TOKEN`, is sent as `Authorization: Bearer` by `bearerTransport`,
+a `RoundTripper` in `StreamableClientTransport.HTTPClient`, only on
+requests to the endpoint's scheme and host (case-insensitive host
+compare). The HTTP client refuses every redirect (`refuseRedirect`; the
+error names the target), so `--url` must be the final endpoint.
+`bearerTransport` also records a 401 answer, and
 `withClient` then prefixes the error with a hint naming `--token` /
 `CACHYDB_TOKEN` (no token given, or the token was rejected).
 

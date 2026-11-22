@@ -42,9 +42,10 @@ else ` + defaultClientURL + `. Start the server with
 
 A server that requires tokens needs --token, or the environment variable
 CACHYDB_TOKEN (preferred: a flag shows in the process list); it is sent
-as "Authorization: Bearer <token>" on every request. Use https:// for a
-server on another machine, so the token is not sent in clear text. See
-"cachydb docs access".`,
+as "Authorization: Bearer <token>", only to the scheme and host of the
+server address. The client does not follow redirects, so point --url at
+the final endpoint. Use https:// for a server on another machine, so the
+token is not sent in clear text. See "cachydb docs access".`,
 	Example: `  cachydb client tools
   cachydb client call find_documents '{"database":"kb","collection":"notes","query":{"limit":5}}'
   echo '{"collection":"notes"}' | cachydb client call count_documents -

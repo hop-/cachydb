@@ -99,6 +99,8 @@ MCP clients send `Authorization: Bearer <token>` (in Claude Code:
 `claude mcp add --transport http cachydb <url> --header "Authorization: Bearer <token>"`).
 `cachydb client` takes `--token` or `CACHYDB_TOKEN` (preferred: a flag
 shows in the process list); after a 401 answer its error names the flag.
+It sends the token only to the scheme and host of `--url` and does not
+follow redirects, so point `--url` at the final endpoint.
 Without a valid token `/mcp` answers 401; `/healthz` never needs one. A
 session belongs to the user that opened it: another user's token on it
 gets 403. Use HTTPS (`--tls-cert`, `--tls-key`) or a trusted network, so
