@@ -1,7 +1,7 @@
 ---
 name: query
 title: Query language
-summary: find_documents filters, operators (contains, has, has_any, has_all), OR groups, sort, projection, paging, count_documents, distinct, $now, and index use
+summary: find_documents filters, operators (contains, has, has_any, has_all, exists, starts_with), OR groups, sort, projection, paging, explain, count_documents, distinct, update operators (inc, push, add_to_set, pull), $now, and index use
 ---
 # Query language
 
@@ -54,7 +54,8 @@ conditions, `sort`, `fields`, `distinct`, and index fields.
 - A path that crosses an array or a value that is not an object is
   missing: `tags.0` does not index into an array, and `meta.author` is
   missing when `meta` is a string or an array.
-- Updates (`updates`, `unset`) and schemas use top-level field names only.
+- Updates (`updates`, `unset`, and the update operators) and schemas use
+  top-level field names only.
 
 ## Operators
 
@@ -69,6 +70,8 @@ conditions, `sort`, `fields`, `distinct`, and index fields.
 | `has` | is an array with an element equal to `value` |
 | `has_any` | is an array with an element equal to some value of the array `value` |
 | `has_all` | is an array containing every value of the array `value` |
+| `exists` | is present (`value` `true`, also when it is `null`) or missing (`value` `false`) |
+| `starts_with` | is a string that starts with `value` (a string), case-sensitively |
 
 Any other operator is rejected with an error that lists the valid ones.
 
@@ -87,7 +90,9 @@ Any other operator is rejected with an error that lists the valid ones.
 - A type the operator does not apply to does not match: `contains` on a
   number, `has` on a non-array.
 - **A document that does not have the field matches no operator, not even
-  `ne`.** (This differs from MongoDB's `$ne`.)
+  `ne`**, except `exists` with `false`. (This differs from MongoDB's
+  `$ne`.) To find documents without a field, use
+  `{"field": "due", "operator": "exists", "value": false}`.
 
 ## `$now`
 
@@ -136,6 +141,36 @@ be stored literally.
 {"collection": "notes", "query": {"sort": [{"field": "updated", "order": "desc"}], "skip": 100}}
 ```
 
+## Explain
+
+`"explain": true` next to `query` adds a `plan` object to the result,
+describing how the query ran (it is absent otherwise):
+
+```json
+{"collection": "notes", "query": {"filters": [{"field": "type", "operator": "eq", "value": "decision"}], "limit": 5}, "explain": true}
+```
+
+```json
+"plan": {"driver": "index", "index": "by_type", "order_provided": true, "examined": 6, "returned": 5}
+```
+
+- `driver`: where the candidate documents came from: `id lookup` (`eq`
+  or `in` on `_id`), `index` (values of an index), `index range` (a range
+  of an index: `gt`, `gte`, `lt`, `lte`, `starts_with`, `exists` true),
+  `or union` (one index per `any` group), `index sort` (the sort field's
+  index, walked in order), `keydir` (every document in `_id` order, a
+  full scan), or `none` (no document can match).
+- `index`: the index read (several, comma-separated, for `or union`);
+  absent for `id lookup`, `keydir`, and `none`.
+- `order_provided`: `true` when the driver gave the documents in the
+  requested order, so the query stopped early without sorting.
+- `examined`: documents read and checked against the filters (it may
+  include one more than the page, used to set `has_more`); `returned`:
+  documents returned (`count`).
+
+`keydir` with a large `examined` means a full scan: an index on a
+filtered or sorted field avoids it.
+
 ## Counting and distinct values
 
 - `count_documents {collection, query?: {filters, any}}` returns
@@ -149,10 +184,40 @@ be stored literally.
   (objects and arrays by content) and sorted in the order above. Without
   filters, an indexed field is answered from the index.
 
+## Update operators
+
+`update_document` and `update_documents` change fields relative to their
+stored value, without reading the document first. Each operator is an
+object of top-level field to value:
+
+| Parameter | Effect | Fails (nothing written) when the field holds |
+| --- | --- | --- |
+| `inc` | adds the number (negative subtracts); a missing field starts at 0 | a non-number |
+| `push` | appends the value; a missing field becomes a one-element array | a non-array |
+| `add_to_set` | appends the value unless an equal element exists | a non-array |
+| `pull` | removes every element equal to the value; a missing field is left alone | a non-array |
+
+```json
+{"collection": "notes", "id": "n1", "inc": {"views": 1}, "add_to_set": {"tags": "wal"}, "pull": {"tags": "draft"}}
+```
+
+- They apply after `updates` and `unset`, atomically with them and with
+  `if` (compare-and-set). With `upsert`, a missing document is created
+  from `updates`, then the operators apply (`inc` from 0, `push` and
+  `add_to_set` start an array).
+- A field may be named in only one of `updates`, `unset`, `inc`, `push`,
+  `add_to_set`, and `pull`; otherwise the call fails with "invalid update".
+- Elements are compared like `eq`: `1` equals `1.0`, objects and arrays
+  by content. `push` of an array appends it as one element.
+- The result must satisfy the schema. In `update_documents`, one
+  document of the wrong type fails the whole call.
+
 ## Indexes
 
 - `create_index` builds an index on one field, which may be a nested path
   (`meta.author`). For an array field, **each element** is indexed.
+  `"unique": true` makes it unique; `describe_collection` lists each
+  index with `"unique": true` when it is.
 - An index can be **unique**: a write whose value for the field already
   belongs to another document then fails with "unique index violation"
   and writes nothing. Only a single value is constrained (a string,
@@ -163,7 +228,8 @@ be stored literally.
   share a value; the error lists up to 10 of the values with their ids.
 - Filters that use an index: `eq` and `in` (on `_id` or an indexed
   field), `has`, `has_any` (union), `has_all` (intersection), and the
-  ranges `gt`, `gte`, `lt`, `lte` on an indexed field, and `any` groups
+  ranges `gt`, `gte`, `lt`, `lte`, `starts_with`, and `exists` on an
+  indexed field, and `any` groups
   when every group has such a filter. With several, the one with the
   fewest matches is used and every filter is re-checked on its documents.
   `eq` matches whole values and `has*` array elements; ranges compare

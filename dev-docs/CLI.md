@@ -211,12 +211,16 @@ cachydb utils import -i FILE|- [--on-conflict fail|skip|replace]
 JSON Lines in the format of `internal/exportfmt` (header with `version`
 1, then database, collection, and document lines, all sorted; see `cachydb
 docs config`). `-c` requires `-d`; export writes to stdout without `-o`.
-Import creates missing databases and collections (schema and indexes);
+Import creates missing databases and collections (schema and indexes,
+unique ones as unique: the export's index lines carry `unique`, and
+`client export`/`client import` read and pass it through
+`describe_collection` and `create_index`);
 `fail` (default) stops at the first existing `_id` and reports how many
 lines were applied, `skip` keeps existing documents, `replace` replaces
 them and also updates a differing schema (via `UpdateSchema`) and adds
-missing indexes. With `fail`/`skip` a collection whose schema or index set
-differs is an error. Offline import writes the document lines of a
+missing indexes (an index of the same name whose field or uniqueness
+differs is dropped and re-created). With `fail`/`skip` a collection whose
+schema or index set (names, fields, and uniqueness) differs is an error. Offline import writes the document lines of a
 collection in atomic batches of up to 1,000 documents or 4 MiB of lines
 (`exportfmt.BatchTarget`, one WAL fsync each); a batch that fails is
 applied not at all, so the reported count of applied lines leaves out

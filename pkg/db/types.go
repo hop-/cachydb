@@ -75,11 +75,19 @@ type SortKey struct {
 type Condition = []QueryFilter
 
 // UpdateSpec describes an update for Collection.UpdateWith.
+// The operators Inc, Push, AddToSet, and Pull apply after Set and Unset,
+// each a map of top-level field to value (see update.go); a field may be
+// named by at most one of Set, Unset, and the operators.
 type UpdateSpec struct {
 	Set    map[string]any // top-level fields to replace or add
 	Unset  []string       // top-level fields to remove (after Set)
 	If     Condition      // the stored version must match all of these
-	Upsert bool           // create {_id: id} + Set if the document is missing
+	Upsert bool           // create {_id: id} + Set (then the operators) if the document is missing
+
+	Inc      map[string]any // add the number to a numeric field; a missing field starts at 0
+	Push     map[string]any // append the value to an array field; a missing field becomes [value]
+	AddToSet map[string]any // as Push, unless an equal element exists
+	Pull     map[string]any // remove every element equal to the value; a missing field is left alone
 }
 
 // MarshalJSON customizes JSON marshaling for Document

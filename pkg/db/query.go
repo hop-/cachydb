@@ -84,6 +84,13 @@ func (c *Collection) Iterate(ctx context.Context, q *Query, fn func(*Document) b
 	return err
 }
 
+// IterateWithPlan is Iterate that also describes how the query ran (see
+// FindWithPlan and QueryPlan). Returned counts the results fn received,
+// including one for which it returned false.
+func (c *Collection) IterateWithPlan(ctx context.Context, q *Query, fn func(*Document) bool) (QueryPlan, error) {
+	return c.iterate(ctx, q, fn)
+}
+
 // iterate is Iterate that also describes how the query ran (see
 // FindWithPlan); Returned counts the results fn received.
 func (c *Collection) iterate(ctx context.Context, q *Query, fn func(*Document) bool) (QueryPlan, error) {

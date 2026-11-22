@@ -392,7 +392,7 @@ func (d *Database) CopyCollection(ctx context.Context, name, newName string, tar
 		return 0, fmt.Errorf("copying collection %q: %w", name, err)
 	}
 	for _, ix := range src.Indexes() {
-		if err := dst.CreateIndex(ctx, ix.Name, ix.Field); err != nil {
+		if err := dst.CreateIndex(ctx, ix.Name, ix.Field, Unique(ix.Unique)); err != nil {
 			return 0, fmt.Errorf("copying collection %q: %w", name, err)
 		}
 	}

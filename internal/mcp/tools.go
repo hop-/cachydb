@@ -16,7 +16,7 @@ import (
 // cannot drift from the code.
 
 // Operators lists the find_documents filter operators.
-var Operators = []string{"eq", "ne", "gt", "gte", "lt", "lte", "in", "contains", "has", "has_any", "has_all"}
+var Operators = []string{"eq", "ne", "gt", "gte", "lt", "lte", "in", "contains", "has", "has_any", "has_all", "exists", "starts_with"}
 
 // SortOrders lists the sort orders of find_documents.
 var SortOrders = []string{"asc", "desc"}
@@ -82,14 +82,14 @@ type InsertDocumentInput struct {
 
 // Filter is one find_documents filter.
 type Filter struct {
-	Field    string   `json:"field" jsonschema:"Top-level document field name, or _id (no dot notation)"`
-	Operator Operator `json:"operator" jsonschema:"Comparison operator: eq ne gt gte lt lte in (whole values); contains (case-insensitive substring of a string, or of a string element of an array); has (an array element equals value); has_any / has_all (some / every value of an array value is an element)"`
-	Value    any      `json:"value" jsonschema:"Value to compare with; an array for in, has_any and has_all; {\"$now\": true} is the server's current time"`
+	Field    string   `json:"field" jsonschema:"Document field name, a dotted path into nested objects (meta.author), or _id"`
+	Operator Operator `json:"operator" jsonschema:"Comparison operator: eq ne gt gte lt lte in (whole values); contains (case-insensitive substring of a string, or of a string element of an array); has (an array element equals value); has_any / has_all (some / every value of an array value is an element); exists (value true: the field is present, even null; false: it is missing); starts_with (case-sensitive string prefix)"`
+	Value    any      `json:"value" jsonschema:"Value to compare with; an array for in, has_any and has_all; true or false for exists; a string for starts_with; {\"$now\": true} is the server's current time"`
 }
 
 // SortKey is one find_documents sort key.
 type SortKey struct {
-	Field string    `json:"field" jsonschema:"Top-level field (or _id) to sort by"`
+	Field string    `json:"field" jsonschema:"Field, dotted path (meta.author), or _id to sort by"`
 	Order SortOrder `json:"order,omitempty" jsonschema:"asc (default) or desc"`
 }
 
@@ -97,7 +97,7 @@ type SortKey struct {
 type Query struct {
 	Filters []Filter   `json:"filters,omitempty" jsonschema:"Filters that must all match (AND); omit to match every document"`
 	Any     [][]Filter `json:"any,omitempty" jsonschema:"OR groups: when set, a document must also match every filter of at least one group"`
-	Fields  []string   `json:"fields,omitempty" jsonschema:"Top-level fields to return (projection); _id is always returned; omit for whole documents"`
+	Fields  []string   `json:"fields,omitempty" jsonschema:"Fields or dotted paths to return (projection); _id is always returned; omit for whole documents"`
 	Sort    []SortKey  `json:"sort,omitempty" jsonschema:"Sort keys in order, then _id ascending; omit to sort by _id. Sorting by other fields reads every match"`
 	Limit   int        `json:"limit,omitempty" jsonschema:"Maximum number of documents to return; 0 or omitted means the server's default limit (100 unless configured). A result byte cap (1 MiB unless configured) also applies; has_more says whether more match"`
 	Skip    int        `json:"skip,omitempty" jsonschema:"Number of matching documents to skip, after sorting; to page, set it to the previous result's next_skip"`
@@ -114,16 +114,21 @@ type FindDocumentsInput struct {
 	Database   string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string `json:"collection" jsonschema:"Collection name"`
 	Query      *Query `json:"query,omitempty" jsonschema:"Filters, OR groups, projection, sort, limit, and skip; omit to match every document (returned a page at a time, see has_more)"`
+	Explain    bool   `json:"explain,omitempty" jsonschema:"Also return plan: how the query ran (the index or scan used, whether it gave the sort order, documents examined and returned)"`
 }
 
 type UpdateDocumentInput struct {
-	Database   string         `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
-	Collection string         `json:"collection" jsonschema:"Collection name"`
-	ID         string         `json:"id" jsonschema:"Document _id"`
-	Updates    map[string]any `json:"updates,omitempty" jsonschema:"Top-level fields to set (replaced or added); other fields are kept; _id cannot be changed. {\"$now\": true} is the server's current time"`
-	Unset      []string       `json:"unset,omitempty" jsonschema:"Top-level fields to remove (after updates); at least one of updates and unset is required"`
-	If         []Filter       `json:"if,omitempty" jsonschema:"Condition: the stored document must match all of these filters, or nothing is written (compare-and-set)"`
-	Upsert     bool           `json:"upsert,omitempty" jsonschema:"Create the document as {_id: id} plus updates if it does not exist"`
+	Database   string             `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
+	Collection string             `json:"collection" jsonschema:"Collection name"`
+	ID         string             `json:"id" jsonschema:"Document _id"`
+	Updates    map[string]any     `json:"updates,omitempty" jsonschema:"Top-level fields to set (replaced or added); other fields are kept; _id cannot be changed. {\"$now\": true} is the server's current time"`
+	Unset      []string           `json:"unset,omitempty" jsonschema:"Top-level fields to remove (after updates); give at least one of updates, unset, inc, push, add_to_set, and pull, and name a field in only one of them"`
+	Inc        map[string]float64 `json:"inc,omitempty" jsonschema:"Top-level numeric fields to add to (field to amount, negative to subtract); a missing field starts at 0; fails if the field holds a non-number"`
+	Push       map[string]any     `json:"push,omitempty" jsonschema:"Append the value to the top-level array field (field to value); a missing field becomes a one-element array; fails if the field holds a non-array"`
+	AddToSet   map[string]any     `json:"add_to_set,omitempty" jsonschema:"Like push, but only if no element equals the value"`
+	Pull       map[string]any     `json:"pull,omitempty" jsonschema:"Remove every element equal to the value from the top-level array field; a missing field is left alone; fails if the field holds a non-array"`
+	If         []Filter           `json:"if,omitempty" jsonschema:"Condition: the stored document must match all of these filters, or nothing is written (compare-and-set)"`
+	Upsert     bool               `json:"upsert,omitempty" jsonschema:"Create the document as {_id: id} plus updates (then the operators: inc from 0, push and add_to_set start an array) if it does not exist"`
 }
 
 type ReplaceDocumentInput struct {
@@ -155,13 +160,17 @@ type InsertDocumentsInput struct {
 }
 
 type UpdateDocumentsInput struct {
-	Database   string         `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
-	Collection string         `json:"collection" jsonschema:"Collection name"`
-	Query      *MatchQuery    `json:"query,omitempty" jsonschema:"Filters and OR groups selecting the documents to update; an empty or omitted query is rejected unless all is true"`
-	Updates    map[string]any `json:"updates,omitempty" jsonschema:"Top-level fields to set in every matching document (replaced or added); _id cannot be changed. {\"$now\": true} is the server's current time"`
-	Unset      []string       `json:"unset,omitempty" jsonschema:"Top-level fields to remove (after updates); at least one of updates and unset is required"`
-	Limit      int            `json:"limit,omitempty" jsonschema:"Update at most this many matching documents, the first by _id; 0 or omitted means no limit (then more matches than the batch limit fail)"`
-	All        bool           `json:"all,omitempty" jsonschema:"Set to true to allow an empty query, which matches every document"`
+	Database   string             `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
+	Collection string             `json:"collection" jsonschema:"Collection name"`
+	Query      *MatchQuery        `json:"query,omitempty" jsonschema:"Filters and OR groups selecting the documents to update; an empty or omitted query is rejected unless all is true"`
+	Updates    map[string]any     `json:"updates,omitempty" jsonschema:"Top-level fields to set in every matching document (replaced or added); _id cannot be changed. {\"$now\": true} is the server's current time"`
+	Unset      []string           `json:"unset,omitempty" jsonschema:"Top-level fields to remove (after updates); give at least one of updates, unset, inc, push, add_to_set, and pull, and name a field in only one of them"`
+	Inc        map[string]float64 `json:"inc,omitempty" jsonschema:"Top-level numeric fields to add to (field to amount, negative to subtract); a missing field starts at 0; fails if the field holds a non-number"`
+	Push       map[string]any     `json:"push,omitempty" jsonschema:"Append the value to the top-level array field (field to value); a missing field becomes a one-element array; fails if the field holds a non-array"`
+	AddToSet   map[string]any     `json:"add_to_set,omitempty" jsonschema:"Like push, but only if no element equals the value"`
+	Pull       map[string]any     `json:"pull,omitempty" jsonschema:"Remove every element equal to the value from the top-level array field; a missing field is left alone; fails if the field holds a non-array"`
+	Limit      int                `json:"limit,omitempty" jsonschema:"Update at most this many matching documents, the first by _id; 0 or omitted means no limit (then more matches than the batch limit fail)"`
+	All        bool               `json:"all,omitempty" jsonschema:"Set to true to allow an empty query, which matches every document"`
 }
 
 type DeleteDocumentsInput struct {
@@ -181,7 +190,7 @@ type CountDocumentsInput struct {
 type DistinctInput struct {
 	Database   string      `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string      `json:"collection" jsonschema:"Collection name"`
-	Field      string      `json:"field" jsonschema:"Top-level field whose distinct values to list; array values contribute each element"`
+	Field      string      `json:"field" jsonschema:"Field or dotted path whose distinct values to list; array values contribute each element"`
 	Query      *MatchQuery `json:"query,omitempty" jsonschema:"Filters and OR groups selecting the documents; omit for every document"`
 }
 
@@ -224,7 +233,8 @@ type CreateIndexInput struct {
 	Database   string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string `json:"collection" jsonschema:"Collection name"`
 	IndexName  string `json:"index_name" jsonschema:"Index name: letters, digits, _ and -, starting with a letter or digit, at most 64 characters"`
-	FieldName  string `json:"field_name" jsonschema:"Top-level field to index"`
+	FieldName  string `json:"field_name" jsonschema:"Field or dotted path (meta.author) to index"`
+	Unique     bool   `json:"unique,omitempty" jsonschema:"Make the index unique: a write giving a value another document already has fails with a unique violation (missing fields, arrays, and objects are not constrained). Fails if existing documents share a value"`
 }
 
 // Tool outputs. The keys are the ones the tools always returned.
@@ -269,6 +279,16 @@ type FindDocumentsOutput struct {
 	Documents []map[string]any `json:"documents" jsonschema:"Matching documents in sort order (by default by _id), each a flat object with its _id"`
 	HasMore   bool             `json:"has_more" jsonschema:"True if more documents match after these (the limit, the default limit, or the result byte cap ended the page)"`
 	NextSkip  int              `json:"next_skip,omitempty" jsonschema:"Set when has_more is true: repeat the call with query.skip set to this value for the next page"`
+	Plan      *QueryPlan       `json:"plan,omitempty" jsonschema:"How the query ran; only with explain: true"`
+}
+
+// QueryPlan describes how find_documents ran a query (explain).
+type QueryPlan struct {
+	Driver        string `json:"driver" jsonschema:"Where the candidates came from, one of: id lookup; index; index range; or union (one index per OR group); index sort; keydir (every document in _id order); none (no document can match)"`
+	Index         string `json:"index,omitempty" jsonschema:"The index the driver read (several comma-separated for an OR union); absent for id lookup, keydir, and none"`
+	OrderProvided bool   `json:"order_provided" jsonschema:"True if the driver produced the documents in the requested order, so the query stopped early without sorting"`
+	Examined      int    `json:"examined" jsonschema:"Candidate documents read and checked against the filters"`
+	Returned      int    `json:"returned" jsonschema:"Documents returned (count)"`
 }
 
 type GetDocumentOutput struct {
@@ -321,8 +341,9 @@ type DescribeCollectionOutput struct {
 
 // IndexDesc describes one secondary index.
 type IndexDesc struct {
-	Name  string `json:"name" jsonschema:"Index name"`
-	Field string `json:"field" jsonschema:"Indexed top-level field"`
+	Name   string `json:"name" jsonschema:"Index name"`
+	Field  string `json:"field" jsonschema:"Indexed field or dotted path"`
+	Unique bool   `json:"unique,omitempty" jsonschema:"True for a unique index (absent otherwise)"`
 }
 
 type CopyCollectionOutput struct {
@@ -492,7 +513,7 @@ func toolSpecs() []toolSpec {
 			map[string]any{"collection": "products", "id": "p1", "fields": []any{"name", "price"}},
 			func(s *Server) mcp.ToolHandlerFor[GetDocumentInput, GetDocumentOutput] { return s.getDocumentTool }),
 		newSpec("find_documents",
-			"Find the documents of a collection matching every filter in query.filters (and, if given, at least one group of query.any), with optional sort, projection (fields), skip, and limit; sorted by _id by default. Returns at most the default limit (100) and 1 MiB unless configured; when has_more is true, call again with query.skip = next_skip. Operators include contains (case-insensitive substring) and has / has_any / has_all (array elements). Comparison is type-aware and a document missing the field matches no operator, not even ne. See resource cachydb://docs/query.",
+			"Find the documents of a collection matching every filter in query.filters (and, if given, at least one group of query.any), with optional sort, projection (fields), skip, and limit; sorted by _id by default. Returns at most the default limit (100) and 1 MiB unless configured; when has_more is true, call again with query.skip = next_skip. Operators include contains (case-insensitive substring), starts_with, has / has_any / has_all (array elements), and exists. Comparison is type-aware and a document missing the field matches no operator except exists (not even ne). explain: true adds the query plan. See resource cachydb://docs/query.",
 			readOnly("Find documents"), accessRead,
 			map[string]any{"collection": "products", "query": map[string]any{
 				"filters": []any{map[string]any{"field": "price", "operator": "lt", "value": 10}},
@@ -517,7 +538,7 @@ func toolSpecs() []toolSpec {
 			map[string]any{"collection": "products", "field": "name"},
 			func(s *Server) mcp.ToolHandlerFor[DistinctInput, DistinctOutput] { return s.distinctTool }),
 		newSpec("update_document",
-			"Merge top-level fields into a document (updates) and remove fields (unset); other fields are kept and the result must satisfy the schema. With if, the write happens only if the stored document matches those filters (compare-and-set; otherwise a condition-failed error). With upsert, a missing document is created.",
+			"Merge top-level fields into a document (updates), remove fields (unset), and change fields in place: inc adds to a number, push / add_to_set append to an array, pull removes equal elements. Other fields are kept and the result must satisfy the schema. With if, the write happens only if the stored document matches those filters (compare-and-set; otherwise a condition-failed error). With upsert, a missing document is created.",
 			writing("Update document", false, false), accessWrite,
 			map[string]any{"collection": "products", "id": "p1", "updates": map[string]any{"price": 3},
 				"if": []any{map[string]any{"field": "price", "operator": "eq", "value": 2.5}}},
@@ -525,7 +546,7 @@ func toolSpecs() []toolSpec {
 				return s.updateDocumentTool
 			}),
 		newSpec("update_documents",
-			"Set fields (updates) and remove fields (unset) in every document matching query.filters and query.any, atomically: all matching documents change or none do. An empty query is rejected unless all is true, and more than 10,000 matches without a limit fail with the match count and change nothing. With limit only the first matches by _id change; repeating the call makes progress only if the update makes documents stop matching the query.",
+			"Set fields (updates), remove fields (unset), and apply inc, push, add_to_set, and pull in every document matching query.filters and query.any, atomically: all matching documents change or none do. An empty query is rejected unless all is true, and more than 10,000 matches without a limit fail with the match count and change nothing. With limit only the first matches by _id change; repeating the call makes progress only if the update makes documents stop matching the query.",
 			writing("Update documents", false, false), accessWrite,
 			map[string]any{"collection": "products", "query": map[string]any{
 				"filters": []any{map[string]any{"field": "price", "operator": "gt", "value": 5}},
@@ -591,7 +612,7 @@ func toolSpecs() []toolSpec {
 				return s.deleteCollectionTool
 			}),
 		newSpec("create_index",
-			"Create a hash index on a top-level field so eq filters (and has, has_any, has_all on array fields, whose elements are indexed) avoid a full scan. Writes to the database wait while the index builds.",
+			"Create an index on a field or dotted path so filters on it (eq, in, ranges, starts_with, exists, and has / has_any / has_all on array elements) and sorts by it avoid a full scan. With unique: true, two documents cannot share a value (a write that would fails with a unique violation). Writes to the database wait while the index builds.",
 			writing("Create index", false, false), accessAdmin,
 			map[string]any{"collection": "products", "index_name": "by_name", "field_name": "name"},
 			func(s *Server) mcp.ToolHandlerFor[CreateIndexInput, MessageOutput] { return s.createIndexTool }),

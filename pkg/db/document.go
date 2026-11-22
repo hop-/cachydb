@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -193,9 +192,14 @@ func (c *Collection) Update(ctx context.Context, id string, set map[string]any) 
 // with ErrConditionFailed and writes nothing. A missing document fails
 // with ErrConditionFailed if u.If is not empty, is created as {_id: id} +
 // u.Set if u.Upsert (upserted is then true), and fails with ErrNotFound
-// otherwise. $now values in u.Set and u.If are resolved once. It fails
-// with ErrSchemaValidation if u.Set or u.Unset names "_id", a field is in
-// both, or the result does not satisfy the schema.
+// otherwise. The operators of u (Inc, Push, AddToSet, Pull) apply after
+// Set and Unset, also to an upserted document; one applied to a field of
+// the wrong type fails with ErrInvalidUpdate. $now values in u.Set, the
+// operators, and u.If are resolved once. It fails with ErrSchemaValidation
+// if u.Set or u.Unset names "_id", a field is in both, or the result does
+// not satisfy the schema, and with ErrInvalidUpdate if an operator names
+// "_id" or a field another part of u names, or an Inc value is not a
+// number.
 func (c *Collection) UpdateWith(ctx context.Context, id string, u UpdateSpec) (doc *Document, upserted bool, err error) {
 	w, err := c.prepareUpdate(id, u, nil, nowString(time.Now()))
 	if err != nil {
@@ -215,12 +219,15 @@ func (c *Collection) prepareUpdate(id string, u UpdateSpec, extra Condition, ts 
 	if p := updateFieldsProblem(u); p != "" {
 		return nil, fmt.Errorf("%w: updating document %q: %s", ErrSchemaValidation, id, p)
 	}
+	if err := checkUpdateOps(&u, fmt.Sprintf("updating document %q", id)); err != nil {
+		return nil, err
+	}
 	if u.Upsert {
 		if err := checkDocID(id); err != nil {
 			return nil, fmt.Errorf("upserting document: %w", err)
 		}
 	}
-	set := resolveNowData(u.Set, ts)
+	ru := resolveNowUpdate(u, ts)
 	filters := u.If
 	if len(extra) > 0 {
 		filters = slices.Concat(extra, u.If)
@@ -240,9 +247,12 @@ func (c *Collection) prepareUpdate(id string, u UpdateSpec, extra Condition, ts 
 				return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
 			}
 			w.upserted = true
-			return &Document{ID: id, Data: set}, nil
 		}
-		return mergeUpdate(cur, set, u.Unset), nil
+		data, err := applyUpdate(id, cur, &ru)
+		if err != nil {
+			return nil, err
+		}
+		return &Document{ID: id, Data: data}, nil
 	}
 	return w, nil
 }
@@ -263,20 +273,6 @@ func updateFieldsProblem(u UpdateSpec) string {
 		}
 	}
 	return ""
-}
-
-// mergeUpdate returns cur with the fields of set replaced or added, then
-// the fields of unset removed. It builds a new top-level map: cur is
-// shared (memtable) and must not change. Nested values of cur and set are
-// only read; the write path re-encodes the after-image into fresh values.
-func mergeUpdate(cur *Document, set map[string]any, unset []string) *Document {
-	data := make(map[string]any, len(cur.Data)+len(set))
-	maps.Copy(data, cur.Data)
-	maps.Copy(data, set)
-	for _, k := range unset {
-		delete(data, k)
-	}
-	return &Document{ID: cur.ID, Data: data}
 }
 
 // Replace atomically replaces the whole document id with doc and returns

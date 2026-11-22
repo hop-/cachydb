@@ -209,8 +209,9 @@ type Target interface {
 	CreateCollection(ctx context.Context, database, collection string, schema *db.Schema) error
 	// UpdateSchema replaces a collection's schema.
 	UpdateSchema(ctx context.Context, database, collection string, schema *db.Schema) error
-	// CreateIndex and DropIndex manage a secondary index.
-	CreateIndex(ctx context.Context, database, collection, name, field string) error
+	// CreateIndex and DropIndex manage a secondary index; CreateIndex
+	// creates ix (its name, field, and whether it is unique).
+	CreateIndex(ctx context.Context, database, collection string, ix db.IndexInfo) error
 	DropIndex(ctx context.Context, database, collection, name string) error
 	// InsertDocument inserts a document (a flat object with its _id); an
 	// existing _id returns an error wrapping ErrDocumentExists.
@@ -390,20 +391,20 @@ func importCollection(ctx context.Context, raw []byte, t Target, mode OnConflict
 			return fmt.Errorf("%s: updating the schema: %w", where, err)
 		}
 	}
-	have := make(map[string]string, len(indexes))
+	have := make(map[string]db.IndexInfo, len(indexes))
 	for _, ix := range indexes {
-		have[ix.Name] = ix.Field
+		have[ix.Name] = ix
 	}
-	want := make(map[string]string, len(l.Indexes))
+	want := make(map[string]db.IndexInfo, len(l.Indexes))
 	for _, ix := range l.Indexes {
-		want[ix.Name] = ix.Field
+		want[ix.Name] = ix
 	}
 	if exists && mode != Replace && !maps.Equal(have, want) {
 		return fmt.Errorf("%s exists with a different index set (use --on-conflict replace to add the missing indexes)", where)
 	}
 	for _, ix := range l.Indexes {
-		field, ok := have[ix.Name]
-		if ok && field == ix.Field {
+		cur, ok := have[ix.Name]
+		if ok && cur == ix {
 			continue
 		}
 		if ok {
@@ -411,7 +412,7 @@ func importCollection(ctx context.Context, raw []byte, t Target, mode OnConflict
 				return fmt.Errorf("%s: replacing index %q: %w", where, ix.Name, err)
 			}
 		}
-		if err := t.CreateIndex(ctx, l.Database, l.Name, ix.Name, ix.Field); err != nil {
+		if err := t.CreateIndex(ctx, l.Database, l.Name, ix); err != nil {
 			return fmt.Errorf("%s: index %q: %w", where, ix.Name, err)
 		}
 	}

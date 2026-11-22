@@ -546,6 +546,8 @@ func toolError(action string, err error) error {
 		return fmt.Errorf("%s: %w (hint: list_databases and list_collections show what exists; current_database shows the database used when none is given)", action, err)
 	case errors.Is(err, db.ErrSchemaValidation):
 		return fmt.Errorf("%s: %w (hint: see resource cachydb://docs/schema)", action, err)
+	case errors.Is(err, db.ErrInvalidUpdate):
+		return fmt.Errorf("%s: %w (hint: get_document shows the field's current value; see the update operators in resource cachydb://docs/query)", action, err)
 	case errors.Is(err, db.ErrConditionFailed):
 		return fmt.Errorf("%s: %w; re-read it and retry", action, err)
 	case errors.Is(err, auth.ErrPermissionDenied):
@@ -832,18 +834,36 @@ func checkBatchQuery(action string, q *MatchQuery, all bool, limit int) error {
 	return nil
 }
 
+// updateSpec builds the engine update of update_document and
+// update_documents, or returns nil if it changes nothing: no updates
+// object (an empty one counts, as before), no unset, and no operator.
+func updateSpec(updates map[string]any, unset []string, inc map[string]float64, push, addToSet, pull map[string]any) *db.UpdateSpec {
+	if updates == nil && len(unset) == 0 && len(inc) == 0 && len(push) == 0 && len(addToSet) == 0 && len(pull) == 0 {
+		return nil
+	}
+	u := &db.UpdateSpec{Set: updates, Unset: unset, Push: push, AddToSet: addToSet, Pull: pull}
+	if len(inc) > 0 {
+		u.Inc = make(map[string]any, len(inc))
+		for f, n := range inc {
+			u.Inc[f] = n
+		}
+	}
+	return u
+}
+
 func (s *Server) updateDocumentsTool(ctx context.Context, req *mcp.CallToolRequest, in UpdateDocumentsInput) (*mcp.CallToolResult, UpdateDocumentsOutput, error) {
 	if err := checkBatchQuery("update documents", in.Query, in.All, in.Limit); err != nil {
 		return nil, UpdateDocumentsOutput{}, err
 	}
-	if in.Updates == nil && len(in.Unset) == 0 {
-		return nil, UpdateDocumentsOutput{}, errors.New("update documents: give updates, unset, or both")
+	u := updateSpec(in.Updates, in.Unset, in.Inc, in.Push, in.AddToSet, in.Pull)
+	if u == nil {
+		return nil, UpdateDocumentsOutput{}, errors.New("update documents: give updates, unset, or an operator (inc, push, add_to_set, pull)")
 	}
 	coll, err := s.getCollection(in.Database, in.Collection, "update documents")
 	if err != nil {
 		return nil, UpdateDocumentsOutput{}, err
 	}
-	matched, modified, err := coll.UpdateMany(ctx, toDBMatchQuery(in.Query), db.UpdateSpec{Set: in.Updates, Unset: in.Unset}, in.Limit)
+	matched, modified, err := coll.UpdateMany(ctx, toDBMatchQuery(in.Query), *u, in.Limit)
 	if err != nil {
 		return nil, UpdateDocumentsOutput{}, toolError("update documents", err)
 	}
@@ -946,7 +966,7 @@ func (s *Server) findDocumentsTool(ctx context.Context, req *mcp.CallToolRequest
 		hasMore bool
 		encErr  error
 	)
-	err = coll.Iterate(ctx, q, func(doc *db.Document) bool {
+	plan, err := coll.IterateWithPlan(ctx, q, func(doc *db.Document) bool {
 		if len(out) == limit {
 			hasMore = true
 			return false
@@ -978,6 +998,12 @@ func (s *Server) findDocumentsTool(ctx context.Context, req *mcp.CallToolRequest
 	res := FindDocumentsOutput{Success: true, Count: len(out), Documents: out, HasMore: hasMore}
 	if hasMore {
 		res.NextSkip = max(q.Skip, 0) + len(out)
+	}
+	if in.Explain {
+		// plan.Returned counts the look-ahead document too; report what
+		// this page returned.
+		res.Plan = &QueryPlan{Driver: plan.Driver, Index: plan.Index, OrderProvided: plan.OrderProvided,
+			Examined: plan.Examined, Returned: len(out)}
 	}
 	return nil, res, nil
 }
@@ -1014,12 +1040,12 @@ func (s *Server) updateDocumentTool(ctx context.Context, req *mcp.CallToolReques
 	if err != nil {
 		return nil, UpdateDocumentOutput{}, err
 	}
-	if in.Updates == nil && len(in.Unset) == 0 {
-		return nil, UpdateDocumentOutput{}, errors.New("update document: give updates, unset, or both")
+	u := updateSpec(in.Updates, in.Unset, in.Inc, in.Push, in.AddToSet, in.Pull)
+	if u == nil {
+		return nil, UpdateDocumentOutput{}, errors.New("update document: give updates, unset, or an operator (inc, push, add_to_set, pull)")
 	}
-	_, upserted, err := coll.UpdateWith(ctx, in.ID, db.UpdateSpec{
-		Set: in.Updates, Unset: in.Unset, If: toDBFilters(in.If), Upsert: in.Upsert,
-	})
+	u.If, u.Upsert = toDBFilters(in.If), in.Upsert
+	_, upserted, err := coll.UpdateWith(ctx, in.ID, *u)
 	if err != nil {
 		return nil, UpdateDocumentOutput{}, toolError("update document", err)
 	}
@@ -1084,7 +1110,7 @@ func (s *Server) describeCollectionTool(_ context.Context, req *mcp.CallToolRequ
 	}
 	indexes := make([]IndexDesc, 0)
 	for _, ix := range coll.Indexes() {
-		indexes = append(indexes, IndexDesc{Name: ix.Name, Field: ix.Field})
+		indexes = append(indexes, IndexDesc{Name: ix.Name, Field: ix.Field, Unique: ix.Unique})
 	}
 	return nil, DescribeCollectionOutput{
 		Success:  true,
@@ -1166,12 +1192,16 @@ func (s *Server) createIndexTool(ctx context.Context, req *mcp.CallToolRequest, 
 	if err != nil {
 		return nil, MessageOutput{}, err
 	}
-	if err := coll.CreateIndex(ctx, in.IndexName, in.FieldName); err != nil {
+	if err := coll.CreateIndex(ctx, in.IndexName, in.FieldName, db.Unique(in.Unique)); err != nil {
 		return nil, MessageOutput{}, toolError("create index", err)
+	}
+	kind := "Index"
+	if in.Unique {
+		kind = "Unique index"
 	}
 	return nil, MessageOutput{
 		Success: true,
-		Message: fmt.Sprintf("Index '%s' created on field '%s'", in.IndexName, in.FieldName),
+		Message: fmt.Sprintf("%s '%s' created on field '%s'", kind, in.IndexName, in.FieldName),
 	}, nil
 }
 

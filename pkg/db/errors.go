@@ -27,4 +27,10 @@ var (
 	// Options.MaxBatchDocs or a larger payload than Options.MaxBatchBytes;
 	// the error states the limit. Nothing was written. Split the batch.
 	ErrBatchTooLarge = errors.New("batch too large")
+	// ErrInvalidUpdate reports a misuse of the update operators of
+	// UpdateSpec (Inc, Push, AddToSet, Pull): an operator on a field of the
+	// wrong type (inc on a non-number, push/add_to_set/pull on a
+	// non-array), a non-numeric inc value, or a field named by more than one
+	// of Set, Unset, and the operators. Nothing was written.
+	ErrInvalidUpdate = errors.New("invalid update")
 )

@@ -135,12 +135,12 @@ func (a Engine) UpdateSchema(ctx context.Context, database, collection string, s
 }
 
 // CreateIndex implements Target.
-func (a Engine) CreateIndex(ctx context.Context, database, collection, name, field string) error {
+func (a Engine) CreateIndex(ctx context.Context, database, collection string, ix db.IndexInfo) error {
 	c, err := a.coll(database, collection)
 	if err != nil {
 		return err
 	}
-	return c.CreateIndex(ctx, name, field)
+	return c.CreateIndex(ctx, ix.Name, ix.Field, db.Unique(ix.Unique))
 }
 
 // DropIndex implements Target.

@@ -18,8 +18,8 @@ A lightweight document-based database with Model Context Protocol (MCP) support,
 - **Multiple databases**: Create and manage multiple databases within a single instance
 - **Schema validation**: Define and enforce schemas for your collections
 - **Indexing**: Multi-value hash indexes on any top-level field (duplicate values supported; array fields indexed per element)
-- **Query operations**: Type-aware filters (eq, ne, gt, gte, lt, lte, in), case-insensitive `contains`, array matching (`has`, `has_any`, `has_all`), OR groups, sort by any field, projection, deterministic skip/limit, `count_documents`, `distinct`
-- **Safe writes**: Conditional writes (`if`, compare-and-set), `unset`, upsert, atomic `replace_document`, and `{"$now": true}` server timestamps
+- **Query operations**: Type-aware filters (eq, ne, gt, gte, lt, lte, in), case-insensitive `contains`, array matching (`has`, `has_any`, `has_all`), `exists`, `starts_with`, nested paths, OR groups, sort by any field, projection, deterministic skip/limit, query plans (`explain`), `count_documents`, `distinct`
+- **Safe writes**: Conditional writes (`if`, compare-and-set), `unset`, in-place operators (`inc`, `push`, `add_to_set`, `pull`), unique indexes, upsert, atomic `replace_document`, and `{"$now": true}` server timestamps
 - **Batch writes**: `insert_documents`, `update_documents`, and `delete_documents` change many documents in one atomic call (all or none); `get_document` reads one by id
 - **Schema evolution**: Every violation reported at once; `describe_collection`, `update_schema`, `rename_collection`, `copy_collection`, `delete_collection`, `drop_index`
 - **Export and client**: JSON Lines export/import (`cachydb utils export|import`), offline `utils find|get`, an offline integrity check (`utils verify`, which can also rebuild index files), and `cachydb client` to call any tool of a running HTTP server from the shell
@@ -467,11 +467,12 @@ Query documents in a collection.
 }
 ```
 
-**Operators**: `eq`, `ne`, `gt`, `lt`, `gte`, `lte`, `in` (`in` takes an array of values), `contains` (case-insensitive substring of a string, or of a string element of an array), `has` (an array element equals the value), `has_any` / `has_all` (some / every value of an array is an element)
+**Operators**: `eq`, `ne`, `gt`, `lt`, `gte`, `lte`, `in` (`in` takes an array of values), `contains` (case-insensitive substring of a string, or of a string element of an array), `has` (an array element equals the value), `has_any` / `has_all` (some / every value of an array is an element), `exists` (`true`: the field is present; `false`: missing), `starts_with` (case-sensitive prefix)
 
-- All `filters` must match; with `any`, at least one group must match too (OR of ANDs). `field` is a top-level field name or `_id` (nested paths are not supported).
+- All `filters` must match; with `any`, at least one group must match too (OR of ANDs). `field` is a field name, a nested path (`meta.author`), or `_id`.
 - Comparison is type-aware: numbers compare numerically, strings lexically. Values of different types never match `eq`, `gt`, `gte`, `lt`, or `lte`. `eq`/`in` compare arrays as whole values; use `has` for elements.
-- A document that lacks the filtered field matches no operator, including `ne` (unlike MongoDB's `$ne`).
+- A document that lacks the filtered field matches no operator, including `ne` (unlike MongoDB's `$ne`), except `exists` with `false`.
+- `"explain": true` next to `query` adds a `plan` (driver, index, whether it gave the order, documents examined and returned).
 - Results are sorted by `sort` (any fields, `asc`/`desc`; missing < null < booleans < numbers < strings < arrays < objects), then `_id`; `skip` and `limit` page deterministically. `fields` returns only the listed fields plus `_id`. An omitted or empty `query` matches all documents. Without a `limit` a call returns at most 100 documents (`DEFAULT_LIMIT`), and every result stays within 1 MiB of JSON (`MAX_RESULT_BYTES`, at least one document); when `has_more` is `true`, repeat the call with `skip` set to `next_skip`.
 
 #### count_documents / distinct
@@ -485,7 +486,7 @@ Query documents in a collection.
 
 #### update_document
 
-Update a document by ID. Top-level fields in `updates` are replaced or added, fields in `unset` are removed, other fields are kept. `_id` cannot be updated. `if` makes the write conditional on the stored document (compare-and-set); `upsert: true` creates a missing document.
+Update a document by ID. Top-level fields in `updates` are replaced or added, fields in `unset` are removed, other fields are kept. `_id` cannot be updated. `inc` (add to a number), `push` / `add_to_set` (append to an array), and `pull` (remove equal elements) change fields in place, after `updates` and `unset`; a field may appear in only one of them, and an operator on a field of the wrong type fails without writing. `if` makes the write conditional on the stored document (compare-and-set); `upsert: true` creates a missing document.
 
 ```json
 {
@@ -526,7 +527,7 @@ Delete a document by ID, optionally only `if` it matches filters.
 
 #### update_documents / delete_documents
 
-Update (`updates`, `unset`) or delete every document matching `query` (`filters`, `any`), atomically: all matching documents change, or none. The result has `matched` and `modified` (or `deleted`). An empty query is rejected unless `"all": true`. More than 10,000 matches without a `limit` fail with the match count and change nothing; with `limit`, the first matches by `_id` change, and repeating the call makes progress only when the change makes documents stop matching (always for a delete).
+Update (`updates`, `unset`, `inc`, `push`, `add_to_set`, `pull`) or delete every document matching `query` (`filters`, `any`), atomically: all matching documents change, or none. The result has `matched` and `modified` (or `deleted`). An empty query is rejected unless `"all": true`. More than 10,000 matches without a `limit` fail with the match count and change nothing; with `limit`, the first matches by `_id` change, and repeating the call makes progress only when the change makes documents stop matching (always for a delete).
 
 ```json
 {"collection": "users", "query": {"filters": [{"field": "age", "operator": "lt", "value": 18}]}, "updates": {"minor": true}}
@@ -537,7 +538,7 @@ Update (`updates`, `unset`) or delete every document matching `query` (`filters`
 
 #### create_index
 
-Create an index on a collection field for faster `eq` queries, and `has` / `has_any` / `has_all` on array fields (each element is indexed). Indexes support duplicate values. Building an index blocks writes to that database until it finishes. `drop_index` (`{"collection", "index_name"}`) removes one.
+Create an index on a field or nested path for faster `eq`, `in`, range, `starts_with`, and `exists` filters and sorts, and `has` / `has_any` / `has_all` on array fields (each element is indexed). Indexes allow duplicate values unless `"unique": true`, which makes a write that repeats another document's value fail. Building an index blocks writes to that database until it finishes. `drop_index` (`{"collection", "index_name"}`) removes one.
 
 ```json
 {

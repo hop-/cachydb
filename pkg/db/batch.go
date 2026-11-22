@@ -194,6 +194,9 @@ func (c *Collection) UpdateMany(ctx context.Context, q *Query, u UpdateSpec, lim
 	if p := updateFieldsProblem(u); p != "" {
 		return 0, 0, fmt.Errorf("%w: updating documents: %s", ErrSchemaValidation, p)
 	}
+	if err := checkUpdateOps(&u, "updating documents"); err != nil {
+		return 0, 0, err
+	}
 	wq, cq, err := compileWriteQuery(q, u.If, "updating documents")
 	if err != nil {
 		return 0, 0, err
@@ -205,14 +208,18 @@ func (c *Collection) UpdateMany(ctx context.Context, q *Query, u UpdateSpec, lim
 	if err := e.hook(hookAfterMatch); err != nil {
 		return matched, 0, err
 	}
-	set := resolveNowData(u.Set, cq.now)
+	ru := resolveNowUpdate(u, cq.now)
 	writes := make([]*docWrite, len(ids))
 	for i, id := range ids {
 		writes[i] = &docWrite{id: id, build: func(cur *Document) (*Document, error) {
 			if cur == nil || !cq.matches(cur) {
 				return nil, errSkipWrite
 			}
-			return mergeUpdate(cur, set, u.Unset), nil
+			data, err := applyUpdate(id, cur, &ru)
+			if err != nil {
+				return nil, err
+			}
+			return &Document{ID: id, Data: data}, nil
 		}}
 	}
 	n, err := c.writeMatched(ctx, writes)
@@ -325,7 +332,7 @@ func (c *Collection) writeMatched(ctx context.Context, writes []*docWrite) (int,
 
 // prepareOp checks op and returns its write; $now values resolve to ts.
 func (c *Collection) prepareOp(op *WriteOp, ts string) (*docWrite, error) {
-	hasUpdate := len(op.Update.Set) > 0 || len(op.Update.Unset) > 0 || len(op.Update.If) > 0 || op.Update.Upsert
+	hasUpdate := len(op.Update.Set) > 0 || len(op.Update.Unset) > 0 || len(op.Update.If) > 0 || op.Update.Upsert || op.Update.hasOps()
 	switch op.Kind {
 	case OpInsert:
 		if hasUpdate || len(op.If) > 0 {

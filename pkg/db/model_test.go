@@ -548,6 +548,85 @@ func mValid(s *Schema, data map[string]any) bool {
 	return true
 }
 
+// mApplyUpdate returns data after u, as the engine applies it (plan 013,
+// approach-agent-interface §4): Set, then Unset, then Inc, Push, AddToSet,
+// and Pull on top-level fields. It returns false when an operator meets a
+// field of the wrong type (inc on a non-number; push, add_to_set, or pull
+// on a non-array; pull on a missing field is a no-op). data may be nil (an
+// upsert) and is not changed.
+func mApplyUpdate(data map[string]any, u UpdateSpec) (map[string]any, bool) {
+	next := maps.Clone(data)
+	if next == nil {
+		next = map[string]any{}
+	}
+	maps.Copy(next, u.Set)
+	for _, f := range u.Unset {
+		delete(next, f)
+	}
+	for f, by := range u.Inc {
+		v, ok := next[f]
+		if !ok {
+			next[f] = by
+			continue
+		}
+		n, isNum := v.(float64)
+		if !isNum {
+			return nil, false
+		}
+		next[f] = n + by.(float64)
+	}
+	array := func(f string) ([]any, bool) {
+		v, ok := next[f]
+		if !ok {
+			return nil, true
+		}
+		arr, ok := v.([]any)
+		return arr, ok
+	}
+	for f, el := range u.Push {
+		arr, ok := array(f)
+		if !ok {
+			return nil, false
+		}
+		next[f] = append(slices.Clone(arr), el)
+	}
+	for f, el := range u.AddToSet {
+		arr, ok := array(f)
+		if !ok {
+			return nil, false
+		}
+		if !slices.ContainsFunc(arr, func(x any) bool { return mEqual(x, el) }) {
+			arr = append(slices.Clone(arr), el)
+		}
+		next[f] = arr
+	}
+	for f, el := range u.Pull {
+		if _, ok := next[f]; !ok {
+			continue
+		}
+		arr, ok := array(f)
+		if !ok {
+			return nil, false
+		}
+		next[f] = slices.DeleteFunc(slices.Clone(arr), func(x any) bool { return mEqual(x, el) })
+	}
+	return next, true
+}
+
+// mUpdateDesc describes the operators of u for an operation's desc.
+func mUpdateDesc(u UpdateSpec) string {
+	var b strings.Builder
+	for _, op := range []struct {
+		name string
+		m    map[string]any
+	}{{"inc", u.Inc}, {"push", u.Push}, {"add_to_set", u.AddToSet}, {"pull", u.Pull}} {
+		if len(op.m) > 0 {
+			fmt.Fprintf(&b, " %s=%s", op.name, js(op.m))
+		}
+	}
+	return b.String()
+}
+
 // ---- the run ----
 
 type modelRun struct {
@@ -868,7 +947,7 @@ func errClass(err error) string {
 		name string
 	}{
 		{ErrExists, "exists"}, {ErrNotFound, "not found"}, {ErrConditionFailed, "condition failed"}, {ErrSchemaValidation, "schema"},
-		{ErrUniqueViolation, "unique"},
+		{ErrUniqueViolation, "unique"}, {ErrInvalidUpdate, "invalid update"},
 	} {
 		if errors.Is(err, s.err) {
 			return s.name
@@ -900,6 +979,87 @@ type docItem struct {
 	want string
 	next map[string]any
 	del  bool
+}
+
+// updateOps adds random update operators (Inc, Push, AddToSet, Pull) to
+// u, each on a field u does not set or unset and no other operator names,
+// so the update is valid; whether the operator meets a field of the right
+// type is left to chance.
+func (r *modelRun) updateOps(u *UpdateSpec) {
+	if !r.chance(0.5) {
+		return
+	}
+	used := map[string]bool{}
+	for f := range u.Set {
+		used[f] = true
+	}
+	for _, f := range u.Unset {
+		used[f] = true
+	}
+	put := func(m *map[string]any, f string, v any) {
+		if *m == nil {
+			*m = map[string]any{}
+		}
+		(*m)[f] = v
+	}
+	for _, f := range modelFields {
+		if used[f] || !r.chance(0.4) {
+			continue
+		}
+		switch r.pick(4) {
+		case 0:
+			put(&u.Inc, f, []float64{1, -1, 2.5, 0}[r.pick(4)])
+		case 1:
+			if r.chance(0.2) {
+				put(&u.Push, f, r.array())
+			} else {
+				put(&u.Push, f, r.scalar())
+			}
+		case 2:
+			put(&u.AddToSet, f, r.scalar())
+		default:
+			v, ok := r.storedValue(f)
+			if !ok || r.chance(0.3) {
+				v = r.scalar()
+			}
+			put(&u.Pull, f, v)
+		}
+	}
+}
+
+// conflictOp adds to u an operator on a field that u already names (in Set,
+// Unset, or another operator), which the engine rejects with
+// ErrInvalidUpdate before reading anything. It returns false if u names no
+// field.
+func (r *modelRun) conflictOp(u *UpdateSpec) bool {
+	var used []string
+	for _, f := range modelFields {
+		_, inSet := u.Set[f]
+		_, inInc := u.Inc[f]
+		_, inPush := u.Push[f]
+		if inSet || inInc || inPush || slices.Contains(u.Unset, f) {
+			used = append(used, f)
+		}
+	}
+	if len(used) == 0 {
+		return false
+	}
+	f := used[r.pick(len(used))]
+	if _, inPull := u.Pull[f]; inPull || r.chance(0.5) {
+		if u.AddToSet == nil {
+			u.AddToSet = map[string]any{}
+		}
+		if _, dup := u.AddToSet[f]; dup {
+			return false
+		}
+		u.AddToSet[f] = r.scalar()
+		return true
+	}
+	if u.Pull == nil {
+		u.Pull = map[string]any{}
+	}
+	u.Pull[f] = r.scalar()
+	return true
 }
 
 func (r *modelRun) docItem(cn, id string) docItem {
@@ -940,6 +1100,7 @@ func (r *modelRun) docItem(cn, id string) docItem {
 				u.Unset = append(u.Unset, f)
 			}
 		}
+		r.updateOps(&u)
 		op := WriteOp{Kind: OpUpdate, ID: id, Update: u}
 		if r.chance(0.5) {
 			op.Update.If = cond // UpdateSpec.If; otherwise WriteOp.If
@@ -953,20 +1114,17 @@ func (r *modelRun) docItem(cn, id string) docItem {
 			want = "condition failed"
 		case !exists && !u.Upsert:
 			want = "not found"
-		case !exists:
-			next = maps.Clone(u.Set)
 		default:
-			next = maps.Clone(cur)
-			maps.Copy(next, u.Set)
-			for _, f := range u.Unset {
-				delete(next, f)
+			var ok bool
+			if next, ok = mApplyUpdate(cur, u); !ok { // cur is nil for an upsert
+				want = "invalid update"
 			}
 		}
 		if want == "ok" && !mValid(mc.schema, next) {
 			want = "schema"
 		}
 		return docItem{
-			desc: fmt.Sprintf("update %s/%s set=%s unset=%v if=%s upsert=%v", cn, id, js(u.Set), u.Unset, js(cond), u.Upsert),
+			desc: fmt.Sprintf("update %s/%s set=%s unset=%v%s if=%s upsert=%v", cn, id, js(u.Set), u.Unset, mUpdateDesc(u), js(cond), u.Upsert),
 			op:   op,
 			want: want,
 			next: next,
@@ -1016,6 +1174,15 @@ func (r *modelRun) docWrite() writeOp {
 		want = "unique"
 	}
 	op := it.op
+	if op.Kind == OpUpdate && r.chance(0.05) {
+		// A field named twice is rejected before anything is read, whatever
+		// the condition and the document. The update maps are fresh (docItem),
+		// so changing them here changes nothing else.
+		if r.conflictOp(&op.Update) {
+			want = "invalid update"
+			it.desc += " conflict" + mUpdateDesc(op.Update)
+		}
+	}
 	return writeOp{
 		desc: it.desc,
 		run: func(ctx context.Context) error {
@@ -1217,17 +1384,23 @@ func (r *modelRun) manyWrite() writeOp {
 			u.Unset = append(u.Unset, f)
 		}
 	}
+	r.updateOps(&u)
+	conflict := r.chance(0.03) && r.conflictOp(&u)
 	if r.chance(0.2) {
 		u.If = r.filters(cn, 1)
 	}
 	ids := match(u.If)
 	final := maps.Clone(mc.docs)
 	want := "ok"
+	if conflict {
+		want = "invalid update" // rejected before matching
+		ids = nil
+	}
 	for _, id := range ids {
-		next := maps.Clone(mc.docs[id])
-		maps.Copy(next, u.Set)
-		for _, f := range u.Unset {
-			delete(next, f)
+		next, ok := mApplyUpdate(mc.docs[id], u)
+		if !ok {
+			want = "invalid update"
+			break
 		}
 		if !mValid(mc.schema, next) {
 			want = "schema"
@@ -1239,7 +1412,7 @@ func (r *modelRun) manyWrite() writeOp {
 		want = "unique"
 	}
 	return writeOp{
-		desc: fmt.Sprintf("update_many %s %s set=%s unset=%v if=%s limit=%d -> %v", cn, js(q), js(u.Set), u.Unset, js(u.If), limit, ids),
+		desc: fmt.Sprintf("update_many %s %s set=%s unset=%v%s if=%s limit=%d -> %v", cn, js(q), js(u.Set), u.Unset, mUpdateDesc(u), js(u.If), limit, ids),
 		run: counts(ids, func(ctx context.Context) (int, int, error) {
 			return r.coll(cn).UpdateMany(ctx, q, u, limit)
 		}),

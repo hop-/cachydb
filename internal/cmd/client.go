@@ -411,7 +411,7 @@ func (c clientStore) Describe(ctx context.Context, database, collection string) 
 	}
 	indexes := make([]db.IndexInfo, len(out.Indexes))
 	for i, ix := range out.Indexes {
-		indexes[i] = db.IndexInfo{Name: ix.Name, Field: ix.Field}
+		indexes[i] = db.IndexInfo{Name: ix.Name, Field: ix.Field, Unique: ix.Unique}
 	}
 	return schema, indexes, nil
 }
@@ -499,8 +499,14 @@ func (c clientStore) UpdateSchema(ctx context.Context, database, collection stri
 	return err
 }
 
-func (c clientStore) CreateIndex(ctx context.Context, database, collection, name, field string) error {
-	_, err := callTool(ctx, c.cs, "create_index", map[string]any{"database": database, "collection": collection, "index_name": name, "field_name": field})
+// CreateIndex sends unique only for a unique index, so a non-unique index
+// can still be created on a server without the parameter.
+func (c clientStore) CreateIndex(ctx context.Context, database, collection string, ix db.IndexInfo) error {
+	args := map[string]any{"database": database, "collection": collection, "index_name": ix.Name, "field_name": ix.Field}
+	if ix.Unique {
+		args["unique"] = true
+	}
+	_, err := callTool(ctx, c.cs, "create_index", args)
 	return err
 }
 

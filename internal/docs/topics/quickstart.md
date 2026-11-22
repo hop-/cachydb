@@ -79,12 +79,15 @@ find_documents {"collection": "products", "query": {"skip": 100}}
 ```
 
 Update merges top-level fields (`unset` removes some; `{"$now": true}` is
-the server time); `if` makes it conditional; delete removes a document:
+the server time); `if` makes it conditional; `inc`, `push`,
+`add_to_set`, and `pull` change a number or an array in place (see
+`cachydb docs query`); delete removes a document:
 
 ```json
 update_document {"collection": "products", "id": "p1", "updates": {"price": 3, "updated": {"$now": true}}, "unset": ["draft"]}
 update_document {"collection": "products", "id": "p1", "updates": {"price": 4}, "if": [{"field": "price", "operator": "eq", "value": 3}]}
 update_document {"collection": "products", "id": "p9", "updates": {"name": "Ink"}, "upsert": true}
+update_document {"collection": "products", "id": "p1", "inc": {"stock": -1}, "add_to_set": {"tags": "sale"}}
 delete_document {"collection": "products", "id": "p1"}
 ```
 
@@ -96,11 +99,13 @@ update_documents {"collection": "products", "query": {"filters": [{"field": "pri
 delete_documents {"collection": "products", "query": {"filters": [{"field": "sale", "operator": "eq", "value": true}]}}
 ```
 
-Speed up equality and tag (`has`) lookups with an index; inspect the
+Speed up lookups, ranges, and sorts on a field with an index (`unique`
+also rejects a second document with the same value); inspect the
 collection:
 
 ```json
 create_index {"collection": "products", "index_name": "by_name", "field_name": "name"}
+create_index {"collection": "products", "index_name": "by_sku", "field_name": "sku", "unique": true}
 describe_collection {"collection": "products"}
 ```
 

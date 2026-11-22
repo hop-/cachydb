@@ -83,7 +83,7 @@ on-disk format versions this build reads and writes.
 | `ListCollections() []string` | Sorted; nil when empty |
 | `DropCollection(ctx, name) error` | MCP `delete_collection` |
 | `RenameCollection(ctx, old, new) error` | Same database; flushes the collection, then WAL op 10 (`rename_coll`) + directory rename + `coll.meta` rewrite; `ErrNotFound`, `ErrExists`; old handles return `ErrNotFound` afterwards |
-| `CopyCollection(ctx, name, newName, target *Database) (int, error)` | `target` nil = same database; creates the target with the schema and indexes, then inserts every document (same ids, ascending) through `Collection.Batch`, each batch at most `MaxBatchDocs` documents and about `MaxBatchBytes` (sizes estimated, a batch over the limit is split in halves); **not atomic** as a whole (on error the target holds the batches written before it; drop it); `ErrExists` |
+| `CopyCollection(ctx, name, newName, target *Database) (int, error)` | `target` nil = same database; creates the target with the schema and indexes (unique ones stay unique, F-015), then inserts every document (same ids, ascending) through `Collection.Batch`, each batch at most `MaxBatchDocs` documents and about `MaxBatchBytes` (sizes estimated, a batch over the limit is split in halves); **not atomic** as a whole (on error the target holds the batches written before it; drop it); `ErrExists` |
 
 ### Collection (`document.go`, `collection.go`)
 
@@ -94,10 +94,11 @@ on-disk format versions this build reads and writes.
 | `Find(ctx, *Query) ([]*Document, error)` | See [Queries](#queries) |
 | `FindWithPlan(ctx, *Query) ([]*Document, QueryPlan, error)` | `Find` plus the plan it ran: driver, index, whether the order was provided, examined and returned counts (for `explain`) |
 | `Iterate(ctx, *Query, func(*Document) bool) error` | Runs the query as `Find` does and passes each result (a copy) to the callback in order until it returns false, without collecting them; the callback runs inside the read snapshot and must not write. If a compaction or index change restarts the query, it continues by position after the results already passed (as `skip` paging does). Backs the bounded `find_documents` |
+| `IterateWithPlan(ctx, *Query, func(*Document) bool) (QueryPlan, error)` | `Iterate` plus the plan (`Returned` counts the results passed to the callback, including one it stopped on); backs `find_documents` `explain` |
 | `CountDocuments(ctx, *Query) (int, error)` | Filters and `Any` only; fast paths below |
 | `Distinct(ctx, field, *Query) ([]any, error)` | Arrays contribute each element; deduplicated like `eq`, sorted by the sort order |
 | `Update(ctx, id, set map[string]any) (*Document, error)` | `UpdateWith` with only `Set` |
-| `UpdateWith(ctx, id, UpdateSpec) (*Document, bool, error)` | `Set`, then remove `Unset`; `If` condition; `Upsert` creates `{_id}+Set` (returns `upserted`); `ErrNotFound`, `ErrConditionFailed`; `"_id"` in `Set`/`Unset` or a field in both → `ErrSchemaValidation` |
+| `UpdateWith(ctx, id, UpdateSpec) (*Document, bool, error)` | `Set`, then remove `Unset`, then the operators `Inc`, `Push`, `AddToSet`, `Pull` (see [Update operators](#update-operators)); `If` condition; `Upsert` creates `{_id}+Set`, then applies the operators (returns `upserted`); `ErrNotFound`, `ErrConditionFailed`; `"_id"` in `Set`/`Unset` or a field in both → `ErrSchemaValidation`; operator misuse → `ErrInvalidUpdate` |
 | `Replace(ctx, id, *Document, Condition) (*Document, error)` | Whole-document replace; `doc.ID` empty or `id`; `ErrNotFound` (missing), `ErrConditionFailed` |
 | `Delete(ctx, id) error` | `DeleteWith(ctx, id, nil)` |
 | `DeleteWith(ctx, id, Condition) error` | `ErrNotFound`, `ErrConditionFailed` |
@@ -126,6 +127,34 @@ on-disk format versions this build reads and writes.
 - Every single write still logs one `put_doc`/`delete_doc` after-image; a
   `Batch` logs one `batch` record holding every item's after-image (or
   delete).
+
+### Update operators
+
+`UpdateSpec.Inc`, `Push`, `AddToSet`, and `Pull` (plan 013,
+approach-agent-interface §4; `update.go`) change top-level fields
+relative to their stored value. Each is a map of field to value:
+
+| Field | Effect | `ErrInvalidUpdate` when the field holds |
+| --- | --- | --- |
+| `Inc` | adds the number (any Go numeric kind or `json.Number`, finite); a missing field starts at 0; the result is a `float64` | a non-number (or the sum overflows) |
+| `Push` | appends the value as one element; a missing field becomes `[value]` | a non-array |
+| `AddToSet` | as `Push`, unless an element equal to the value (`valuesEqual`, numbers as `float64`) exists | a non-array |
+| `Pull` | removes every element equal to the value; a missing field is left alone | a non-array |
+
+- They apply after `Set` and `Unset` in the write's `build` callback
+  (`applyUpdate`), under the document lock, so they are atomic and
+  combine with `If` and `Upsert` (an upserted document is `{_id}+Set`,
+  then the operators). The schema is validated on the result. `$now` in
+  `Push`, `AddToSet`, and `Pull` values resolves like in `Set`.
+- `checkUpdateOps` runs before any document is read: an operator on
+  `"_id"`, a field named by an operator and by `Set`, `Unset`, or another
+  operator, or an `Inc` value that is not a finite number fails with
+  `ErrInvalidUpdate`. (`"_id"` in `Set`/`Unset`, or a field in both, stays
+  `ErrSchemaValidation`.)
+- `Batch` `OpUpdate` items and `UpdateMany` use the same code; in
+  `UpdateMany` one document of the wrong type fails the whole call.
+- The model test (`model_test.go`, `updateOps`, `mApplyUpdate`) generates
+  the operators, including type mismatches and conflicting fields.
 
 ### Batches (`batch.go`)
 
@@ -175,7 +204,8 @@ return how many documents matched and how many they changed.
 - Only `q.Filters` and `q.Any` apply; `Sort`, `Fields`, `Skip`, or `Limit`
   in `q` is an error (the limit is the call's argument). A nil or empty
   query matches every document.
-- `UpdateSpec`: `Set` and `Unset` as in `UpdateWith`; `If` adds filters to
+- `UpdateSpec`: `Set`, `Unset`, and the operators as in `UpdateWith`
+  (conflicts are rejected before matching); `If` adds filters to
   the query (a document that does not match them is not matched);
   `Upsert` is an error. `$now` resolves to one time for the query and the
   update.
@@ -190,8 +220,8 @@ return how many documents matched and how many they changed.
   fail with `ErrBatchTooLarge`; the text states the match count (also
   returned as `matched`) and nothing is written. A payload over
   `MaxBatchBytes` fails the same way.
-- A document the update makes invalid (schema, unique index) fails the
-  whole call with that document's error (the `*BatchItemError` wrapper is
+- A document the update makes invalid (schema, unique index, an operator
+  on a field of the wrong type) fails the whole call with that document's error (the `*BatchItemError` wrapper is
   removed: the error names the document).
 
 Every acknowledged write is fsynced to the WAL before the call returns.
@@ -209,6 +239,7 @@ Errors are wrapped with context; test them with `errors.Is`.
 | `ErrSchemaValidation` | Invalid schema, document violates the schema (a `*SchemaError` listing every violation wraps it), a reserved `_id` misuse, or `UpdateSchema` found non-matching documents |
 | `ErrConditionFailed` | An `if` condition did not match the stored document (or it is missing); nothing was written |
 | `ErrUniqueViolation` | A write's value for a unique index belongs to another document, or `CreateIndex` with `Unique(true)` found documents sharing a value; nothing was written |
+| `ErrInvalidUpdate` | Misuse of the update operators: `Inc` on a non-number or a non-numeric/non-finite `Inc` value or an overflowing sum, `Push`/`AddToSet`/`Pull` on a non-array, an operator on `"_id"`, or a field named by an operator and by `Set`, `Unset`, or another operator; nothing was written |
 | `ErrBatchTooLarge` | A `Batch` has more operations than `MaxBatchDocs` or a larger payload than `MaxBatchBytes`, or `UpdateMany`/`DeleteMany` without a limit match more than `MaxBatchDocs` documents; the text states the limit (and the match count); nothing was written |
 | `ErrClosed` | Engine closed |
 | `ErrDataDirInUse` | Another process (or engine) holds `cachydb.lock` |
@@ -341,7 +372,8 @@ otherwise the name is split on `.` and followed through objects. A path
 that crosses an array or a value that is not an object resolves to
 missing (`tags.0` is missing; indexing into arrays is not supported).
 Filters, sort keys, and projections split their paths once per call.
-Schemas, `UpdateSpec.Set`, and `Unset` stay top-level.
+Schemas, `UpdateSpec.Set`, `Unset`, and the update operators stay
+top-level.
 
 ### Snapshot and plans (`plan.go`)
 
@@ -386,9 +418,10 @@ early stop. A sort the driver does not provide reads every candidate into
 a bounded heap of `Skip+Limit` (`findByHeap`, `sortHeap`). A descending
 index sort walks value groups backwards and each group forwards.
 
-`Collection.FindWithPlan` returns the `QueryPlan` (driver, index name,
-whether the order was provided, examined and returned counts); the
-internal `find` returns the examined count for tests.
+`Collection.FindWithPlan` (and `IterateWithPlan`, which backs MCP
+`explain`) returns the `QueryPlan` (driver, index name, whether the order
+was provided, examined and returned counts); the internal `find` returns
+the examined count for tests.
 
 - `CountDocuments`: no filter → `Count()`; a single filter that the key
   table or an index answers exactly (`countExact`: `eq`/`in` on `_id`;

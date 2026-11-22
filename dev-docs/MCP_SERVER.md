@@ -271,7 +271,7 @@ Annotations (all tools also set `openWorldHint: false` and a title):
 | `current_database` | — | `current_database` (session choice or default) |
 | `create_collection` | `name`, `database`?, `schema`? | `message` |
 | `list_collections` | `database`? | `collections` (sorted; `[]` when empty), `database` |
-| `describe_collection` | `collection`, `database`? | `database`, `name`, `schema` (or null), `indexes` [`{name, field}`, sorted], `count` |
+| `describe_collection` | `collection`, `database`? | `database`, `name`, `schema` (or null), `indexes` [`{name, field, unique?}`, sorted; `unique: true` only on unique indexes], `count` |
 | `update_schema` | `collection`, `schema` (object or null), `database`? | `message` |
 | `rename_collection` | `collection`, `new_name`, `database`? | `message` |
 | `copy_collection` | `collection`, `new_name`, `target_database`?, `database`? | `message`, `copied` |
@@ -279,15 +279,15 @@ Annotations (all tools also set `openWorldHint: false` and a title):
 | `insert_document` | `collection`, `document`, `database`? | `id`, `message` |
 | `insert_documents` | `collection`, `documents` (array), `database`? | `ids` (in order), `inserted` |
 | `get_document` | `collection`, `id`, `fields`?, `database`? | `document` (flat, with `_id`) |
-| `find_documents` | `collection`, `query`?, `database`? | `count`, `documents`, `has_more`, `next_skip` (when `has_more`) |
+| `find_documents` | `collection`, `query`?, `explain`?, `database`? | `count`, `documents`, `has_more`, `next_skip` (when `has_more`), `plan` (with `explain`) |
 | `count_documents` | `collection`, `query`? (`filters`, `any`), `database`? | `count` |
 | `distinct` | `collection`, `field`, `query`? (`filters`, `any`), `database`? | `values` |
-| `update_document` | `collection`, `id`, `updates`?, `unset`?, `if`?, `upsert`?, `database`? | `message`, `upserted` |
-| `update_documents` | `collection`, `query`? (`filters`, `any`), `updates`?, `unset`?, `limit`?, `all`?, `database`? | `matched`, `modified` |
+| `update_document` | `collection`, `id`, `updates`?, `unset`?, `inc`?, `push`?, `add_to_set`?, `pull`?, `if`?, `upsert`?, `database`? | `message`, `upserted` |
+| `update_documents` | `collection`, `query`? (`filters`, `any`), `updates`?, `unset`?, `inc`?, `push`?, `add_to_set`?, `pull`?, `limit`?, `all`?, `database`? | `matched`, `modified` |
 | `replace_document` | `collection`, `id`, `document`, `if`?, `database`? | `message` |
 | `delete_document` | `collection`, `id`, `if`?, `database`? | `message` |
 | `delete_documents` | `collection`, `query`? (`filters`, `any`), `limit`?, `all`?, `database`? | `matched`, `deleted` |
-| `create_index` | `collection`, `index_name`, `field_name`, `database`? | `message` |
+| `create_index` | `collection`, `index_name`, `field_name`, `unique`?, `database`? | `message` |
 | `drop_index` | `collection`, `index_name`, `database`? | `message` (`ErrNotFound` if missing) |
 
 `?` = optional. Handlers are thin: each resolves the database (see
@@ -344,13 +344,15 @@ Filters, OR groups, projection, sort, limit, and skip are nested under
 ```
 
 - Operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `contains`,
-  `has`, `has_any`, `has_all`. All `filters` must match, and with `any`
-  also every filter of at least one group. Fields are top-level names or
-  `_id` (no dot-notation).
+  `has`, `has_any`, `has_all`, `exists`, `starts_with` (the `Operators`
+  enum). All `filters` must match, and with `any` also every filter of at
+  least one group. Fields are names, nested paths (`meta.author`), or
+  `_id`; the same holds for `sort`, `fields`, `distinct`, `if`, and
+  `create_index`.
 - Type-aware comparison: numbers compare numerically, strings lexically;
   values of different types never match `eq/gt/gte/lt/lte`.
 - A document **missing the field matches no operator, including `ne`**
-  (unlike MongoDB's `$ne`).
+  (unlike MongoDB's `$ne`), except `exists` with `false`.
 - Results are sorted by `sort`, then `_id`; `skip`/`limit` page
   deterministically. An omitted or empty `query` matches every document.
 - **Bounded results** (plan 013 §2): `limit` omitted or 0 means
@@ -366,16 +368,35 @@ Filters, OR groups, projection, sort, limit, and skip are nested under
   (which follows `has_more`/`next_skip`) are not bounded by these.
 - Each document is returned as a flat object with `_id` (only the
   `fields` listed, plus `_id`, when `fields` is set).
+- **`explain: true`** (plan 013 §5) runs the same iteration through
+  `Collection.IterateWithPlan` and adds `plan` (`QueryPlan` in tools.go:
+  `driver`, `index` (omitted when empty), `order_provided`, `examined`,
+  `returned`); without it `plan` is omitted. `returned` is the page's
+  `count`; `examined` comes from the engine and can include the
+  look-ahead document.
 
 Full semantics: [DATABASE_ENGINE.md — Queries](DATABASE_ENGINE.md#queries).
 
 ### `update_document`, `replace_document`, `delete_document`
 
 `updates` is merged into the document (top-level fields are replaced or
-added), then the `unset` fields are removed; at least one of the two is
-required, and a field in both is an error. `_id` cannot be updated or
-unset. `upsert: true` creates a missing document as `{_id: id} + updates`
-(`upserted: true` in the result). `replace_document` replaces the whole
+added), then the `unset` fields are removed, then the update operators
+apply (plan 013 §4; `UpdateSpec.Inc`, `Push`, `AddToSet`, `Pull`):
+`inc` (`map[string]float64` in the input, so the SDK rejects a
+non-number) adds to a number, a missing field starting at 0; `push`
+appends, a missing field becoming a one-element array; `add_to_set`
+appends unless an equal element (`eq` equality) exists; `pull` removes
+every equal element, a missing field being a no-op. At least one of
+`updates` (even `{}`), `unset`, and the operators is required
+(`updateSpec` in server.go). A field in both `updates` and `unset` is a
+schema-validation error as before; a field named by an operator and by
+anything else, an operator on `_id`, or an operator meeting the wrong
+type (`inc` on a non-number, the array operators on a non-array) is
+`db.ErrInvalidUpdate`, which `toolError` hints at `get_document` and the
+query topic. `_id` cannot be updated or unset. `upsert: true` creates a
+missing document as `{_id: id} + updates`, then applies the operators
+(`upserted: true` in the result). Everything runs in the write's build
+callback under the document lock, so it combines atomically with `if`. `replace_document` replaces the whole
 document atomically (its `_id`, if given, must equal `id`). The schema is
 validated on the result. `if` (on all three) is a list of filters the
 stored document must match, checked under the document lock just before
@@ -412,8 +433,10 @@ Plan 013 §3, on the stage-3 engine calls:
   one) fail with the engine's `ErrBatchTooLarge` message, which states
   the match count, and write nothing. A document that stops matching
   between the snapshot and its write is skipped, so `modified`/`deleted`
-  can be lower than `matched`. `update_documents` needs `updates` or
-  `unset` (like `update_document`) and has no `upsert`. Repeating a
+  can be lower than `matched`. `update_documents` takes the same
+  `updates`, `unset`, and operators as `update_document` (at least one)
+  and has no `upsert`; one matching document of the wrong type for an
+  operator fails the whole call. Repeating a
   limited update only makes progress when the update makes documents
   stop matching the query (the tool description says so); a limited
   delete always does.
@@ -423,9 +446,16 @@ Plan 013 §3, on the stage-3 engine calls:
 
 ### `create_index`, `drop_index`
 
-Builds a multi-value index from the existing documents (array fields are
-indexed per element). Writes to the whole database wait while it builds.
-`eq`, `has`, `has_any`, and `has_all` filters use indexes.
+Builds an index from the existing documents (array fields are indexed
+per element; `field_name` may be a nested path). Writes to the whole
+database wait while it builds. `eq`, `in`, ranges, `starts_with`,
+`exists`, `has`, `has_any`, and `has_all` filters and sorts use indexes.
+`unique: true` passes `db.Unique(true)`: a duplicate value fails with the
+engine's `ErrUniqueViolation` (`unique index violation`), also when
+existing documents already share a value; the message then says "Unique
+index '<name>' created". `describe_collection` reports `unique: true` on
+such an index (omitted otherwise, so the output for existing indexes is
+unchanged), and `cachydb client export`/`import` carry it (F-016).
 
 ## Self-description
 

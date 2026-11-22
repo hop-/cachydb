@@ -23,7 +23,9 @@ starting `validating "arguments":`.
 | `schema validation failed` | The document breaks the collection schema (every violation is listed), the schema itself is invalid, or `update_schema` found documents that do not match (their ids are listed) | Fix the fields named in the message; see `cachydb docs schema` |
 | `condition failed: document x no longer matches if; re-read it and retry` | An `if` condition (update, replace, delete) did not match the stored document, or the document does not exist; nothing was written | Read the document again, recompute, and retry with the new values in `if` |
 | `in both updates and unset` | `update_document` named a field in both | Use one of them per field |
-| `give updates, unset, or both` | `update_document` had nothing to change | Pass `updates` and/or `unset` |
+| `give updates, unset, or an operator` | `update_document` or `update_documents` had nothing to change | Pass `updates`, `unset`, or an update operator (`inc`, `push`, `add_to_set`, `pull`) |
+| `invalid update` | An update operator met a field of the wrong type (`inc` on a non-number; `push`, `add_to_set`, `pull` on a non-array), or a field was named in more than one of `updates`, `unset`, and the operators; nothing was written | Check the field's current value (`get_document`); name each field once; see `cachydb docs query` |
+| `unique index violation` | A write gives a unique index's value to a second document, or `create_index` with `unique` found documents sharing a value (listed); nothing was written | Use another value, or change the other document first |
 | `field "_id" in data is reserved` / `field "_id" cannot be changed` | `_id` was not a string on insert, or was in `updates` | Pass a string `_id` on insert only |
 | `validating "arguments"` | The arguments do not match the tool's input schema (missing field, wrong type, unknown operator or field type) | Fix the arguments; the message names the property; see `cachydb docs tools` |
 | `the database engine is shut down` | The server is stopping | Reconnect after it restarts |
