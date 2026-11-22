@@ -354,14 +354,17 @@ func (e *toolCallError) Unwrap() error { return errToolFailed }
 
 // isAlreadyExists reports whether err is a tool error for an existing
 // item: by its [already_exists] code, or, from a server older than the
-// error codes, by the db.ErrExists text.
+// error codes, by the db.ErrExists text in the tool error. An error that
+// is not a tool error is never a conflict.
 func isAlreadyExists(err error) bool {
-	if tf, ok := errors.AsType[*toolCallError](err); ok {
-		if code, known := mcpserver.ErrorCodeOf(tf.text); known {
-			return code == mcpserver.CodeAlreadyExists
-		}
+	tf, ok := errors.AsType[*toolCallError](err)
+	if !ok {
+		return false
 	}
-	return strings.Contains(err.Error(), db.ErrExists.Error())
+	if code, known := mcpserver.ErrorCodeOf(tf.text); known {
+		return code == mcpserver.CodeAlreadyExists
+	}
+	return strings.Contains(tf.text, db.ErrExists.Error())
 }
 
 // resultText joins the text content of a tool result.
