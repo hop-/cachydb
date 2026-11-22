@@ -2,11 +2,14 @@ package cmd
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
+	"github.com/hop-/cachydb/internal/auth"
 	"github.com/hop-/cachydb/internal/config"
 	"github.com/spf13/cobra"
 )
@@ -24,10 +27,14 @@ another status (503 while it shuts down), or took longer than 3 seconds.
 The reason goes to stderr; nothing is written on success.
 
 The URL defaults to http://127.0.0.1:<port>/healthz, with the port from
--p/--port, then PORT, then 7601. Without --url, if the transport (-t,
-then TRANSPORT) is stdio there is no HTTP server to probe: healthcheck
-prints a note to stderr and exits 0, so a stdio container is not marked
-unhealthy. An explicit --url is always probed.
+-p/--port, then PORT, then 7601; https:// when the server's TLS
+certificate and key are set (--tls-cert and --tls-key, then TLS_CERT and
+TLS_KEY). Without --url, if the transport (-t, then TRANSPORT) is stdio
+there is no HTTP server to probe: healthcheck prints a note to stderr and
+exits 0, so a stdio container is not marked unhealthy. An explicit --url
+is always probed. An HTTPS URL on a loopback host (127.0.0.1, ::1,
+localhost) is probed without verifying the certificate; /healthz needs
+no token.
 
 healthcheck never opens the database, so it works while a server runs. The
 official Docker image uses it as its HEALTHCHECK; see "cachydb docs mcp".`,
@@ -42,6 +49,8 @@ var (
 	healthcheckURL       string
 	healthcheckPort      int
 	healthcheckTransport string
+	healthcheckTLSCert   string
+	healthcheckTLSKey    string
 )
 
 func init() {
@@ -63,6 +72,18 @@ func init() {
 		c.Transport,
 		"transport of the local server; stdio means nothing to probe (env TRANSPORT)",
 	)
+	healthcheckCmd.Flags().StringVar(
+		&healthcheckTLSCert,
+		"tls-cert",
+		c.TLSCert,
+		"TLS certificate of the local server; with --tls-key the default URL is https (env TLS_CERT)",
+	)
+	healthcheckCmd.Flags().StringVar(
+		&healthcheckTLSKey,
+		"tls-key",
+		c.TLSKey,
+		"TLS key of the local server; with --tls-cert the default URL is https (env TLS_KEY)",
+	)
 	rootCmd.AddCommand(healthcheckCmd)
 }
 
@@ -76,7 +97,9 @@ func runHealthcheck(cmd *cobra.Command, _ []string) error {
 // healthcheck probes url, or the local server's /healthz when url is
 // empty, and returns nil only for HTTP 200. With an empty url and the
 // stdio transport there is nothing to probe: it writes a note to stderr
-// and returns nil. ctx bounds the request.
+// and returns nil. The default URL is https when the --tls-cert and
+// --tls-key flags (defaults TLS_CERT, TLS_KEY) are both set. ctx bounds
+// the request.
 func healthcheck(ctx context.Context, stderr io.Writer, url, transport string, port int) error {
 	if url == "" {
 		if err := validateTransport(transport); err != nil {
@@ -86,14 +109,18 @@ func healthcheck(ctx context.Context, stderr io.Writer, url, transport string, p
 			_, err := fmt.Fprintln(stderr, "healthcheck: transport is stdio; nothing to probe")
 			return err
 		}
-		url = fmt.Sprintf("http://127.0.0.1:%d/healthz", port)
+		scheme := "http"
+		if healthcheckTLSCert != "" && healthcheckTLSKey != "" {
+			scheme = "https"
+		}
+		url = fmt.Sprintf("%s://127.0.0.1:%d/healthz", scheme, port)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("healthcheck: %w", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := healthClient(req.URL).Do(req)
 	if err != nil {
 		return fmt.Errorf("healthcheck: %w", err)
 	}
@@ -105,4 +132,23 @@ func healthcheck(ctx context.Context, stderr io.Writer, url, transport string, p
 		return fmt.Errorf("healthcheck: GET %s: unhealthy: %s", url, resp.Status)
 	}
 	return nil
+}
+
+// healthClient returns the client that probes u. An HTTPS URL on a
+// loopback host skips certificate verification: the certificate names
+// the server's public host, not 127.0.0.1, and often is self-signed, and
+// the probe sends no secret and only reads the status. That client does
+// not follow redirects, so only the loopback answer counts.
+func healthClient(u *url.URL) *http.Client {
+	if u.Scheme != "https" || !auth.IsLoopback(u.Hostname()) {
+		return http.DefaultClient
+	}
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	return &http.Client{
+		Transport: t,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }

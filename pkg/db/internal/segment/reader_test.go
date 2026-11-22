@@ -156,9 +156,7 @@ func TestReaderConcurrentReadAndRetire(t *testing.T) {
 		errs    = make(chan error, workers)
 	)
 	for w := range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			signaled := false
 			for i := 0; ; i++ {
 				if !r.Acquire() {
@@ -188,7 +186,7 @@ func TestReaderConcurrentReadAndRetire(t *testing.T) {
 					started <- struct{}{}
 				}
 			}
-		}()
+		})
 	}
 	for range workers {
 		<-started
@@ -275,10 +273,4 @@ func TestReaderRetireWithMissingFileIsNotAnError(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.RetireWith(func(err error) { t.Errorf("unexpected error: %v", err) })
-}
-
-func TestHintPath(t *testing.T) {
-	if got, want := HintPath("/d", 7), hintPath("/d", 7); got != want {
-		t.Errorf("HintPath = %s, want %s", got, want)
-	}
 }

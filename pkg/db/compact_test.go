@@ -116,14 +116,16 @@ func docsModel(indexes map[string]string, docs map[string]map[string]any) model 
 // non-retired segment.
 func checkKeydirLive(t *testing.T, c *Collection) {
 	t.Helper()
+	keys := keyTable(t, c)
+	segBytes, _ := segAccounting(t, c)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	for id, ke := range c.keydir {
-		if _, ok := c.retired[ke.loc.Seg]; ok {
-			t.Errorf("keydir[%q] points into retired segment %d", id, ke.loc.Seg)
+	for id, ke := range keys {
+		if _, ok := c.retired[ke.Seg]; ok {
+			t.Errorf("keydir[%q] points into retired segment %d", id, ke.Seg)
 		}
-		if _, ok := c.segBytes[ke.loc.Seg]; !ok {
-			t.Errorf("keydir[%q] points into unknown segment %d", id, ke.loc.Seg)
+		if _, ok := segBytes[ke.Seg]; !ok {
+			t.Errorf("keydir[%q] points into unknown segment %d", id, ke.Seg)
 		}
 	}
 	for seg := range c.readers {
@@ -330,7 +332,7 @@ func TestCompactionRecords(t *testing.T) {
 				t.Fatalf("segments %v -> %v: want one new output segment with a higher id", before, after)
 			}
 			for _, s := range tt.wantRun {
-				if slices.Contains(after, s) || fileExistsT(t, segment.HintPath(c.dir, s)) {
+				if slices.Contains(after, s) {
 					t.Errorf("files of compacted segment %d still exist", s)
 				}
 			}
@@ -338,13 +340,8 @@ func TestCompactionRecords(t *testing.T) {
 			if got := recordKinds(outRecs); !slices.Equal(got, tt.wantOut) {
 				t.Errorf("output records = %v, want %v", got, tt.wantOut)
 			}
-			hint, err := segment.ReadHint(c.dir, out[0])
-			if err != nil || len(hint) != len(outRecs) {
-				t.Errorf("output hint = %d entries, %v; want %d", len(hint), err, len(outRecs))
-			}
-			c.mu.RLock()
-			outDead := c.deadBytes[out[0]]
-			c.mu.RUnlock()
+			_, deadBytes := segAccounting(t, c)
+			outDead := deadBytes[out[0]]
 			if outDead != 0 {
 				t.Errorf("deadBytes[output] = %d, want 0 (copied tombstones are needed)", outDead)
 			}
@@ -410,9 +407,19 @@ func TestCompactionSwapIsCompareAndSwap(t *testing.T) {
 	if _, err := c.Update(ctx, "a", map[string]any{"v": "a2"}); err != nil {
 		t.Fatal(err)
 	}
-	mustFlushSeal(t, c) // 2
+	// x is inserted and deleted before the flush: segment 2 gets its
+	// tombstone, dead bytes that put segment 2 into the compaction run
+	// (without checkpoint markers it would hold no dead bytes at all).
+	mustInsert(t, c, "x", map[string]any{"v": 1})
+	if err := c.Delete(ctx, "x"); err != nil {
+		t.Fatal(err)
+	}
+	mustFlushSeal(t, c) // 2: a2, tomb(x)
+	if got := recordKinds(segmentRecords(t, c.dir, 2)); !slices.Equal(got, []string{"put:a", "tomb:x"}) {
+		t.Fatalf("segment 2 records = %v, want [put:a tomb:x]", got)
+	}
 	mustInsert(t, c, "z", map[string]any{"v": "z"})
-	mustFlushSeal(t, c) // 3 (newest marker)
+	mustFlushSeal(t, c) // 3
 
 	if !mustCompact(t, c) || !fired {
 		t.Fatalf("compaction did not run through the swap (fired %v)", fired)
@@ -423,25 +430,28 @@ func TestCompactionSwapIsCompareAndSwap(t *testing.T) {
 	if got, want := recordKinds(outRecs), []string{"put:b", "put:c", "put:a"}; !slices.Equal(got, want) {
 		t.Fatalf("output %d records = %v, want %v", out, got, want)
 	}
-	c.mu.RLock()
-	ka, kb := c.keydir["a"], c.keydir["b"]
-	_, hasC := c.keydir["c"]
-	dead := c.deadBytes[out]
-	c.mu.RUnlock()
-	if ka.loc.Seg != out {
+	ka, _ := keyEntryOf(t, c, "a")
+	kb, _ := keyEntryOf(t, c, "b")
+	_, hasC := keyEntryOf(t, c, "c")
+	_, deadBytes := segAccounting(t, c)
+	dead := deadBytes[out]
+	if ka.Seg != out {
 		t.Errorf("a not repointed to the output: %+v", ka)
 	}
-	if kb.loc.Seg == out {
+	if kb.Seg == out {
 		t.Errorf("b updated during compaction was overwritten by its old copy: %+v", kb)
 	}
 	if hasC {
 		t.Error("c deleted during compaction is back in the keydir")
 	}
-	hint, err := segment.ReadHint(c.dir, out)
-	if err != nil {
+	var hint []segment.Location // the output's records
+	if _, err := segment.ScanHeaders(c.dir, out, func(_ segment.Record, loc segment.Location) error {
+		hint = append(hint, loc)
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if want := int64(hint[0].Loc.Size + hint[1].Loc.Size); dead != want {
+	if want := int64(hint[0].Size + hint[1].Size); dead != want {
 		t.Errorf("deadBytes[output] = %d, want %d (stale copies of b and c)", dead, want)
 	}
 	want := docsModel(nil, map[string]map[string]any{"a": {"v": "a2"}, "b": {"v": "new"}, "z": {"v": "z"}})
@@ -469,9 +479,7 @@ func TestCompactionRetiredSegmentReads(t *testing.T) {
 	mustInsert(t, c, "z", map[string]any{"v": 3})
 	mustFlushSeal(t, c) // 3
 
-	c.mu.RLock()
-	staleB := c.keydir["b"] // in segment 2, which no read has opened
-	c.mu.RUnlock()
+	staleB, _ := keyEntryOf(t, c, "b") // in segment 2, which no read has opened
 	held, err := c.acquireReader(1)
 	if err != nil {
 		t.Fatal(err)
@@ -482,7 +490,7 @@ func TestCompactionRetiredSegmentReads(t *testing.T) {
 	if !fileExistsT(t, segment.DataPath(c.dir, 1)) {
 		t.Error("segment 1 removed while a read holds it")
 	}
-	if fileExistsT(t, segment.HintPath(c.dir, 1)) || fileExistsT(t, segment.DataPath(c.dir, 2)) {
+	if fileExistsT(t, segment.DataPath(c.dir, 2)) {
 		t.Error("retired files not removed")
 	}
 	if _, err := c.acquireReader(1); !errors.Is(err, errSegmentRetired) {
@@ -716,9 +724,7 @@ func TestConcurrentCompactionStress(t *testing.T) {
 		results = make([]map[string]map[string]any, writers)
 	)
 	for w := range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			rng := rand.New(rand.NewPCG(uint64(w), 1))
 			mine := map[string]map[string]any{}
 			for i := range ops {
@@ -742,13 +748,11 @@ func TestConcurrentCompactionStress(t *testing.T) {
 				}
 			}
 			results[w] = mine
-		}()
+		})
 	}
 	var rwg sync.WaitGroup
 	for r := range readers {
-		rwg.Add(1)
-		go func() {
-			defer rwg.Done()
+		rwg.Go(func() {
 			rng := rand.New(rand.NewPCG(uint64(r), 2))
 			for {
 				select {
@@ -781,12 +785,10 @@ func TestConcurrentCompactionStress(t *testing.T) {
 					}
 				}
 			}
-		}()
+		})
 	}
 	// Explicit compactions on top of the background compactor.
-	rwg.Add(1)
-	go func() {
-		defer rwg.Done()
+	rwg.Go(func() {
 		for {
 			select {
 			case <-stop:
@@ -799,7 +801,7 @@ func TestConcurrentCompactionStress(t *testing.T) {
 			}
 			time.Sleep(time.Millisecond)
 		}
-	}()
+	})
 	wg.Wait()
 	close(stop)
 	rwg.Wait()
@@ -1032,10 +1034,17 @@ func TestCompactionMergesSmallSegments(t *testing.T) {
 		t.Fatalf("no compaction of small fully live segments %v", before)
 	}
 	after := listSegs(t, c.dir)
-	// Segments 1-5 merge into one output; 6 holds the newest checkpoint
-	// marker; the empty active segment 7 is removed when it is sealed.
-	if len(after) != 2 || after[0] != 6 || after[1] <= 7 {
-		t.Fatalf("segments %v -> %v, want [6 <output>]", before, after)
+	// Segments 1-6 merge into one output: no segment is kept for a
+	// checkpoint marker any more (the checkpoint is in index.db). The empty
+	// active segment 7 is removed when it is sealed.
+	if !slices.Equal(before, []uint32{1, 2, 3, 4, 5, 6, 7}) {
+		t.Fatalf("segments before compaction = %v, want 1-6 sealed and the active 7", before)
+	}
+	if len(after) != 1 || after[0] <= 7 {
+		t.Fatalf("segments %v -> %v, want [<output>]", before, after)
+	}
+	if total, _ := segAccounting(t, c); len(total) != 1 || total[after[0]] == 0 {
+		t.Errorf("registered segments after the merge = %v, want only the output %d", total, after[0])
 	}
 	checkModel(t, e, docsModel(idx, want))
 	checkKeydirLive(t, c)

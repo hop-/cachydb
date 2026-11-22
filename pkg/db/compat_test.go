@@ -29,8 +29,12 @@ func TestCompatFixtures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(versions) < 2 {
-		t.Fatalf("found %d fixtures, want v0.0.4 and later", len(versions))
+	// One fixture per release since v0.0.4: a missing one is a failure, not
+	// a shorter test.
+	for _, want := range []string{"v0.0.4", "v0.0.5", "v0.0.6"} {
+		if !slices.Contains(versions, filepath.Join("testdata", "compat", want)) {
+			t.Errorf("no fixture for %s (found %v)", want, versions)
+		}
 	}
 	for _, fixture := range versions {
 		t.Run(filepath.Base(fixture), func(t *testing.T) {
@@ -141,9 +145,11 @@ func checkIndexesLikeScan(t *testing.T, e *db.Engine, expected []byte) {
 			}
 			for _, ix := range c.Indexes() {
 				// Every value the field holds (array elements included).
+				// The field is resolved as the engine resolves index
+				// fields: a nested path (Document.GetPath).
 				var vals []any
 				for _, doc := range all {
-					v, ok := doc.Data[ix.Field]
+					v, ok := doc.GetPath(ix.Field)
 					if !ok {
 						continue
 					}
@@ -158,7 +164,8 @@ func checkIndexesLikeScan(t *testing.T, e *db.Engine, expected []byte) {
 						f := db.QueryFilter{Field: ix.Field, Operator: op, Value: v}
 						var want []string
 						for _, doc := range all {
-							if matches(doc.Data[ix.Field], op, v) {
+							// A missing field matches nothing, not even eq null.
+							if fv, ok := doc.GetPath(ix.Field); ok && matches(fv, op, v) {
 								want = append(want, doc.ID)
 							}
 						}
@@ -205,7 +212,7 @@ func matches(field any, op string, v any) bool {
 func expectedDocs(t *testing.T, expected []byte, database, collection string) []*db.Document {
 	t.Helper()
 	var out []*db.Document
-	for _, line := range bytes.Split(bytes.TrimSpace(expected), []byte("\n")) {
+	for line := range bytes.SplitSeq(bytes.TrimSpace(expected), []byte("\n")) {
 		var l exportfmt.DocumentLine
 		if err := json.Unmarshal(line, &l); err != nil {
 			t.Fatal(err)

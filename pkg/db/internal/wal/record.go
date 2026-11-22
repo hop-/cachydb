@@ -28,6 +28,10 @@ const (
 	// OpRenameColl renames collection Coll within database DB (plan 004
 	// §3.4).
 	OpRenameColl Op = 10 // payload: {"new_name":...}
+	// OpBatch changes several documents of collection Coll atomically
+	// (plan 013 §3.1): one record, one CRC, one offset for every item. ID
+	// is empty; the payload is the item list of AppendBatch.
+	OpBatch Op = 11 // payload: u32 count, then per item: u8 op · u16 id_len · id · u32 doc_len · doc
 )
 
 // String returns the format name of the op (e.g. "put_doc").
@@ -53,12 +57,14 @@ func (o Op) String() string {
 		return "update_schema"
 	case OpRenameColl:
 		return "rename_coll"
+	case OpBatch:
+		return "batch"
 	default:
 		return fmt.Sprintf("op(%d)", uint8(o))
 	}
 }
 
-func (o Op) valid() bool { return o >= OpPutDoc && o <= OpRenameColl }
+func (o Op) valid() bool { return o >= OpPutDoc && o <= OpBatch }
 
 // Record is one WAL entry. Offset and Time are assigned by Log.Append; any
 // values the caller sets are overwritten.
@@ -67,7 +73,7 @@ type Record struct {
 	Time         time.Time // assigned by Append
 	Op           Op
 	DB, Coll, ID string
-	Payload      []byte // JSON per §3.1 table; may be empty
+	Payload      []byte // JSON per §3.1 table (binary for OpBatch); may be empty
 }
 
 // On-disk record layout (§3.1, little-endian):
@@ -110,6 +116,25 @@ func validateRecord(r *Record) error {
 	}
 	if n := bodySize(r); n > maxBodyLen {
 		return fmt.Errorf("wal: record is %d bytes, max %d", n, int64(maxBodyLen))
+	}
+	if err := checkBatchShape(r); err != nil {
+		return fmt.Errorf("wal: %w", err)
+	}
+	return nil
+}
+
+// checkBatchShape checks the parts of a batch record the record layer
+// owns: an empty id and a payload that holds at least the item count. The
+// items themselves are checked by DecodeBatch.
+func checkBatchShape(r *Record) error {
+	if r.Op != OpBatch {
+		return nil
+	}
+	if r.ID != "" {
+		return fmt.Errorf("batch record has id %q, want none", r.ID)
+	}
+	if len(r.Payload) < batchCountSize {
+		return fmt.Errorf("batch record payload is %d bytes, want at least %d", len(r.Payload), batchCountSize)
 	}
 	return nil
 }
@@ -174,6 +199,9 @@ func decodeBody(body []byte) (Record, error) {
 	}
 	if !r.Op.valid() {
 		return Record{}, fmt.Errorf("%w: unknown op %d", errBadBody, uint8(r.Op))
+	}
+	if err := checkBatchShape(&r); err != nil {
+		return Record{}, fmt.Errorf("%w: %w", errBadBody, err)
 	}
 	return r, nil
 }

@@ -6,8 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hop-/cachydb/internal/exportfmt"
@@ -35,12 +40,20 @@ shell scripts and agents without MCP support call every tool.
 
 The server address is --url, else the environment variable CACHYDB_URL,
 else ` + defaultClientURL + `. Start the server with
-"cachydb -t http -p 7601".`,
+"cachydb -t http -p 7601".
+
+A server that requires tokens needs --token, or the environment variable
+CACHYDB_TOKEN (preferred: a flag shows in the process list); it is sent
+as "Authorization: Bearer <token>", only to the scheme and host of the
+server address. The client does not follow redirects, so point --url at
+the final endpoint. Use https:// for a server on another machine, so the
+token is not sent in clear text. See "cachydb docs access".`,
 	Example: `  cachydb client tools
   cachydb client call find_documents '{"database":"kb","collection":"notes","query":{"limit":5}}'
   echo '{"collection":"notes"}' | cachydb client call count_documents -
   cachydb client export -d kb -o kb.jsonl
-  cachydb client import -i kb.jsonl --on-conflict skip --url http://db-host:7601/mcp`,
+  cachydb client import -i kb.jsonl --on-conflict skip --url http://db-host:7601/mcp
+  CACHYDB_TOKEN="$TOKEN" cachydb client call whoami --url https://db-host:7601/mcp`,
 }
 
 var clientToolsCmd = &cobra.Command{
@@ -125,7 +138,8 @@ var clientImportCmd = &cobra.Command{
 	Long: `Import a JSON Lines export through the running server, with the same
 rules and --on-conflict modes as "cachydb utils import".`,
 	Example: `  cachydb client import -i kb.jsonl
-  cachydb client import -i kb.jsonl --on-conflict replace`,
+  cachydb client import -i kb.jsonl --on-conflict replace
+  cachydb client import -i seed.jsonl --on-conflict keep`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		mode, err := exportfmt.ParseOnConflict(importOnConflict)
@@ -138,7 +152,11 @@ rules and --on-conflict modes as "cachydb utils import".`,
 		cmd.SilenceUsage = true
 		return withInputFile(importInput, cmd.InOrStdin(), func(r io.Reader) error {
 			return withClient(cmd.Context(), clientURL(), func(cs *mcp.ClientSession) error {
-				st, err := exportfmt.Import(cmd.Context(), r, clientStore{cs: cs}, mode)
+				t, err := importTarget(cmd.Context(), cs)
+				if err != nil {
+					return err
+				}
+				st, err := exportfmt.Import(cmd.Context(), r, t, mode)
 				if err != nil {
 					return err
 				}
@@ -151,17 +169,19 @@ rules and --on-conflict modes as "cachydb utils import".`,
 
 var (
 	clientURLFlag     string
+	clientTokenFlag   string
 	clientToolsFormat string
 )
 
 func init() {
 	clientCmd.PersistentFlags().StringVar(&clientURLFlag, "url", "", "server MCP endpoint (env CACHYDB_URL; default "+defaultClientURL+")")
+	clientCmd.PersistentFlags().StringVar(&clientTokenFlag, "token", "", "token for a server that requires one, sent as a bearer token (env CACHYDB_TOKEN, preferred)")
 	clientToolsCmd.Flags().StringVarP(&clientToolsFormat, "format", "f", "text", "output format: text or json")
 	clientExportCmd.Flags().StringVarP(&exportDatabase, "database", "d", "", "export only this database")
 	clientExportCmd.Flags().StringVarP(&exportCollection, "collection", "c", "", "export only this collection (requires -d)")
 	clientExportCmd.Flags().StringVarP(&exportOutput, "output", "o", "", "write to this file instead of stdout")
 	clientImportCmd.Flags().StringVarP(&importInput, "input", "i", "", "file to import (- for stdin)")
-	clientImportCmd.Flags().StringVar(&importOnConflict, "on-conflict", string(exportfmt.Fail), "existing _id: fail, skip, or replace")
+	clientImportCmd.Flags().StringVar(&importOnConflict, "on-conflict", string(exportfmt.Fail), onConflictUsage)
 	clientCmd.AddCommand(clientToolsCmd, clientCallCmd, clientExportCmd, clientImportCmd)
 	rootCmd.AddCommand(clientCmd)
 }
@@ -178,12 +198,81 @@ func clientURL() string {
 	return defaultClientURL
 }
 
-// withClient connects to the server at url, calls fn, and closes the
-// session.
+// clientToken returns the token: --token, else CACHYDB_TOKEN, else "".
+func clientToken() string {
+	if clientTokenFlag != "" {
+		return clientTokenFlag
+	}
+	return os.Getenv("CACHYDB_TOKEN")
+}
+
+// bearerTransport sends token (if any) as a bearer token on requests to
+// the endpoint's scheme and host only, and remembers whether the server
+// answered 401 Unauthorized.
+type bearerTransport struct {
+	token        string
+	scheme, host string // the endpoint's; the token is sent nowhere else
+	base         http.RoundTripper
+	unauthorized atomic.Bool
+}
+
+// newBearerTransport returns a bearerTransport that sends token to
+// endpoint only. An endpoint that does not parse gets no token; connecting
+// to it fails anyway.
+func newBearerTransport(endpoint, token string) *bearerTransport {
+	t := &bearerTransport{token: token, base: http.DefaultTransport}
+	if u, err := url.Parse(endpoint); err == nil {
+		t.scheme, t.host = u.Scheme, u.Host
+	}
+	return t
+}
+
+func (t *bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if t.token != "" && t.host != "" && r.URL.Scheme == t.scheme && strings.EqualFold(r.URL.Host, t.host) {
+		// A RoundTripper must not modify the caller's request.
+		r = r.Clone(r.Context())
+		r.Header.Set("Authorization", "Bearer "+t.token)
+	}
+	resp, err := t.base.RoundTrip(r)
+	if err == nil && resp.StatusCode == http.StatusUnauthorized {
+		t.unauthorized.Store(true)
+	}
+	return resp, err
+}
+
+// authHint explains a 401 answer, naming the flag; "" if there was none.
+func (t *bearerTransport) authHint() string {
+	switch {
+	case !t.unauthorized.Load():
+		return ""
+	case t.token == "":
+		return "the server requires a token: pass --token or set CACHYDB_TOKEN"
+	default:
+		return "the server rejected the token (unknown or revoked): check --token / CACHYDB_TOKEN"
+	}
+}
+
+// withClient connects to the server at url, sending the token of
+// clientToken, calls fn, and closes the session. An error after a 401
+// answer carries a hint that names --token.
 func withClient(ctx context.Context, url string, fn func(*mcp.ClientSession) error) (err error) {
+	rt := newBearerTransport(url, clientToken())
+	defer func() {
+		if hint := rt.authHint(); err != nil && hint != "" {
+			err = fmt.Errorf("%s: %w", hint, err)
+		}
+	}()
 	client := mcp.NewClient(&mcp.Implementation{Name: "cachydb-client", Version: getVersion()}, nil)
-	cs, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: url, DisableStandaloneSSE: true, MaxRetries: -1}, nil)
+	cs, err := client.Connect(ctx, &mcp.StreamableClientTransport{
+		Endpoint:             url,
+		HTTPClient:           &http.Client{Transport: rt, CheckRedirect: refuseRedirect},
+		DisableStandaloneSSE: true,
+		MaxRetries:           -1,
+	}, nil)
 	if err != nil {
+		if rt.authHint() != "" {
+			return fmt.Errorf("connecting to the cachydb server at %s: %w", url, err)
+		}
 		return fmt.Errorf("connecting to the cachydb server at %s (start one with \"cachydb -t http\", or set --url / CACHYDB_URL): %w", url, err)
 	}
 	defer func() {
@@ -192,6 +281,13 @@ func withClient(ctx context.Context, url string, fn func(*mcp.ClientSession) err
 		}
 	}()
 	return fn(cs)
+}
+
+// refuseRedirect is the client's redirect policy: the MCP endpoint never
+// needs a redirect, and following one could send the request, token
+// included, to another host or over plain HTTP.
+func refuseRedirect(req *http.Request, _ []*http.Request) error {
+	return fmt.Errorf("the server redirected to %s; cachydb client does not follow redirects: set --url / CACHYDB_URL to the final endpoint", req.URL.Redacted())
 }
 
 // listClientTools prints the server's tools.
@@ -241,9 +337,34 @@ func callTool(ctx context.Context, cs *mcp.ClientSession, tool string, args map[
 		return nil, fmt.Errorf("calling %s: %w", tool, err)
 	}
 	if res.IsError {
-		return nil, fmt.Errorf("%w: %s: %s", errToolFailed, tool, resultText(res))
+		return nil, &toolCallError{tool: tool, text: resultText(res)}
 	}
 	return res, nil
+}
+
+// toolCallError is a tool error result: errToolFailed with the tool's
+// name and message, kept apart so its error code can be read.
+type toolCallError struct{ tool, text string }
+
+func (e *toolCallError) Error() string {
+	return fmt.Sprintf("%v: %s: %s", errToolFailed, e.tool, e.text)
+}
+
+func (e *toolCallError) Unwrap() error { return errToolFailed }
+
+// isAlreadyExists reports whether err is a tool error for an existing
+// item: by its [already_exists] code, or, from a server older than the
+// error codes, by the db.ErrExists text in the tool error. An error that
+// is not a tool error is never a conflict.
+func isAlreadyExists(err error) bool {
+	tf, ok := errors.AsType[*toolCallError](err)
+	if !ok {
+		return false
+	}
+	if code, known := mcpserver.ErrorCodeOf(tf.text); known {
+		return code == mcpserver.CodeAlreadyExists
+	}
+	return strings.Contains(tf.text, db.ErrExists.Error())
 }
 
 // resultText joins the text content of a tool result.
@@ -280,8 +401,8 @@ type clientStore struct {
 }
 
 var (
-	_ exportfmt.Source = clientStore{}
-	_ exportfmt.Target = clientStore{}
+	_ exportfmt.Source      = clientStore{}
+	_ exportfmt.BatchTarget = clientStore{}
 )
 
 func (c clientStore) Databases(ctx context.Context) ([]string, error) {
@@ -316,14 +437,23 @@ func (c clientStore) Describe(ctx context.Context, database, collection string) 
 	}
 	indexes := make([]db.IndexInfo, len(out.Indexes))
 	for i, ix := range out.Indexes {
-		indexes[i] = db.IndexInfo{Name: ix.Name, Field: ix.Field}
+		indexes[i] = db.IndexInfo{Name: ix.Name, Field: ix.Field, Unique: ix.Unique}
 	}
 	return schema, indexes, nil
 }
 
+// Documents reads every document of the collection in _id order, one
+// find_documents page at a time. It asks for clientPageSize documents per
+// page; the server's result byte cap may return fewer, so it follows
+// has_more and next_skip. A server older than those keys returns full
+// pages, and the listing ends at the first short one.
 func (c clientStore) Documents(ctx context.Context, database, collection string, fn func(map[string]any) error) error {
-	for skip := 0; ; skip += clientPageSize {
-		var out mcpserver.FindDocumentsOutput
+	for skip := 0; ; {
+		var out struct {
+			Documents []map[string]any `json:"documents"`
+			HasMore   *bool            `json:"has_more"`
+			NextSkip  int              `json:"next_skip"`
+		}
 		err := callInto(ctx, c.cs, "find_documents", map[string]any{
 			"database": database, "collection": collection,
 			"query": map[string]any{"skip": skip, "limit": clientPageSize},
@@ -336,8 +466,18 @@ func (c clientStore) Documents(ctx context.Context, database, collection string,
 				return err
 			}
 		}
-		if len(out.Documents) < clientPageSize {
+		switch {
+		case out.HasMore == nil: // a server without paging keys
+			if len(out.Documents) < clientPageSize {
+				return nil
+			}
+			skip += clientPageSize
+		case !*out.HasMore:
 			return nil
+		case out.NextSkip <= skip:
+			return fmt.Errorf("find_documents on %s.%s: has_more without a next_skip after %d", database, collection, skip)
+		default:
+			skip = out.NextSkip
 		}
 	}
 }
@@ -385,8 +525,14 @@ func (c clientStore) UpdateSchema(ctx context.Context, database, collection stri
 	return err
 }
 
-func (c clientStore) CreateIndex(ctx context.Context, database, collection, name, field string) error {
-	_, err := callTool(ctx, c.cs, "create_index", map[string]any{"database": database, "collection": collection, "index_name": name, "field_name": field})
+// CreateIndex sends unique only for a unique index, so a non-unique index
+// can still be created on a server without the parameter.
+func (c clientStore) CreateIndex(ctx context.Context, database, collection string, ix db.IndexInfo) error {
+	args := map[string]any{"database": database, "collection": collection, "index_name": ix.Name, "field_name": ix.Field}
+	if ix.Unique {
+		args["unique"] = true
+	}
+	_, err := callTool(ctx, c.cs, "create_index", args)
 	return err
 }
 
@@ -397,10 +543,146 @@ func (c clientStore) DropIndex(ctx context.Context, database, collection, name s
 
 func (c clientStore) InsertDocument(ctx context.Context, database, collection string, doc map[string]any) error {
 	_, err := callTool(ctx, c.cs, "insert_document", map[string]any{"database": database, "collection": collection, "document": doc})
-	if err != nil && strings.Contains(err.Error(), db.ErrExists.Error()) {
+	if err != nil && isAlreadyExists(err) {
 		return errors.Join(exportfmt.ErrDocumentExists, err)
 	}
 	return err
+}
+
+// importTarget returns the import target for the server of cs: the
+// clientStore, which writes documents in batches with insert_documents,
+// or, for a server without that tool (older than plan 013), the
+// clientStore as a plain Target that inserts one document per call.
+func importTarget(ctx context.Context, cs *mcp.ClientSession) (exportfmt.Target, error) {
+	for tool, err := range cs.Tools(ctx, nil) {
+		if err != nil {
+			return nil, fmt.Errorf("listing tools: %w", err)
+		}
+		if tool.Name == "insert_documents" {
+			return clientStore{cs: cs}, nil
+		}
+	}
+	return struct{ exportfmt.Target }{clientStore{cs: cs}}, nil
+}
+
+// clientBatchBytes bounds the JSON size of the documents of one
+// insert_documents call from client import, below the 4 MiB request body
+// limit of the server's HTTP transport (the SDK's
+// DefaultMaxRequestBodyBytes) with room for the rest of the request.
+const clientBatchBytes = 3 << 20
+
+// itemIndexRE finds the failing item that insert_documents names at the
+// start of its error text, after the code if any
+// ("[already_exists] insert documents: documents[3]: ...").
+var itemIndexRE = regexp.MustCompile(`^(?:\[[a-z_]+\] )?insert documents: documents\[(\d+)\]:`)
+
+// InsertDocuments implements exportfmt.BatchTarget with insert_documents,
+// one call per run of documents. Documents whose JSON exceeds
+// clientBatchBytes fail with db.ErrBatchTooLarge before any call, so
+// Import splits them (and sends a single such document through
+// InsertDocument). In Skip and Replace mode one find_documents lookup
+// first tells which _ids exist; the missing documents are inserted in
+// one atomic call, and in Replace mode the existing ones are then
+// replaced one replace_document call each (there is no batch replace
+// tool), so a failing replace leaves the inserts and earlier replaces
+// applied.
+func (c clientStore) InsertDocuments(ctx context.Context, database, collection string, docs []map[string]any, mode exportfmt.OnConflict) (exportfmt.Stats, error) {
+	data, err := json.Marshal(docs)
+	if err != nil {
+		return exportfmt.Stats{}, fmt.Errorf("encoding documents: %w", err)
+	}
+	if len(data) > clientBatchBytes {
+		return exportfmt.Stats{}, fmt.Errorf("%w: %d bytes of documents, the client sends at most %d per call",
+			db.ErrBatchTooLarge, len(data), clientBatchBytes)
+	}
+	var exists map[string]bool
+	if mode != exportfmt.Fail {
+		if exists, err = c.existingIDs(ctx, database, collection, docs); err != nil {
+			return exportfmt.Stats{}, err
+		}
+	}
+	var (
+		st       exportfmt.Stats
+		inserts  []map[string]any
+		pos      []int // insert → position in docs
+		replaces []int // positions in docs
+	)
+	for i, d := range docs {
+		id, _ := d["_id"].(string)
+		switch {
+		case !exists[id]:
+			inserts = append(inserts, d)
+			pos = append(pos, i)
+		case mode == exportfmt.Skip:
+			st.Skipped++
+		default:
+			replaces = append(replaces, i)
+		}
+	}
+	if len(inserts) > 0 {
+		var out mcpserver.InsertDocumentsOutput
+		err := callInto(ctx, c.cs, "insert_documents", map[string]any{
+			"database": database, "collection": collection, "documents": inserts,
+		}, &out)
+		if err != nil {
+			var item []string
+			if tf, ok := errors.AsType[*toolCallError](err); ok {
+				item = itemIndexRE.FindStringSubmatch(tf.text)
+			}
+			if isAlreadyExists(err) {
+				err = errors.Join(exportfmt.ErrDocumentExists, err)
+			}
+			if item != nil {
+				if i, convErr := strconv.Atoi(item[1]); convErr == nil && i < len(pos) {
+					return exportfmt.Stats{}, &db.BatchItemError{Index: pos[i], Err: err}
+				}
+			}
+			return exportfmt.Stats{}, err
+		}
+		st.Inserted = len(inserts)
+	}
+	for _, i := range replaces {
+		if err := c.ReplaceDocument(ctx, database, collection, docs[i]); err != nil {
+			return exportfmt.Stats{}, &db.BatchItemError{Index: i, Err: err}
+		}
+		st.Replaced++
+	}
+	return st, nil
+}
+
+// existingIDs returns which _ids of docs exist in the collection, with
+// one find_documents call (more if the result byte cap splits it).
+func (c clientStore) existingIDs(ctx context.Context, database, collection string, docs []map[string]any) (map[string]bool, error) {
+	ids := make([]any, len(docs))
+	for i, d := range docs {
+		ids[i] = d["_id"]
+	}
+	exists := make(map[string]bool)
+	for skip := 0; ; {
+		var out mcpserver.FindDocumentsOutput
+		err := callInto(ctx, c.cs, "find_documents", map[string]any{
+			"database": database, "collection": collection,
+			"query": map[string]any{
+				"filters": []any{map[string]any{"field": "_id", "operator": "in", "value": ids}},
+				"fields":  []any{"_id"}, "limit": len(ids), "skip": skip,
+			},
+		}, &out)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range out.Documents {
+			if id, ok := d["_id"].(string); ok {
+				exists[id] = true
+			}
+		}
+		if !out.HasMore {
+			return exists, nil
+		}
+		if out.NextSkip <= skip {
+			return nil, fmt.Errorf("find_documents on %s.%s: has_more without a next_skip after %d", database, collection, skip)
+		}
+		skip = out.NextSkip
+	}
 }
 
 func (c clientStore) ReplaceDocument(ctx context.Context, database, collection string, doc map[string]any) error {

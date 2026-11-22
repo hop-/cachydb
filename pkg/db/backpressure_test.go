@@ -137,7 +137,9 @@ func TestBackpressureConcurrentWriters(t *testing.T) {
 	}
 	close(stopSample)
 	m := <-maxSeen
-	docSize := int64(len("w0-00")+len(`{"_id":"w0-00","pad":""}`)+150) + memEntryOverhead
+	// The largest entry a writer adds: its id, the WAL payload it keeps,
+	// and the decoded document (memEntrySize).
+	docSize := memEntrySize("w0-00", []byte(`{"_id":"w0-00","pad":"`+strings.Repeat("y", 150)+`"}`))
 	if bound := int64(bpLimit) + writers*docSize; m > bound {
 		t.Fatalf("pending bytes peaked at %d, want <= %d", m, bound)
 	}

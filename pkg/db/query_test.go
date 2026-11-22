@@ -2,15 +2,9 @@ package db
 
 import (
 	"context"
-	"encoding/binary"
-	"hash/crc32"
-	"os"
-	"path/filepath"
 	"reflect"
 	"slices"
 	"testing"
-
-	"github.com/hop-/cachydb/pkg/db/internal/segment"
 )
 
 // Tests of the plan-004 query features: element operators, OR groups,
@@ -123,45 +117,6 @@ func TestFindElementOperatorsAndAny(t *testing.T) {
 	}
 }
 
-func TestIndexElementKeys(t *testing.T) {
-	ix := newIndex("by_tags", "tags")
-	ix.add("a", idxDoc("a", map[string]any{"tags": []any{"x", "y", "x", 1.0, map[string]any{"o": 1.0}, []any{"n"}}}))
-	ix.add("b", idxDoc("b", map[string]any{"tags": []any{"y", "z"}}))
-	ix.add("c", idxDoc("c", map[string]any{"tags": "x"}))
-	ix.add("d", idxDoc("d", map[string]any{"tags": []any{}}))
-
-	keys := slices.Sorted(func(yield func(string) bool) {
-		for k := range ix.keys {
-			if !yield(k) {
-				return
-			}
-		}
-	})
-	if want := []string{"a:", "n:1", "s:x", "s:y", "s:z", "u:"}; !slices.Equal(keys, want) {
-		t.Errorf("keys = %v, want %v (nested objects and arrays only marked)", keys, want)
-	}
-	if got := ix.lookup("x"); !slices.Equal(got, []string{"a", "c"}) {
-		t.Errorf("lookup(x) = %v", got)
-	}
-	if got, ok := ix.lookupAny([]any{"x", "z"}); !ok || !slices.Equal(got, []string{"a", "b", "c"}) {
-		t.Errorf("lookupAny(x, z) = %v, %v", got, ok)
-	}
-	if _, ok := ix.lookupAny([]any{"x", map[string]any{}}); ok {
-		t.Error("lookupAny with an unindexable value used the index")
-	}
-	if got, ok := ix.lookupAll([]any{"y", "x", map[string]any{}}); !ok || !slices.Equal(got, []string{"a"}) {
-		t.Errorf("lookupAll(y, x, {}) = %v, %v", got, ok)
-	}
-	if _, ok := ix.lookupAll([]any{map[string]any{}}); ok {
-		t.Error("lookupAll without an indexable value used the index")
-	}
-
-	ix.remove("a", idxDoc("a", map[string]any{"tags": []any{"x", "y", "x", 1.0, map[string]any{"o": 1.0}, []any{"n"}}}))
-	if _, ok := ix.keys["n:1"]; ok || ix.keys[unindexedMarker] != nil || !slices.Equal(ix.lookup("x"), []string{"c"}) {
-		t.Errorf("remove left element keys behind: %v", ix.keys)
-	}
-}
-
 func TestFindElementOperatorsUseIndex(t *testing.T) {
 	ctx := context.Background()
 	_, c := newTestColl(t, nil, nil)
@@ -179,11 +134,11 @@ func TestFindElementOperatorsUseIndex(t *testing.T) {
 		want     []string
 		examined int
 	}{
-		{"has", QueryFilter{"tags", "has", "storage"}, []string{"k1", "k2"}, 3}, // k4's scalar "storage" is a candidate
+		{"has", QueryFilter{"tags", "has", "storage"}, []string{"k1", "k2"}, 2}, // only element entries: k4's scalar "storage" is not a candidate
 		{"has_any union", QueryFilter{"tags", "has_any", []any{"mcp", "wal"}}, []string{"k1", "k3"}, 2},
 		{"has_all intersection", QueryFilter{"tags", "has_all", []any{"storage", "perf"}}, []string{"k2"}, 1},
 		{"has_all with unindexable values", QueryFilter{"tags", "has_all", []any{"perf", map[string]any{}}}, []string{}, 1},
-		{"eq rechecked", QueryFilter{"tags", "eq", "storage"}, []string{"k4"}, 3},
+		{"eq rechecked", QueryFilter{"tags", "eq", "storage"}, []string{"k4"}, 1}, // only whole-value entries: k1's and k2's elements are not candidates
 		{"has absent", QueryFilter{"tags", "has", "nothing"}, []string{}, 0},
 		{"contains scans", QueryFilter{"tags", "contains", "stor"}, []string{"k1", "k2", "k4"}, 25},
 	}
@@ -200,67 +155,6 @@ func TestFindElementOperatorsUseIndex(t *testing.T) {
 				t.Errorf("examined %d candidates, want %d", examined, tt.examined)
 			}
 		})
-	}
-}
-
-// TestRecoveryOldIndexSnapshotRebuilds: a version-1 index snapshot
-// (whole-value keys, before plan 004) is rejected at open and the index
-// rebuilt with element keys.
-func TestRecoveryOldIndexSnapshotRebuilds(t *testing.T) {
-	ctx := context.Background()
-	opts, e, c := newCrashColl(t, nil, nil)
-	if err := c.CreateIndex(ctx, "by_g", "g"); err != nil {
-		t.Fatal(err)
-	}
-	mustInsert(t, c, "s", map[string]any{"g": "a"})
-	mustInsert(t, c, "arr", map[string]any{"g": []any{"a", "b"}})
-	if err := e.Close(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	// What plan 003 wrote: arrays not indexed, sidecar version 1.
-	snap, err := segment.ReadIndexSnapshot(c.dir, "by_g")
-	if err != nil {
-		t.Fatal(err)
-	}
-	snap.Keys = map[string][]string{"s:a": {"s"}}
-	if err := segment.WriteIndexSnapshot(c.dir, snap); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(c.dir, "idx-by_g.snap")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	binary.LittleEndian.PutUint16(data[4:], 1)
-	end := len(data) - 4
-	binary.LittleEndian.PutUint32(data[end:], crc32.Checksum(data[:end], crc32.MakeTable(crc32.Castagnoli)))
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	e = openEngine(t, opts)
-	if got := e.recov.indexesRebuilt.Load(); got != 1 {
-		t.Errorf("indexes rebuilt = %d, want 1", got)
-	}
-	if got := e.recov.snapshotsLoaded.Load(); got != 0 {
-		t.Errorf("snapshots loaded = %d, want 0", got)
-	}
-	c = mustColl(t, mustDB(t, e, "app"), "c")
-	docs, examined, err := c.find(ctx, &Query{Filters: []QueryFilter{{"g", "has", "b"}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ids := docIDs(docs); !slices.Equal(ids, []string{"arr"}) || examined != 1 {
-		t.Errorf("has b = %v after examining %d, want [arr] from the index", ids, examined)
-	}
-	if err := e.Close(ctx); err != nil {
-		t.Fatal(err)
-	}
-	// Close wrote a current snapshot, which loads.
-	e = openEngine(t, opts)
-	if got := e.recov.snapshotsLoaded.Load(); got != 1 {
-		t.Errorf("snapshots loaded after a clean close = %d, want 1", got)
 	}
 }
 
@@ -387,7 +281,7 @@ func TestCountDocuments(t *testing.T) {
 		{"_id eq", &Query{Filters: []QueryFilter{{"_id", "eq", "k2"}}}, 1, 0},
 		{"_id eq absent", &Query{Filters: []QueryFilter{{"_id", "eq", "zz"}}}, 0, 0},
 		{"unindexed eq scans", &Query{Filters: []QueryFilter{{"type", "eq", "note"}}}, 2, 5},
-		{"two filters use candidates", &Query{Filters: []QueryFilter{{"tags", "has", "storage"}, {"type", "eq", "note"}}}, 1, 3},
+		{"two filters use candidates", &Query{Filters: []QueryFilter{{"tags", "has", "storage"}, {"type", "eq", "note"}}}, 1, 2}, // has reads element entries only (k1, k2)
 		{"any groups", &Query{Any: [][]QueryFilter{{{"type", "eq", "decision"}}, {{"prio", "eq", 1}}}}, 2, 5},
 		{"skip, limit, and sort ignored", &Query{Skip: 3, Limit: 1, Sort: []SortKey{{Field: "prio"}}}, 5, 0},
 	}

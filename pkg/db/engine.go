@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -90,8 +89,11 @@ type Engine struct {
 // the exclusive directory lock (ErrDataDirInUse if another process — or
 // another Engine in this process — holds it), checks the on-disk format
 // (ErrIncompatibleDataDir), removes leftovers of interrupted drops, opens
-// the WAL, loads database and collection metadata, the collections' data
-// segments and indexes, replays the WAL idempotently (see recovery.go),
+// the WAL, loads database and collection metadata, upgrades a directory of
+// format version 2 to version 3 by building every collection's index file
+// from its data segments (one-way; see upgrade.go), opens the collections'
+// index files (rebuilding one that is missing or damaged from the data
+// segments), replays the WAL idempotently (see recovery.go),
 // and starts the background flusher, compactor, and WAL retention. A WAL that ends
 // before an offset the data references fails with ErrWALCorrupt. A
 // database whose schema version is newer than CurrentSchemaVersion fails
@@ -128,7 +130,8 @@ func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 		}
 	}()
 
-	if err := checkDataDir(root); err != nil {
+	upgrade, err := checkDataDir(root)
+	if err != nil {
 		return nil, err
 	}
 	if err := removeDeletedLeftovers(root); err != nil {
@@ -167,7 +170,7 @@ func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 		flushKick: make(chan struct{}, 1),
 		pending:   newPendingBytes(),
 	}
-	if err := e.recover(ctx); err != nil {
+	if err := e.recover(ctx, upgrade); err != nil {
 		e.closeCollectionFiles()
 		return nil, fmt.Errorf("opening %s: %w", root, err)
 	}
@@ -185,8 +188,8 @@ func Open(ctx context.Context, opts Options) (_ *Engine, err error) {
 	return e, nil
 }
 
-// closeCollectionFiles closes the segment files of every loaded collection
-// without flushing (cleanup after a failed Open).
+// closeCollectionFiles closes the segment and index files of every loaded
+// collection without flushing (cleanup after a failed Open).
 func (e *Engine) closeCollectionFiles() {
 	for _, d := range e.databases {
 		for _, c := range d.collections {
@@ -205,7 +208,7 @@ func (e *Engine) loadMetadata(ctx context.Context) error {
 		return fmt.Errorf("reading data directory: %w", err)
 	}
 	for _, ent := range entries {
-		if !ent.IsDir() || !validName(ent.Name()) {
+		if !ent.IsDir() || !validDatabaseDir(ent.Name()) {
 			continue
 		}
 		if err := ctx.Err(); err != nil {
@@ -274,8 +277,8 @@ func (e *Engine) loadDatabase(name string) (*Database, error) {
 }
 
 // Close waits for in-flight operations, stops the background goroutines,
-// flushes every collection's memtable (final flush) and writes the index
-// snapshots, closes the data segments and the WAL, and releases the
+// flushes every collection's memtable (final flush), closes the data
+// segments, the index files, and the WAL, and releases the
 // data-directory lock. It is idempotent: later calls return the first
 // call's result. A failed final flush is reported; its changes remain in
 // the WAL. If ctx ends while waiting, Close skips the remaining flushes,
@@ -382,11 +385,9 @@ func (e *Engine) Closed() bool { return e.isClosed() }
 // promptly once ctx is cancelled. It must be called from inside an
 // enter/exit pair (so Close cannot have started waiting on bg yet).
 func (e *Engine) spawn(fn func(ctx context.Context)) {
-	e.bg.Add(1)
-	go func() {
-		defer e.bg.Done()
+	e.bg.Go(func() {
 		fn(e.bgCtx)
-	}()
+	})
 }
 
 // removeInBackground deletes a directory renamed away by a drop.
@@ -428,6 +429,26 @@ func (e *Engine) CreateDatabase(ctx context.Context, name string) (*Database, er
 	if err := ValidateName("database", name); err != nil {
 		return nil, err
 	}
+	return e.createDatabase(ctx, name)
+}
+
+// SystemDatabase creates or returns the reserved database
+// SystemDatabaseName, which holds the server's own data (users and
+// tokens). It is durable like any database, but ListDatabases leaves it
+// out, and Database, CreateDatabase, and DropDatabase reject its name, so
+// no tool, export, or listing reaches it.
+func (e *Engine) SystemDatabase(ctx context.Context) (*Database, error) {
+	return e.createDatabase(ctx, SystemDatabaseName)
+}
+
+// HasSystemDatabase reports whether the reserved system database exists,
+// without creating it (SystemDatabase creates it).
+func (e *Engine) HasSystemDatabase() bool {
+	return e.lookupDatabase(SystemDatabaseName) != nil
+}
+
+// createDatabase is CreateDatabase for a name the caller has checked.
+func (e *Engine) createDatabase(ctx context.Context, name string) (*Database, error) {
 	if err := e.enter(); err != nil {
 		return nil, err
 	}
@@ -486,11 +507,19 @@ func (e *Engine) lookupDatabase(name string) *Database {
 	return e.databases[name]
 }
 
-// ListDatabases returns the database names in sorted order.
+// ListDatabases returns the database names in sorted order. The reserved
+// system database (SystemDatabase) is not listed.
 func (e *Engine) ListDatabases() []string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return slices.Sorted(maps.Keys(e.databases))
+	var names []string
+	for name := range e.databases {
+		if name != SystemDatabaseName {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	return names
 }
 
 // DropDatabase drops the database name and all its collections. It waits
@@ -534,12 +563,10 @@ func (e *Engine) DropDatabase(ctx context.Context, name string) error {
 	if err := e.hook(hookMetaWrite); err != nil {
 		return err
 	}
-	moved, err := renameAway(d.dir, off)
-	if err != nil {
-		return fmt.Errorf("dropping database %q: %w", name, err)
-	}
-	done()
-
+	// Committed. The database is gone from memory, and the index files
+	// and segments of its collections are closed, before its directory is
+	// renamed. If the rename fails, the directory stays until a restart
+	// replays the record.
 	d.dropped = true
 	for _, c := range d.collections {
 		c.markDropped()
@@ -547,6 +574,11 @@ func (e *Engine) DropDatabase(ctx context.Context, name string) error {
 	e.mu.Lock()
 	delete(e.databases, name)
 	e.mu.Unlock()
+	moved, err := renameAway(d.dir, off)
+	if err != nil {
+		return fmt.Errorf("dropping database %q (restart to complete it): %w", name, err)
+	}
+	done()
 	e.removeInBackground(moved)
 	return nil
 }

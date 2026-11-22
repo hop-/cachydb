@@ -9,6 +9,7 @@ go test -race ./...                              # all tests (about a minute)
 go test -race ./pkg/db/...                       # engine only
 go test -race -run TestCrashMatrix ./pkg/db/     # a single test
 test -z "$(gofmt -l .)" && go vet ./...          # format and vet
+go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...   # staticcheck (pinned; also in CI)
 ```
 
 The suite covers:
@@ -19,10 +20,11 @@ The suite covers:
   - compaction, the metadata checkpoint, and the query and index
     semantics;
   - conditional writes and schema operations (update, rename, copy).
-- **The MCP server:** all 21 tools, per-session `use_database`, an
+- **The MCP server:** all 26 tools (33 with tokens: `whoami` and the user tools), per-session `use_database`, an
   end-to-end tool flow, and the docs resources.
 - **The CLI:** `docs`, `healthcheck`, `utils` (including export/import
-  round trips), and `client` against a live test server.
+  round trips, and `verify` on healthy and damaged directories), and
+  `client` against a live test server.
 - **The examples:** `examples/basic` and `examples/mcp-client` run end to
   end as smoke tests, and check their own results. The `mcp-client` test
   builds the server binary first; `-short` skips it.
@@ -31,7 +33,7 @@ The suite covers:
 - **A model-based test** (`TestModel`) that runs random operations
   against the engine and an in-memory reference model.
 - **Upgrade fixtures** (`TestCompatFixtures`): data directories written by
-  v0.0.4 and v0.0.5 must open and read identically.
+  v0.0.4, v0.0.5 and v0.0.6 must open and read identically.
 - **A real-process kill test** (`test/e2e`, build tag `e2e`, not part of
   `go test ./...`).
 
@@ -44,7 +46,7 @@ CI; the commands below run them locally.
 `.github/workflows/test.yml` runs on every pull request and every push
 to `master` (and on demand). A red check blocks a broken change:
 
-- **lint:** `go build ./...`, `gofmt`, `go vet ./...`, and
+- **lint:** `go build ./...`, `gofmt`, `go vet ./...`, `staticcheck`, and
   `go mod tidy -diff` (`go.mod` and `go.sum` must be tidy);
 - **test:** `go test -race ./...` and the quick stress loop (below), on
   the minimum Go version from `go.mod` and the current stable Go, on
@@ -59,7 +61,8 @@ to `master` (and on demand). A red check blocks a broken change:
 `.github/workflows/nightly.yml` runs the heavy tests every day at 03:17
 UTC (and on demand, Actions > nightly > Run workflow): the 200-run stress
 loop, the kill test with 100 rounds, the model test with 20 seeds × 5000
-operations, and every fuzz target for 60s. A failing job uploads what
+operations, every fuzz target for 60s, and the 1M-document scale
+benchmark (its numbers are in the job log; they are not gated). A failing job uploads what
 reproduces it (the kill test's data directory and server logs, the model
 log with its seeds, the new fuzz corpus entries) and fails the run;
 GitHub notifies the repository owner. The Docker image has its own
@@ -88,9 +91,10 @@ decoder of disk or input data:
 
 | Package | Targets |
 | --- | --- |
-| `pkg/db/internal/wal` | `FuzzWALRecordDecode`, `FuzzWALSegmentRead` |
-| `pkg/db/internal/segment` | `FuzzSegmentRecordDecode`, `FuzzSidecarRead` (hint files, index snapshots), `FuzzSegmentScan` |
-| `pkg/db` | `FuzzMetaRead`, `FuzzDecodeDocument`, `FuzzIndexKey`, `FuzzCompare`, `FuzzMatchFilter` |
+| `pkg/db/internal/wal` | `FuzzWALRecordDecode`, `FuzzWALSegmentRead`, `FuzzBatchPayload` |
+| `pkg/db/internal/segment` | `FuzzSegmentRecordDecode`, `FuzzSegmentScan` |
+| `pkg/db/internal/idxstore` | `FuzzIndexKey`, `FuzzIndexKeyDecode` |
+| `pkg/db` | `FuzzMetaRead`, `FuzzDecodeDocument`, `FuzzCompare`, `FuzzMatchFilter`, `FuzzFieldPath` |
 | `internal/exportfmt` | `FuzzImportJSONL` |
 
 They check that garbage never panics and is rejected with the right
@@ -135,10 +139,13 @@ same operations.
 ### Upgrade fixtures
 
 `pkg/db/testdata/compat/<version>/` holds a data directory written by
-that release (v0.0.4, v0.0.5) and `expected.jsonl`, its logical content
-in the export format. `TestCompatFixtures` opens a copy of each one,
-compares the export with `expected.jsonl`, checks the indexes against a
-scan, and writes and reopens. Every release adds its fixture, generated
+that release (v0.0.4, v0.0.5, v0.0.6, all of data format 2) and
+`expected.jsonl`, its logical content in the export format.
+`TestCompatFixtures` opens a copy of each one, which upgrades it to format
+3 (each collection's `index.db` is built from its data segments and the
+hint files and index snapshots are removed), compares the export with
+`expected.jsonl`, checks the indexes against a scan, and writes and
+reopens. Every release adds its fixture, generated
 by the release's own code with `test/compat/gen`; the procedure is in
 [`pkg/db/testdata/compat/README.md`](pkg/db/testdata/compat/README.md).
 Never edit or regenerate an existing fixture.
@@ -201,6 +208,25 @@ TMPDIR=$HOME/.cache/cachydb-bench go test -run '^$' -bench . -benchmem ./pkg/db/
 - cached and uncached reads;
 - indexed and scanning queries.
 
+The scale benchmark (`pkg/db/scale_bench_test.go`) is opt-in: it does not
+run in the default `go test` path or in `test.yml`; the nightly workflow
+runs it once at 1M documents and only reports the numbers. It loads N
+documents with three indexes and reports the query times of the
+plan-013 targets, the heap after reopen, the reopen time, the file sizes,
+cold-cache times, and flushes under sustained random updates:
+
+```bash
+CACHYDB_SCALE_DOCS=1000000 TMPDIR=$HOME/.cache/cachydb-bench go test -run '^$' -bench 'Scale$' -benchtime 1x -timeout 30m ./pkg/db/
+CACHYDB_SCALE_DOCS=1000000 CACHYDB_SCALE_UUID_IDS=1 ...    # 36-byte random ids
+CACHYDB_SCALE_COLLECTIONS=300 TMPDIR=$HOME/.cache/cachydb-bench go test -run '^$' -bench 'ScaleCollections' -benchtime 1x ./pkg/db/
+```
+
+A 1M run takes three to five minutes and about 1.5 GB of disk; a 10M run
+about half an hour and up to 9 GB (use `-timeout 120m`). The report is
+printed to stdout; a missed target prints `MISSED` but does not fail the
+benchmark. The recorded runs and the knobs are in
+[`dev-docs/DEVELOPMENT.md`](dev-docs/DEVELOPMENT.md#scale-benchmark).
+
 Run them on a real disk. If `$TMPDIR` is a tmpfs (as `/tmp` often is),
 fsync costs nothing and the numbers are misleading, hence the `TMPDIR`
 override above. To compare two versions, run both back to back on the
@@ -248,7 +274,7 @@ This will:
 
 - Start an interactive web UI
 - Connect to your server
-- Let you see all 21 tools
+- Let you see all 26 tools
 - Call tools with arguments
 - View responses in real-time
 
@@ -359,6 +385,24 @@ kill -9 %1                                   # 3. crash without a flush
 
 A clean stop (Ctrl-C / SIGTERM, or closing stdin in stdio mode) flushes
 everything before exit; the next start has nothing to re-apply.
+
+## Integrity Check
+
+`cachydb utils verify` (offline; stop the server first) checks a data
+directory and exits 1 on damage. To try it by hand on a copy:
+
+```bash
+cp -a /tmp/cdb /tmp/cdb-copy
+./cachydb utils verify -R /tmp/cdb-copy --deep          # 1. "verify: ok: ...", exit 0
+rm /tmp/cdb-copy/<db>/<coll>/index.db
+./cachydb utils verify -R /tmp/cdb-copy                 # 2. one line naming index.db, exit 1
+./cachydb utils verify -R /tmp/cdb-copy --rebuild-index # 3. rebuilt, then "verify: ok", exit 0
+./cachydb utils find -R /tmp/cdb-copy -d <db> -c <coll> # 4. the same documents as before
+```
+
+A flipped byte in a sealed `seg-*.data` file or in the middle of a
+`wal-*.log` file is reported the same way (the file and the byte
+position); those cannot be repaired.
 
 ## Direct Library Usage
 

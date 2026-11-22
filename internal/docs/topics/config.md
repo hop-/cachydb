@@ -1,7 +1,7 @@
 ---
 name: config
 title: Configuration
-summary: Every flag and environment variable, defaults, precedence (flag > env > default), value formats, cachydb client (CACHYDB_URL), and the export format
+summary: Every flag and environment variable, defaults, precedence (flag > env > default), listen host, AUTH, find_documents result limits, RESULT_TEXT, BOOTSTRAP_ADMIN_TOKEN and TLS, value formats, cachydb client (CACHYDB_URL, CACHYDB_TOKEN), utils user, and the export format
 ---
 # Configuration
 
@@ -13,9 +13,53 @@ environment variable, which wins over the default.**
 | Flag | Env var | Default | Meaning |
 | --- | --- | --- | --- |
 | `-t, --transport` | `TRANSPORT` | `stdio` | `stdio` or `http`; any other value is an error |
-| `-p, --port` | `PORT` | `7601` | HTTP port; listens on all interfaces, path `/mcp` |
+| `-p, --port` | `PORT` | `7601` | HTTP port, path `/mcp` |
+| `--host` | `HOST` | `127.0.0.1` | HTTP listen host; `127.0.0.1` = this machine only, `0.0.0.0` = every interface |
+| `--auth` | `AUTH` | `auto` | `auto`, `required`, or `off` (see below); any other value is an error |
+| `--tls-cert` | `TLS_CERT` | none | PEM certificate file; with `--tls-key`, serve HTTPS |
+| `--tls-key` | `TLS_KEY` | none | PEM private key file; with `--tls-cert`, serve HTTPS |
 | `-R, --root` | `ROOT_DIR` | `~/.cachydb` | Data directory (one server per directory) |
 | `-d, --db` | `DB_NAME` | `main` | Default database; created at startup if missing |
+| | `BOOTSTRAP_ADMIN_TOKEN` | none | At every start, make sure the server admin `admin` exists and holds this token (32 to 512 characters); never logged; no flag |
+| | `BOOTSTRAP_ADMIN_TOKEN_FILE` | none | A file holding the bootstrap token (for Docker secrets); not together with `BOOTSTRAP_ADMIN_TOKEN` |
+| `--default-limit` | `DEFAULT_LIMIT` | `100` | Documents `find_documents` returns at most when a call gives no `limit` (or `0`); must be greater than 0 |
+| `--max-result-bytes` | `MAX_RESULT_BYTES` | `1MiB` | Cap on the JSON size of the documents one `find_documents` call returns, whatever its `limit`; at least one document is always returned; must be greater than 0 |
+| `--result-text` | `RESULT_TEXT` | `full` | Text content of successful tool results: `full` (the result JSON, the same as the structured content) or `summary` (one line such as `12 documents, has_more: false`); any other value is an error |
+
+### When clients need a token
+
+| Transport | Listen host | `AUTH=auto` | `AUTH=required` | `AUTH=off` |
+| --- | --- | --- | --- | --- |
+| stdio | - | no token | no token | no token |
+| HTTP | loopback (`127.0.0.1`, `::1`, `localhost`) | no token | token | no token |
+| HTTP | any other host | token | token | no token (warning logged) |
+
+When clients need a token and no user exists, cachydb refuses to start
+(exit 1) and says how to go on: create the first admin with
+`cachydb utils user add NAME --admin` while the server is stopped, set
+`BOOTSTRAP_ADMIN_TOKEN`, or, on a trusted network only, set `AUTH=off`.
+Clients send the token as `Authorization: Bearer <token>`; without a
+valid one, `/mcp` answers 401. `/healthz` never needs a token. Changing
+`BOOTSTRAP_ADMIN_TOKEN` and restarting replaces the old bootstrap token;
+see `cachydb docs access` for users, access levels, and tokens.
+
+TLS needs both files; setting only one is a start-up error. The
+certificate and key are read once at start-up.
+
+`--default-limit` and `--max-result-bytes` bound what one `find_documents`
+call returns; its `has_more` and `next_skip` say how to get the rest (see
+`cachydb docs query`). `cachydb utils find` and `cachydb client export`
+are not bounded by them.
+
+Every successful tool result carries the result twice: as structured
+content and as text content. With `--result-text full` (the default) the
+text is the same JSON. With `summary` it is one line (counts, ids,
+`has_more`, `next_skip`; a new token in full), and the data is only in
+the structured content. That saves tokens with a client that passes both
+parts to its model, but a client that shows its model only the text sees
+the summary line and none of the data, so use `summary` only with a
+client known to read the structured content. Errors are unchanged in
+both modes.
 
 ## Engine tuning (server and `cachydb utils`)
 
@@ -36,21 +80,33 @@ instead.
 | Command | Flags | Output |
 | --- | --- | --- |
 | `utils export` | `-d` database, `-c` collection (needs `-d`), `-o` file (default stdout) | The export format below |
-| `utils import` | `-i` file (`-` = stdin), `--on-conflict fail\|skip\|replace` (default `fail`) | A summary on stderr |
+| `utils import` | `-i` file (`-` = stdin), `--on-conflict fail\|skip\|replace\|keep` (default `fail`) | A summary on stderr |
 | `utils find` | `-d`, `-c` (required), `--query` JSON (the `find_documents` `query`), `--format jsonl\|json` (default `jsonl`) | Documents |
 | `utils get` | `-d`, `-c`, `--id` (required) | One document; exit 1 if not found |
+| `utils user add NAME` | `--admin`, `--default-database DB` | The first token, once, alone on stdout |
+| `utils user list` | `--format text\|json` | Users, access, and token labels; never tokens |
+| `utils user remove NAME` | | Removes the user and its tokens (not the only server admin) |
+| `utils user grant NAME DATABASE read\|write\|admin` / `revoke NAME DATABASE` | `*` = every database | |
+| `utils user token add NAME` / `token revoke NAME LABEL` | `--label L` | `add` prints the token once, alone on stdout |
 
 `--on-conflict`: `fail` stops at the first existing `_id` (and reports how
 many lines were applied); `skip` keeps existing documents; `replace`
-replaces them, and also updates a differing collection schema (checked
-against the documents) and adds missing indexes. With `fail` or `skip`, an
-existing collection whose schema or index set differs is an error.
+overwrites them with the file's copies, and also updates a differing
+collection schema (checked against the documents) and adds missing
+indexes. With `fail` or `skip`, an existing collection whose schema or
+index set differs is an error. `keep` is for seeding and is safe to run
+again: it creates missing databases, collections (with the file's schema
+and indexes), and documents, and leaves everything that exists as it is,
+including an existing collection's schema and indexes when they differ
+from the file (exit status 0). A missing document that an existing
+collection's schema rejects is still an error.
 
 ## Client (`cachydb client`)
 
 | Flag | Env var | Default | Meaning |
 | --- | --- | --- | --- |
 | `--url` | `CACHYDB_URL` | `http://127.0.0.1:7601/mcp` | MCP endpoint of a running `cachydb -t http` server |
+| `--token` | `CACHYDB_TOKEN` | none | Token for a server that requires one, sent as `Authorization: Bearer`; prefer the variable (a flag shows in the process list). After a 401 the error names the flag |
 
 - `cachydb client tools [--format json]` lists the server's tools.
 - `cachydb client call <tool> [json-args | -]` calls any tool with a JSON
@@ -85,20 +141,29 @@ the same file except the header's `created`. A header with another
 | `--url` | | `http://127.0.0.1:<port>/healthz` | Endpoint to probe; always probed when given |
 | `-p, --port` | `PORT` | `7601` | Port for the default URL |
 | `-t, --transport` | `TRANSPORT` | `stdio` | Without `--url`, `stdio` means nothing to probe (exit 0) |
+| `--tls-cert`, `--tls-key` | `TLS_CERT`, `TLS_KEY` | none | With both, the default URL is `https://` |
 
-Exit 0 on HTTP 200; exit 1 otherwise (3-second timeout). See
+Exit 0 on HTTP 200; exit 1 otherwise (3-second timeout). An `https://`
+URL on a loopback host is probed without verifying the certificate. See
 `cachydb docs mcp`.
 
 ## Docker image
 
-The image `hovhannespalyan/cachydb` sets `TRANSPORT=http`, `PORT=7601`,
-`ROOT_DIR=/data` and `DB_NAME=main`, and passes no flags, so every
-variable above works with `-e`. Keep `ROOT_DIR=/data` (the volume).
-Arguments after the image name are passed to cachydb; flags still win
-over variables, but the image's healthcheck reads only the variables.
+The image `hovhannespalyan/cachydb` sets `TRANSPORT=http`,
+`HOST=0.0.0.0`, `PORT=7601`, `ROOT_DIR=/data` and `DB_NAME=main`, and
+passes no flags, so every variable above works with `-e`. Keep
+`ROOT_DIR=/data` (the volume). Arguments after the image name are passed
+to cachydb; flags still win over variables, but the image's healthcheck
+reads only the variables.
+
+**A container needs a user or `AUTH=off`:** with `HOST=0.0.0.0` and the
+default `AUTH=auto`, clients need a token, so a container without a user
+exits at start with the refusal message above. `BOOTSTRAP_ADMIN_TOKEN`
+(or `BOOTSTRAP_ADMIN_TOKEN_FILE`) creates the admin without a shell.
 
 ```bash
-docker run -d -p 8080:8080 -v cachydb-data:/data -e PORT=8080 -e DB_NAME=app hovhannespalyan/cachydb
+docker run -d -p 7601:7601 -v cachydb-data:/data -e BOOTSTRAP_ADMIN_TOKEN="$TOKEN" hovhannespalyan/cachydb
+docker run -d -p 127.0.0.1:8080:8080 -v cachydb-data:/data -e PORT=8080 -e DB_NAME=app -e AUTH=off hovhannespalyan/cachydb
 docker run -i --rm -v cachydb-data:/data -e TRANSPORT=stdio hovhannespalyan/cachydb
 ```
 
@@ -122,6 +187,7 @@ docker run -i --rm -v cachydb-data:/data -e TRANSPORT=stdio hovhannespalyan/cach
 cachydb -R /srv/cachydb -d app                 # stdio, custom directory and default database
 ROOT_DIR=/srv/cachydb TRANSPORT=http cachydb   # same settings from the environment
 cachydb -t http -p 8080 --cache-size 256MiB    # HTTP on port 8080 with a bigger cache
+cachydb -t http --host 0.0.0.0 --tls-cert cert.pem --tls-key key.pem   # HTTPS on every interface; needs a user
 ```
 
 ## Exit status and output

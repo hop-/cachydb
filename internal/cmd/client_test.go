@@ -67,7 +67,7 @@ func TestClientToolsAndCall(t *testing.T) {
 	if err := clientDo(t, url, func(cs *mcp.ClientSession) error { return listClientTools(ctx, &out, cs, "text") }); err != nil {
 		t.Fatal(err)
 	}
-	if n := strings.Count(out.String(), "\n    "); n != 21 || !strings.Contains(out.String(), "count_documents\n") {
+	if n := strings.Count(out.String(), "\n    "); n != 26 || !strings.Contains(out.String(), "count_documents\n") {
 		t.Errorf("tools text lists %d tools:\n%s", n, out.String())
 	}
 	out.Reset()
@@ -75,7 +75,7 @@ func TestClientToolsAndCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	var tools []map[string]any
-	if err := json.Unmarshal(out.Bytes(), &tools); err != nil || len(tools) != 21 || tools[0]["inputSchema"] == nil {
+	if err := json.Unmarshal(out.Bytes(), &tools); err != nil || len(tools) != 26 || tools[0]["inputSchema"] == nil {
 		t.Errorf("tools json: %d tools, %v", len(tools), err)
 	}
 

@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
 	"github.com/hop-/cachydb/pkg/db/internal/segment"
 	"github.com/hop-/cachydb/pkg/db/internal/wal"
 )
@@ -16,19 +18,29 @@ import (
 // numDocLocks is the number of striped per-document locks per collection.
 const numDocLocks = 256
 
-// keyEntry is the keydir's record of where the live version of a document
-// is stored in the data segments (§4.3).
-type keyEntry struct {
-	loc       segment.Location
-	walOffset uint64
-}
-
 // memEntry is a change that is durable in the WAL but not yet flushed to a
 // data segment (§5.1). A nil doc is a tombstone.
+//
+// base and baseOff describe the version of the document in the index file
+// that the flush of this entry replaces (approach-index-and-query §4, "old
+// index keys without a disk read"): baseOff is its WAL offset (0 when there
+// is no live version), base its keys per index name. They are captured on
+// the write path, which has that version in hand, and a later write to the
+// same id keeps them. An index missing from base (created or dropped since
+// the capture, see forgetBaseLocked), or a baseOff that no longer matches
+// the key table when the flush runs, makes the flush read the version from
+// its data segment instead.
+//
+// payload is the document's encoded after-image as the WAL record holds it
+// (nil for a tombstone); the flush writes it to the data segment as is,
+// without encoding doc again (approach-toolchain-and-storage §3.2).
 type memEntry struct {
 	doc       *Document
+	payload   []byte // read only; may alias a batch record's payload
 	walOffset uint64
-	size      int64 // approximate encoded size, for the MemtableSize flush trigger
+	size      int64 // approximate memory cost (memEntrySize), for MemtableSize and MaxPendingBytes
+	base      indexBase
+	baseOff   uint64
 }
 
 // Collection is a set of documents with an optional schema and secondary
@@ -50,11 +62,22 @@ type Collection struct {
 	// written by metadata operations (indexes, metaOffset, dropped) are
 	// only changed while Database.mu is held exclusively, so holding that
 	// lock is enough to read them.
-	mu       sync.RWMutex
-	keydir   map[string]keyEntry // id -> live on-disk version
+	mu sync.RWMutex
+	// store is the collection's open index file (index.db): the key table
+	// (id -> location of the live flushed version), the live count, the
+	// per-segment byte accounting, and the checkpoint. Only the flusher
+	// and compaction change it, each in one transaction. It is nil while
+	// the file is not open: before load, once the collection is dropped,
+	// detached, or closed, and on a renamed collection until its first
+	// use (indexStore opens it then). The pointer is read under mu and
+	// used after mu is released: mu is never held across a transaction.
+	store    *idxstore.Store
 	memtable map[string]memEntry // durable-in-WAL, not yet flushed
 	flushing map[string]memEntry // immutable memtable being flushed; nil when idle
-	indexes  map[string]*index   // name -> secondary index; contents change only under mu
+	// indexes holds the definitions of the secondary indexes, whose
+	// entries are in the index file (index.go). It changes only while
+	// Database.mu is held exclusively, together with flushMu and mu.
+	indexes map[string]indexDef
 	// inflight holds, in ascending order, a lower bound of the WAL offset
 	// of every document write that is between "registered before the WAL
 	// append" and "applied to the memtable". Together with the memtable it
@@ -62,50 +85,47 @@ type Collection struct {
 	// is not yet visible in memory. See registerInflight.
 	inflight      []uint64
 	readers       map[uint32]*segment.Reader // open data segments, opened on first read
-	readersClosed bool                       // engine shutdown: no new readers
+	readersClosed bool                       // engine shutdown: no new readers, and the index file stays closed
 	// retired holds the data segments compaction replaced (§9). Their
 	// files are removed (once no read holds them), and no reader may be
 	// opened for them again.
-	retired    map[uint32]struct{}
+	retired map[uint32]struct{}
+	// keptTombs holds, per compaction output of this process, the bytes of
+	// the tombstones the compaction had to copy into it. The index file
+	// counts them as dead, like every tombstone; compaction planning does
+	// not (compactionAccounting). It is not persisted: after a restart
+	// they count as dead again, until the next compaction of the segment.
+	keptTombs  map[uint32]int64
 	metaOffset uint64 // coll.meta wal_offset
 	created    uint64 // coll.meta created_offset (immutable; 0 = unknown)
-	// replayTombs holds, during recovery only, the WAL offsets of the
-	// tombstones in the data segments above the checkpoint whose id is not
-	// in the keydir, so replay does not re-apply deletes that are already
-	// durable. nil outside recovery.
-	replayTombs map[string]uint64
-	dropped     bool
+	dropped    bool
 
 	// Flush bookkeeping (§5.4, §7.1), guarded by mu.
 	memBytes      int64  // sum of memtable entry sizes
 	flushingBytes int64  // sum of flushing entry sizes (counted in Engine.pending until the flush completes)
 	memMin        uint64 // <= smallest walOffset in memtable (meaningful when non-empty)
 	flushingMin   uint64 // <= smallest walOffset in flushing (meaningful when non-nil)
-	checkpoint    uint64 // value of the last checkpoint marker durable in the data segments
-	// deadBytes counts, per data segment, the bytes of records the keydir
-	// no longer references: superseded and deleted versions, tombstones,
-	// and checkpoint markers. Compaction (§9) uses it.
-	deadBytes map[uint32]int64
-	// segBytes holds the record bytes of every live data segment (the
-	// active one included); its keys are the collection's live segments.
-	segBytes map[uint32]int64
+	// checkpoint is the checkpoint stored in the index file, as of its
+	// last commit: every change of this collection with a WAL offset at or
+	// below it is in the index file and the data segments.
+	checkpoint uint64
+
+	// storeMu serializes opening the index file on first use (indexStore)
+	// with the operations that close it. Lock order: storeMu → mu.
+	storeMu sync.Mutex
 
 	// flushMu serializes flushes of this collection and guards the active
 	// segment fields below. Drops hold it while renaming the collection
 	// directory, so the flusher never touches a dropped collection's files
 	// by path. Lock order: Database.mu → flushMu → mu.
 	flushMu      sync.Mutex
-	active       segmentWriter       // open active data segment; nil when not open
-	activeSeg    uint32              // id of the active segment; 0 = no segment yet
-	activeSealed bool                // activeSeg is sealed; the next flush creates segment nextSeg
-	activeHint   []segment.HintEntry // records of the active segment, for its hint file
-	// nextSeg is the id of the next data segment to create (max existing
-	// + 1): the active segment and compaction outputs both take ids from
-	// it, so ids are never reused and always grow.
+	active       segmentWriter // open active data segment; nil when not open
+	activeSeg    uint32        // id of the active segment; 0 = no segment yet
+	activeSealed bool          // activeSeg is sealed; the next flush creates segment nextSeg
+	// nextSeg is the id of the next data segment to create (max
+	// registered + 1): the active segment and compaction outputs both
+	// take ids from it, so ids are never reused and always grow.
 	nextSeg uint32
-	// markerSeg is the segment holding the newest checkpoint marker (0 if
-	// none). Compaction never rewrites it, so the marker survives (§9).
-	markerSeg uint32
 
 	// compactMu serializes compactions of this collection with each other
 	// and with drops: a compaction holds it for its whole run, including
@@ -118,7 +138,21 @@ type Collection struct {
 	// by FNV-1a of the id (see docLock).
 	docLocks [numDocLocks]sync.Mutex
 
-	count atomic.Int64 // live documents, kept in sync with keydir and memtable
+	// uniqueLocks serializes writers of the same value of a unique index;
+	// stripe chosen by FNV-1a of (index name, encoded value) (unique.go).
+	// Lock order: docLock → uniqueLocks (ascending) → mu.
+	uniqueLocks [numUniqueLocks]sync.Mutex
+	// uniquePending maps unique index name → encoded value → the ids of
+	// unflushed documents (memtable or flushing) that held the value when
+	// they were applied (unique.go). Guarded by mu. Entries are hints that
+	// readers confirm against the overlay; nil when empty.
+	uniquePending map[string]map[string][]string
+
+	// count is the number of live documents: the count stored in the
+	// index file plus the net effect of the changes not flushed yet. A
+	// flush moves changes from the second part to the first, so it does
+	// not touch the counter.
+	count atomic.Int64
 }
 
 func newCollection(d *Database, name string, s *Schema, created, metaOffset uint64) *Collection {
@@ -127,13 +161,11 @@ func newCollection(d *Database, name string, s *Schema, created, metaOffset uint
 		name:       name,
 		dir:        collDir(d.e.root, d.name, name),
 		schema:     s,
-		keydir:     make(map[string]keyEntry),
 		memtable:   make(map[string]memEntry),
-		indexes:    make(map[string]*index),
+		indexes:    make(map[string]indexDef),
 		readers:    make(map[uint32]*segment.Reader),
 		retired:    make(map[uint32]struct{}),
-		deadBytes:  make(map[uint32]int64),
-		segBytes:   make(map[uint32]int64),
+		keptTombs:  make(map[uint32]int64),
 		nextSeg:    1,
 		metaOffset: metaOffset,
 		created:    created,
@@ -143,10 +175,12 @@ func newCollection(d *Database, name string, s *Schema, created, metaOffset uint
 // Name returns the collection name.
 func (c *Collection) Name() string { return c.name }
 
-// IndexInfo describes a secondary index.
+// IndexInfo describes a secondary index. Field may be a nested path
+// ("meta.author"). Unique reports a unique index (see Unique).
 type IndexInfo struct {
-	Name  string `json:"name"`
-	Field string `json:"field"`
+	Name   string `json:"name"`
+	Field  string `json:"field"`
+	Unique bool   `json:"unique,omitempty"`
 }
 
 // Schema returns a copy of the collection's schema, or nil for a
@@ -229,9 +263,10 @@ func (c *Collection) validateAll(ctx context.Context, s *Schema) error {
 	if s == nil {
 		return nil
 	}
-	c.mu.RLock()
-	ids := c.liveIDsLocked()
-	c.mu.RUnlock()
+	ids, err := c.liveIDs()
+	if err != nil {
+		return err
+	}
 	var (
 		failed []string
 		total  int
@@ -271,16 +306,26 @@ func (c *Collection) validateAll(ctx context.Context, s *Schema) error {
 }
 
 // markDropped flags the collection as dropped so background work and
-// late callers stop using it, closes its active segment and segment
-// readers, and evicts its documents from the cache. Callers hold
-// Database.mu exclusively and the collection's flushMu.
+// late callers stop using it, closes its index file, active segment, and
+// segment readers, and evicts its documents from the cache. It runs before
+// the collection directory is renamed away. Callers hold Database.mu
+// exclusively and the collection's flushMu.
 func (c *Collection) markDropped() {
+	c.storeMu.Lock()
 	c.mu.Lock()
 	c.dropped = true
 	c.releasePendingLocked()
+	st := c.store
+	c.store = nil
 	readers := c.readers
 	c.readers = make(map[uint32]*segment.Reader)
 	c.mu.Unlock()
+	c.storeMu.Unlock()
+	if st != nil {
+		// Best effort, as below. Close waits for the read transactions
+		// still open on the file.
+		_ = st.Close()
+	}
 	if c.active != nil {
 		// Best effort: the directory is about to be removed, so nothing
 		// written to it matters any more.
@@ -295,8 +340,8 @@ func (c *Collection) markDropped() {
 	c.db.e.cache.InvalidateCollection(c.db.name, c.name)
 }
 
-// closeFiles closes the active segment writer and every segment reader
-// without flushing (cleanup after a failed Open).
+// closeFiles closes the active segment writer, every segment reader, and
+// the index file without flushing (cleanup after a failed Open).
 func (c *Collection) closeFiles() error {
 	c.flushMu.Lock()
 	var errs []error
@@ -313,14 +358,24 @@ func (c *Collection) closeFiles() error {
 	return errors.Join(errs...)
 }
 
-// closeReaders closes every open segment reader (engine shutdown).
+// closeReaders closes every open segment reader and the index file (engine
+// shutdown). Neither is opened again.
 func (c *Collection) closeReaders() error {
+	c.storeMu.Lock()
 	c.mu.Lock()
+	st := c.store
+	c.store = nil
 	readers := c.readers
 	c.readers = make(map[uint32]*segment.Reader)
 	c.readersClosed = true
 	c.mu.Unlock()
+	c.storeMu.Unlock()
 	var errs []error
+	if st != nil {
+		if err := st.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	for _, r := range readers {
 		if err := r.Close(); err != nil {
 			errs = append(errs, err)
@@ -329,14 +384,90 @@ func (c *Collection) closeReaders() error {
 	return errors.Join(errs...)
 }
 
+// indexStore returns the collection's open index file. A renamed
+// collection opens its file here on first use (its handle was closed
+// before the directory was renamed). It fails with ErrNotFound for a
+// dropped collection and with ErrClosed after engine shutdown.
+func (c *Collection) indexStore() (*idxstore.Store, error) {
+	c.mu.RLock()
+	st, err := c.storeLocked()
+	c.mu.RUnlock()
+	if st != nil || err != nil {
+		return st, err
+	}
+	return c.openStoreOnUse()
+}
+
+// storeLocked returns the open index file, or nil when it has to be opened
+// first (openStoreOnUse). It fails for a dropped collection and after
+// engine shutdown. Callers hold mu.
+func (c *Collection) storeLocked() (*idxstore.Store, error) {
+	switch {
+	case c.dropped:
+		return nil, c.errDropped()
+	case c.readersClosed:
+		return nil, ErrClosed
+	}
+	return c.store, nil
+}
+
+// openStoreOnUse opens the index file of a collection that has none open
+// (see indexStore). Callers hold neither mu nor storeMu.
+func (c *Collection) openStoreOnUse() (*idxstore.Store, error) {
+	c.storeMu.Lock()
+	defer c.storeMu.Unlock()
+	c.mu.RLock()
+	st, err := c.storeLocked()
+	c.mu.RUnlock()
+	if st != nil || err != nil {
+		return st, err
+	}
+	// The drop, rename, and shutdown paths take storeMu before they flag
+	// the collection, so none of them runs while the file is being opened.
+	st, err = idxstore.Open(c.dir, idxstore.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("collection %q in database %q: %w", c.name, c.db.name, err)
+	}
+	c.mu.Lock()
+	c.store = st
+	c.mu.Unlock()
+	return st, nil
+}
+
+// storeErr maps the error of an index-file operation. A handle that a
+// drop, a rename, or Close closed after the caller took it reports
+// idxstore.ErrClosed; the caller gets the error it would have got had it
+// started a moment later.
+func (c *Collection) storeErr(err error) error {
+	if !errors.Is(err, idxstore.ErrClosed) {
+		return err
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.dropped {
+		return c.errDropped()
+	}
+	return ErrClosed
+}
+
+// storedEntry returns the key-table entry of id: where its live flushed
+// version is. ok is false when the index file has no such id. It runs in
+// a read transaction of its own; callers hold no collection lock.
+func (c *Collection) storedEntry(id string) (ke idxstore.Entry, ok bool, err error) {
+	st, err := c.indexStore()
+	if err != nil {
+		return idxstore.Entry{}, false, err
+	}
+	if ke, ok, err = st.Key(id); err != nil {
+		return idxstore.Entry{}, false, c.storeErr(err)
+	}
+	return ke, ok, nil
+}
+
 // indexDefs returns the definitions of the collection's indexes. Callers
 // hold Database.mu (the index set changes only under it exclusively).
 func (c *Collection) indexDefs() map[string]indexDef {
-	defs := make(map[string]indexDef, len(c.indexes))
-	for name, ix := range c.indexes {
-		defs[name] = indexDef{Name: name, Field: ix.field}
-	}
-	return defs
+	return maps.Clone(c.indexes)
 }
 
 func (c *Collection) errDropped() error {
@@ -344,11 +475,22 @@ func (c *Collection) errDropped() error {
 }
 
 // CreateIndex creates the secondary index name on field and builds it
-// from the documents already in the collection. It fails with ErrExists if
-// an index with that name exists. It holds the database's metadata lock
-// for the whole build, so writes to the database wait while it runs
-// (known limitation: index creation is rare).
-func (c *Collection) CreateIndex(ctx context.Context, name, field string) error {
+// from the documents already in the collection. field may be a nested path
+// ("meta.author", see Document.GetPath). Options: Unique(true) makes the
+// index unique; creating it then fails with an error wrapping
+// ErrUniqueViolation, listing up to 10 shared values with their ids, if
+// existing documents share a value, and nothing changes. It fails with
+// ErrExists if an index with that name exists. It holds the database's
+// metadata lock for the whole build, so writes to the database wait while
+// it runs (known limitation: index creation is rare).
+//
+// The entries are built into the index file, in batches, from the
+// documents the key table lists, before the commit point; the collection's
+// flushes and compactions wait meanwhile, so the new index matches the
+// key table when it is published. Unflushed changes are found by the next
+// flush, which reads the replaced versions' keys from the data segments
+// (forgetBaseLocked).
+func (c *Collection) CreateIndex(ctx context.Context, name, field string, opts ...IndexOption) error {
 	if err := ValidateName("index", name); err != nil {
 		return err
 	}
@@ -370,21 +512,47 @@ func (c *Collection) CreateIndex(ctx context.Context, name, field string) error 
 		return fmt.Errorf("index %q on collection %q: %w", name, c.name, ErrExists)
 	}
 
-	// Build before the commit point: a read error aborts the operation
-	// with nothing written. Document writes are blocked by Database.mu, so
-	// the index stays exact until it is published below.
-	ix, err := c.buildIndex(ctx, name, field)
+	// Lock order: Database.mu → compactMu → flushMu → mu. Document writes
+	// are blocked by Database.mu, flushes and compactions by these two, so
+	// the key table and the documents stay as they are until the index is
+	// published below.
+	c.compactMu.Lock()
+	defer c.compactMu.Unlock()
+	c.flushMu.Lock()
+	defer c.flushMu.Unlock()
+	st, err := c.indexStore()
 	if err != nil {
 		return fmt.Errorf("creating index %q: %w", name, err)
 	}
 
+	// Build before the commit point: an error aborts the operation, and
+	// entries without a definition are dropped (here, or by the next Open).
+	// A unique index is checked for shared values first, over the key
+	// table's documents and the overlay (stable: no write or flush runs).
 	def := indexDef{Name: name, Field: field}
+	for _, o := range opts {
+		o(&def)
+	}
+	def.Name, def.Field = name, field
+	var overlay map[string]*Document
+	if def.Unique {
+		c.mu.RLock()
+		overlay = c.overlayLocked()
+		c.mu.RUnlock()
+	}
+	if err := c.buildIndexesChecked(ctx, st, []indexDef{def}, overlay, def.Unique); err != nil {
+		c.dropIndexEntries(st, name)
+		return fmt.Errorf("creating index %q: %w", name, c.storeErr(err))
+	}
+
 	payload, err := json.Marshal(def)
 	if err != nil {
+		c.dropIndexEntries(st, name)
 		return fmt.Errorf("creating index %q: encoding payload: %w", name, err)
 	}
 	off, done, err := e.appendMetaWAL(ctx, wal.Record{Op: wal.OpCreateIndex, DB: d.name, Coll: c.name, Payload: payload})
 	if err != nil {
+		c.dropIndexEntries(st, name)
 		return fmt.Errorf("creating index %q: %w", name, err)
 	}
 	if err := e.hook(hookMetaWrite); err != nil {
@@ -393,15 +561,31 @@ func (c *Collection) CreateIndex(ctx context.Context, name, field string) error 
 	defs := c.indexDefs()
 	defs[name] = def
 	if err := c.writeMeta(defs, off); err != nil {
+		// The record stays pinned in the WAL (done is not called), so a
+		// restart replays it and builds the index again.
+		c.dropIndexEntries(st, name)
 		return fmt.Errorf("creating index %q: %w", name, err)
 	}
 	done()
 
 	c.mu.Lock()
-	c.indexes[name] = ix
+	c.indexes[name] = def
+	c.forgetBaseLocked(name)
+	c.fillUniquePendingLocked(def)
 	c.metaOffset = off
 	c.mu.Unlock()
 	return nil
+}
+
+// dropIndexEntries removes the entries of index name from the index file,
+// best effort: entries without a definition are also dropped by the next
+// Open (syncIndexes). Callers hold flushMu.
+func (c *Collection) dropIndexEntries(st *idxstore.Store, name string) {
+	err := st.Update(func(u *idxstore.WTx) error { return u.DropIndex(name) })
+	if err != nil && !errors.Is(err, idxstore.ErrNoIndex) {
+		c.db.e.logger.Warn("cachydb: removing the entries of an index from the index file; the next open removes them",
+			"database", c.db.name, "collection", c.name, "index", name, "err", c.storeErr(err))
+	}
 }
 
 // DropIndex removes the secondary index name (ErrNotFound if absent).
@@ -424,6 +608,11 @@ func (c *Collection) DropIndex(ctx context.Context, name string) error {
 		return fmt.Errorf("index %q on collection %q: %w", name, c.name, ErrNotFound)
 	}
 
+	// No flush runs while the index set and the bucket change (lock
+	// order: Database.mu → flushMu → mu): a flush uses one index set from
+	// start to end.
+	c.flushMu.Lock()
+	defer c.flushMu.Unlock()
 	payload, err := json.Marshal(dropIndexPayload{Name: name})
 	if err != nil {
 		return fmt.Errorf("dropping index %q: encoding payload: %w", name, err)
@@ -444,13 +633,15 @@ func (c *Collection) DropIndex(ctx context.Context, name string) error {
 
 	c.mu.Lock()
 	delete(c.indexes, name)
+	c.forgetBaseLocked(name)
+	delete(c.uniquePending, name)
 	c.metaOffset = off
 	c.mu.Unlock()
 
-	// The snapshot is only an accelerator; a stale one is ignored on open
-	// because its index is no longer in coll.meta.
-	if err := segment.RemoveIndexSnapshot(c.dir, name); err != nil {
-		e.logger.Warn("cachydb: removing snapshot of dropped index", "collection", c.name, "index", name, "err", err)
+	// The definition is gone, so nothing reads or maintains the entries
+	// any more; if removing them fails, the next Open does it.
+	if st, err := c.indexStore(); err == nil {
+		c.dropIndexEntries(st, name)
 	}
 	return nil
 }
@@ -474,17 +665,27 @@ func (c *Collection) writeMetaWith(s *Schema, defs map[string]indexDef, off uint
 
 // detach makes the collection unusable under its current name before its
 // directory is renamed (plan 004 §3.4): it flags it dropped, closes its
-// active segment and segment readers, and evicts its documents from the
-// cache. Unlike markDropped it keeps the in-memory state, which
-// moveState hands to the renamed collection. Callers hold Database.mu
-// exclusively and flushMu, or run during recovery.
+// index file, active segment, and segment readers, and evicts its
+// documents from the cache. Unlike markDropped it keeps the in-memory
+// state, which moveState hands to the renamed collection. Callers hold
+// Database.mu exclusively and flushMu, or run during recovery.
 func (c *Collection) detach() error {
+	c.storeMu.Lock()
 	c.mu.Lock()
 	c.dropped = true
+	st := c.store
+	c.store = nil
 	readers := c.readers
 	c.readers = make(map[uint32]*segment.Reader)
 	c.mu.Unlock()
+	c.storeMu.Unlock()
 	var errs []error
+	if st != nil {
+		// Close waits for the read transactions still open on the file.
+		if err := st.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if c.active != nil {
 		if err := c.active.Close(); err != nil {
 			errs = append(errs, err)
@@ -502,29 +703,29 @@ func (c *Collection) detach() error {
 }
 
 // moveState returns a new collection called name, in directory dir, that
-// takes over c's in-memory state (keydir, memtable, indexes, segment
-// bookkeeping, count); c keeps empty structures. The active segment is
-// reopened lazily by the next flush. Callers hold Database.mu exclusively
-// and c's flushMu (or run during recovery), and have detached c.
+// takes over c's in-memory state (memtable, index definitions, segment bookkeeping,
+// checkpoint, count); c keeps empty structures. The index file, which
+// detach closed, is opened again by the new collection's first use
+// (indexStore), and the active segment by its next flush. Callers hold
+// Database.mu exclusively and c's flushMu (or run during recovery), and
+// have detached c.
 func (c *Collection) moveState(name, dir string, metaOffset uint64) *Collection {
 	nc := newCollection(c.db, name, c.schema, c.created, metaOffset)
 	nc.dir = dir
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	nc.keydir, c.keydir = c.keydir, make(map[string]keyEntry)
 	nc.memtable, c.memtable = c.memtable, make(map[string]memEntry)
 	nc.flushing, c.flushing = c.flushing, nil
-	nc.indexes, c.indexes = c.indexes, make(map[string]*index)
+	nc.indexes, c.indexes = c.indexes, make(map[string]indexDef)
+	nc.uniquePending, c.uniquePending = c.uniquePending, nil
 	nc.inflight, c.inflight = c.inflight, nil
 	nc.retired, c.retired = c.retired, make(map[uint32]struct{})
-	nc.replayTombs, c.replayTombs = c.replayTombs, nil
+	nc.keptTombs, c.keptTombs = c.keptTombs, make(map[uint32]int64)
 	nc.memBytes, nc.flushingBytes = c.memBytes, c.flushingBytes
 	c.memBytes, c.flushingBytes = 0, 0
 	nc.memMin, nc.flushingMin, nc.checkpoint = c.memMin, c.flushingMin, c.checkpoint
-	nc.deadBytes, c.deadBytes = c.deadBytes, make(map[uint32]int64)
-	nc.segBytes, c.segBytes = c.segBytes, make(map[uint32]int64)
-	nc.activeSeg, nc.activeSealed, nc.activeHint = c.activeSeg, c.activeSealed, c.activeHint
-	nc.nextSeg, nc.markerSeg = c.nextSeg, c.markerSeg
+	nc.activeSeg, nc.activeSealed = c.activeSeg, c.activeSealed
+	nc.nextSeg = c.nextSeg
 	nc.count.Store(c.count.Load())
 	c.count.Store(0)
 	return nc

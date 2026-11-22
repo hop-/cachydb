@@ -33,6 +33,8 @@ func TestOptionsWithDefaults(t *testing.T) {
 				CompactionRatio:  0.5,
 				MaxPendingBytes:  defaultMaxPendingBytes(16 << 20),
 				FlushWorkers:     defaultFlushWorkers(),
+				MaxBatchDocs:     10_000,
+				MaxBatchBytes:    32 << 20,
 			},
 		},
 		{
@@ -50,6 +52,8 @@ func TestOptionsWithDefaults(t *testing.T) {
 				CompactionRatio:  1,
 				MaxPendingBytes:  6,
 				FlushWorkers:     7,
+				MaxBatchDocs:     8,
+				MaxBatchBytes:    9,
 			},
 			want: Options{
 				Dir:              "/data",
@@ -63,6 +67,8 @@ func TestOptionsWithDefaults(t *testing.T) {
 				CompactionRatio:  1,
 				MaxPendingBytes:  6,
 				FlushWorkers:     7,
+				MaxBatchDocs:     8,
+				MaxBatchBytes:    9,
 			},
 		},
 		{
@@ -86,6 +92,8 @@ func TestOptionsWithDefaults(t *testing.T) {
 				CompactionRatio:  0.5,
 				MaxPendingBytes:  0,
 				FlushWorkers:     defaultFlushWorkers(),
+				MaxBatchDocs:     10_000,
+				MaxBatchBytes:    32 << 20,
 			},
 		},
 	}
@@ -145,6 +153,8 @@ func TestOptionsWithDefaultsErrors(t *testing.T) {
 		{"negative compaction ratio", Options{Dir: "d", CompactionRatio: -0.1}, "CompactionRatio"},
 		{"compaction ratio above 1", Options{Dir: "d", CompactionRatio: 1.5}, "CompactionRatio"},
 		{"negative flush workers", Options{Dir: "d", FlushWorkers: -1}, "FlushWorkers"},
+		{"negative max batch docs", Options{Dir: "d", MaxBatchDocs: -1}, "MaxBatchDocs"},
+		{"negative max batch bytes", Options{Dir: "d", MaxBatchBytes: -1}, "MaxBatchBytes"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

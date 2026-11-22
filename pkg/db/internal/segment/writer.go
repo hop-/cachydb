@@ -78,23 +78,14 @@ func (w *Writer) recover() error {
 		return fmt.Errorf("segment: stat %s: %w", w.path, err)
 	}
 	size := fi.Size()
-
-	hdrErr, ioErr := readHeader(w.f, size)
-	if ioErr != nil {
-		return fmt.Errorf("segment: reading header of %s: %w", w.path, ioErr)
+	keep, err := checkActive(w.f, w.path, size)
+	if err != nil {
+		return err
 	}
-	if hdrErr != nil {
-		// A short or all-zero file is an interrupted Create: nothing in it
-		// was ever written by Append.
-		torn := size < headerSize
-		if !torn {
-			if torn, err = allZero(w.f, 0, size); err != nil {
-				return fmt.Errorf("segment: reading %s: %w", w.path, err)
-			}
-		}
-		if !torn {
-			return corruptErr(w.path, 0, hdrErr.Error())
-		}
+	switch {
+	case keep == 0:
+		// A short or all-zero header: an interrupted Create, nothing in
+		// the file was ever written by Append.
 		if err := w.truncate(0, size); err != nil {
 			return err
 		}
@@ -105,35 +96,84 @@ func (w *Writer) recover() error {
 			return fmt.Errorf("segment: syncing %s: %w", w.path, err)
 		}
 		w.size = headerSize
-		return nil
+	case keep < size:
+		if err := w.truncate(keep, size); err != nil {
+			return err
+		}
+		w.size = keep
+	default:
+		w.size = size
+	}
+	return nil
+}
+
+// checkActive validates f, the segment file at path of size bytes, by
+// OpenActive's rules without changing it. It returns the size OpenActive
+// keeps: size for an intact file, the start of a torn final record it
+// truncates, or 0 for a torn or all-zero header (an interrupted Create),
+// which it rewrites. Damage anywhere else is an error wrapping ErrCorrupt.
+func checkActive(f *os.File, path string, size int64) (keep int64, err error) {
+	hdrErr, ioErr := readHeader(f, size)
+	if ioErr != nil {
+		return 0, fmt.Errorf("segment: reading header of %s: %w", path, ioErr)
+	}
+	if hdrErr != nil {
+		torn := size < headerSize
+		if !torn {
+			if torn, err = allZero(f, 0, size); err != nil {
+				return 0, fmt.Errorf("segment: reading %s: %w", path, err)
+			}
+		}
+		if !torn {
+			return 0, corruptErr(path, 0, hdrErr.Error())
+		}
+		return 0, nil
 	}
 
-	rr := newRecordReader(w.f, size)
+	rr := newRecordReader(f, size)
 	for {
 		_, _, err := rr.next()
 		if err == io.EOF {
-			w.size = size
-			return nil
+			return size, nil
 		}
-		var re *recordError
-		if errors.As(err, &re) {
-			torn, terr := isTornTail(w.f, re, size)
+		if re, ok := errors.AsType[*recordError](err); ok {
+			torn, terr := isTornTail(f, re, size)
 			if terr != nil {
-				return fmt.Errorf("segment: reading %s: %w", w.path, terr)
+				return 0, fmt.Errorf("segment: reading %s: %w", path, terr)
 			}
 			if !torn {
-				return corruptErr(w.path, re.pos, re.reason)
+				return 0, corruptErr(path, re.pos, re.reason)
 			}
-			if err := w.truncate(re.pos, size); err != nil {
-				return err
-			}
-			w.size = re.pos
-			return nil
+			return re.pos, nil
 		}
 		if err != nil {
-			return fmt.Errorf("segment: reading %s: %w", w.path, err)
+			return 0, fmt.Errorf("segment: reading %s: %w", path, err)
 		}
 	}
+}
+
+// CheckActive reports what OpenActive would do with segment seg in dir,
+// without changing the file. It returns the file's size and the size
+// OpenActive keeps: size for an intact file, less when it truncates a
+// torn final record, and 0 for a torn or all-zero header, which it
+// rewrites. Damage OpenActive refuses is an error wrapping ErrCorrupt.
+func CheckActive(dir string, seg uint32) (keep, size int64, err error) {
+	path := DataPath(dir, seg)
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, 0, fmt.Errorf("segment: opening %s: %w", path, err)
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("segment: closing %s: %w", path, cerr)
+		}
+	}()
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, 0, fmt.Errorf("segment: stat %s: %w", path, err)
+	}
+	keep, err = checkActive(f, path, fi.Size())
+	return keep, fi.Size(), err
 }
 
 func (w *Writer) truncate(at, size int64) error {

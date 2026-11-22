@@ -13,8 +13,14 @@ import (
 )
 
 // FormatVersion is the on-disk data-directory format this build reads and
-// writes. Version 1 is the legacy layout (no cachydb.format file).
-const FormatVersion = 2
+// writes. Version 1 is the legacy layout (no cachydb.format file). Version
+// 2 (v0.0.4 to v0.0.6: hint files, index snapshots) is upgraded to version
+// 3 (one index.db per collection) by Open (upgrade.go).
+const FormatVersion = 3
+
+// upgradableFormatVersion is the one older data-directory format this
+// build upgrades in place to FormatVersion.
+const upgradableFormatVersion = 2
 
 // WALFormatVersion is the write-ahead log segment format this build reads
 // and writes.
@@ -31,42 +37,59 @@ type formatFile struct {
 	Version int    `json:"version"`
 }
 
+// errFormatUpgrade is validateFormatFile's result for a directory of
+// upgradableFormatVersion: readable, after the upgrade.
+var errFormatUpgrade = errors.New("data directory format needs an upgrade")
+
 // checkDataDir creates root if needed, detects the old layout
 // (ErrIncompatibleDataDir with the "move or delete it" message), and
-// writes/validates cachydb.format.
-func checkDataDir(root string) error {
+// writes/validates cachydb.format. upgrade is true for a directory of
+// format version 2, which Open upgrades (upgradeFormat) before it loads
+// the collections; the format file still says 2 until that finished.
+func checkDataDir(root string) (upgrade bool, err error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
-		return fmt.Errorf("creating data directory %s: %w", root, err)
+		return false, fmt.Errorf("creating data directory %s: %w", root, err)
 	}
 
 	path := filepath.Join(root, formatFileName)
 	data, err := os.ReadFile(path)
 	switch {
 	case err == nil:
-		return validateFormatFile(root, data)
+		err := validateFormatFile(root, data)
+		if errors.Is(err, errFormatUpgrade) {
+			return true, nil
+		}
+		return false, err
 	case !errors.Is(err, os.ErrNotExist):
-		return fmt.Errorf("reading %s: %w", path, err)
+		return false, fmt.Errorf("reading %s: %w", path, err)
 	}
 
 	old, err := hasOldLayout(root)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if old {
-		return fmt.Errorf("%w: data directory %s was created by an older cachydb format; move or delete it",
+		return false, fmt.Errorf("%w: data directory %s was created by an older cachydb format; move or delete it",
 			ErrIncompatibleDataDir, root)
 	}
+	return false, writeFormatFile(root)
+}
 
-	data, err = json.Marshal(formatFile{Format: formatName, Version: FormatVersion})
+// writeFormatFile writes cachydb.format with FormatVersion, atomically.
+func writeFormatFile(root string) error {
+	data, err := json.Marshal(formatFile{Format: formatName, Version: FormatVersion})
 	if err != nil {
 		return fmt.Errorf("encoding %s: %w", formatFileName, err)
 	}
-	if err := fsutil.WriteFileAtomic(path, data, 0o644); err != nil {
+	if err := fsutil.WriteFileAtomic(filepath.Join(root, formatFileName), data, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", formatFileName, err)
 	}
 	return nil
 }
 
+// validateFormatFile checks the content of cachydb.format: nil for
+// FormatVersion, errFormatUpgrade for upgradableFormatVersion, else
+// ErrIncompatibleDataDir.
 func validateFormatFile(root string, data []byte) error {
 	var ff formatFile
 	if err := json.Unmarshal(data, &ff); err != nil {
@@ -78,14 +101,17 @@ func validateFormatFile(root string, data []byte) error {
 			ErrIncompatibleDataDir, root, formatFileName, ff.Format, formatName)
 	}
 	switch {
+	case ff.Version == FormatVersion:
+		return nil
+	case ff.Version == upgradableFormatVersion:
+		return errFormatUpgrade
 	case ff.Version > FormatVersion:
 		return fmt.Errorf("%w: data directory %s has format version %d, newer than supported version %d; upgrade cachydb",
 			ErrIncompatibleDataDir, root, ff.Version, FormatVersion)
-	case ff.Version < FormatVersion:
-		return fmt.Errorf("%w: data directory %s was created by an older cachydb format (version %d); move or delete it",
-			ErrIncompatibleDataDir, root, ff.Version)
+	default:
+		return fmt.Errorf("%w: data directory %s was created by an older cachydb format (version %d) that this cachydb cannot upgrade (it upgrades version %d); move or delete it",
+			ErrIncompatibleDataDir, root, ff.Version, upgradableFormatVersion)
 	}
-	return nil
 }
 
 // hasOldLayout reports whether root holds files of the legacy (version 1)

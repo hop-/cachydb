@@ -31,10 +31,14 @@ type dbMeta struct {
 }
 
 // indexDef is an index definition as stored in coll.meta and in
-// create_index WAL payloads.
+// create_index WAL payloads. Field may be a nested path (Document.GetPath).
+// Unique is omitted when false, so files written before unique indexes
+// existed load as non-unique and non-unique definitions are written as
+// before.
 type indexDef struct {
-	Name  string `json:"name"`
-	Field string `json:"field"`
+	Name   string `json:"name"`
+	Field  string `json:"field"`
+	Unique bool   `json:"unique,omitempty"`
 }
 
 // collMeta is the JSON content of <root>/<db>/<coll>/coll.meta.
@@ -160,7 +164,7 @@ func removeDeletedLeftovers(root string) error {
 		return entries
 	}
 	for _, e := range removeIn(root) {
-		if e.IsDir() && validName(e.Name()) {
+		if e.IsDir() && validDatabaseDir(e.Name()) {
 			removeIn(filepath.Join(root, e.Name()))
 		}
 	}

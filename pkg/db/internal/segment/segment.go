@@ -1,8 +1,8 @@
 // Package segment implements the append-only data segment files of a
 // cachydb collection (approach §4): a record codec with per-record zstd
 // compression and CRC32C checksums, the active-segment Writer, a shared
-// ref-counted Reader, sequential Scan, and the hint (§4.2) and index
-// snapshot (§8) sidecar files (sidecar.go, hint.go, snapshot.go).
+// ref-counted Reader, and sequential Scan and its header-only variant
+// ScanHeaders.
 //
 // Segment files are named seg-<n, at least 6 digits>.data and start with a
 // 16-byte header: magic "CDBD" · u16 format version · u8 codec · 9
@@ -35,6 +35,10 @@ const (
 	dataPrefix    = "seg-"
 	dataSuffix    = ".data"
 )
+
+// HeaderSize is the size of a segment file's header: a segment file of
+// exactly this size holds no record.
+const HeaderSize = headerSize
 
 // DataPath returns the path of data segment seg in dir: <dir>/seg-%06d.data.
 func DataPath(dir string, seg uint32) string {
@@ -152,6 +156,10 @@ type recordReader struct {
 	pos  int64 // file position of the next record
 	size int64 // file size the reader treats as EOF
 	buf  []byte
+	// headersOnly makes next return records without their documents: the
+	// checksum is still verified over the stored bytes, but nothing is
+	// decompressed (see decodeHeader).
+	headersOnly bool
 }
 
 func newRecordReader(f *os.File, size int64) *recordReader {
@@ -193,7 +201,11 @@ func (rr *recordReader) next() (Record, Location, error) {
 	if got := crc32.Checksum(body, crcTable); got != want {
 		return Record{}, Location{}, &recordError{kind: errKindCRC, pos: start, end: end, reason: "record checksum mismatch"}
 	}
-	rec, err := decodeBody(body)
+	decode := decodeBody
+	if rr.headersOnly {
+		decode = decodeHeader
+	}
+	rec, err := decode(body)
 	if err != nil {
 		if errors.Is(err, errBadBody) {
 			return Record{}, Location{}, &recordError{kind: errKindInvalid, pos: start, end: end, reason: err.Error()}
@@ -246,6 +258,24 @@ func allZero(f *os.File, from, to int64) (bool, error) {
 // Scan stops and returns that error unwrapped, with validEnd at the end of
 // the last record fn accepted.
 func Scan(dir string, seg uint32, fn func(Record, Location) error) (validEnd int64, err error) {
+	return scan(dir, seg, false, fn)
+}
+
+// ScanHeaders is Scan without the documents: fn gets the type, id, WAL
+// offset, and location of every valid record, and Record.Doc is always nil.
+// It reads every record and verifies its checksum, but never decompresses,
+// so it costs a fraction of Scan.
+//
+// It stops at a damaged record or a torn tail exactly as Scan does, with
+// one difference: a put whose checksum is right but whose compressed
+// document does not decompress is reported as valid, because only
+// decompression can find that.
+func ScanHeaders(dir string, seg uint32, fn func(Record, Location) error) (validEnd int64, err error) {
+	return scan(dir, seg, true, fn)
+}
+
+// scan implements Scan (headersOnly false) and ScanHeaders (true).
+func scan(dir string, seg uint32, headersOnly bool, fn func(Record, Location) error) (validEnd int64, err error) {
 	path := DataPath(dir, seg)
 	f, err := os.Open(path)
 	if err != nil {
@@ -270,14 +300,14 @@ func Scan(dir string, seg uint32, fn func(Record, Location) error) (validEnd int
 	}
 
 	rr := newRecordReader(f, size)
+	rr.headersOnly = headersOnly
 	validEnd = headerSize
 	for {
 		rec, loc, err := rr.next()
 		if err == io.EOF {
 			return validEnd, nil
 		}
-		var re *recordError
-		if errors.As(err, &re) {
+		if re, ok := errors.AsType[*recordError](err); ok {
 			return validEnd, corruptErr(path, re.pos, re.reason)
 		}
 		if err != nil {

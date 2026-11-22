@@ -551,7 +551,7 @@ func TestIndexDefinitions(t *testing.T) {
 	c := mustColl(t, d, "users")
 	metaPath := filepath.Join(dir, "app", "users", collMetaFile)
 
-	for _, def := range []indexDef{{"by_name", "name"}, {"by_age", "age"}} {
+	for _, def := range []indexDef{{Name: "by_name", Field: "name"}, {Name: "by_age", Field: "age"}} {
 		off := e.wal.NextOffset()
 		if err := c.CreateIndex(ctx, def.Name, def.Field); err != nil {
 			t.Fatalf("CreateIndex(%q): %v", def.Name, err)
@@ -574,7 +574,7 @@ func TestIndexDefinitions(t *testing.T) {
 
 	e = reopen(t, e)
 	c = mustColl(t, mustDB(t, e, "app"), "users")
-	want := []indexDef{{"by_age", "age"}, {"by_name", "name"}}
+	want := []indexDef{{Name: "by_age", Field: "age"}, {Name: "by_name", Field: "name"}}
 	if got := readCollMetaFile(t, metaPath).Indexes; !slices.Equal(got, want) {
 		t.Fatalf("coll.meta indexes = %v, want %v", got, want)
 	}
@@ -595,7 +595,7 @@ func TestIndexDefinitions(t *testing.T) {
 
 	e = reopen(t, e)
 	c = mustColl(t, mustDB(t, e, "app"), "users")
-	if got := sortedIndexDefs(c.indexDefs()); !slices.Equal(got, []indexDef{{"by_age", "age"}}) {
+	if got := sortedIndexDefs(c.indexDefs()); !slices.Equal(got, []indexDef{{Name: "by_age", Field: "age"}}) {
 		t.Fatalf("indexes after drop and reopen = %v", got)
 	}
 	if m := readCollMetaFile(t, metaPath); m.WALOffset != off {

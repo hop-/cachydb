@@ -20,7 +20,9 @@ topics; with a topic it prints that topic as markdown.
 Topics: ` + strings.Join(docs.Names, ", ") + `.
 
 The tools topic is generated from the MCP tool definitions of this binary,
-so it always matches what the server registers. The same topics are served
+so it always matches what the server registers; the access topic ends with
+the generated reference of the user tools (whoami and the server-admin
+tools), registered only when the server requires tokens. The same topics are served
 over MCP as resources cachydb://docs/<topic>.
 
 docs never opens the database, so it works while a server is running.`,
@@ -54,6 +56,7 @@ func runDocs(cmd *cobra.Command, args []string) error {
 }
 
 // topicJSON is a topic in --format json; Tools is set for the tools topic.
+// (The access topic's user-tool reference is in its markdown content.)
 type topicJSON struct {
 	docs.Topic
 	Tools []mcpserver.ToolDoc `json:"tools,omitempty"`

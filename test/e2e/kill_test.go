@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -262,6 +263,10 @@ type docState struct {
 	acked      map[string]any
 	hasPending bool
 	pending    map[string]any
+	// batch names the batch call (insert_documents, update_documents,
+	// delete_documents) of the pending write, "" for a single write. The
+	// pending writes of one batch must all land or none (verify).
+	batch string
 }
 
 // writerState is owned by one writer goroutine during a round and read
@@ -275,6 +280,7 @@ type writerState struct {
 	// counterPending is set while a counter update is unanswered.
 	counterPending bool
 	ops            map[string]int
+	batches        int // batch calls started, for docState.batch names
 }
 
 func newWriterState(id int) *writerState {
@@ -314,7 +320,7 @@ func (w *writerState) run(ctx context.Context, url string, round int, rng *mrand
 	for ctx.Err() == nil {
 		var err error
 		switch p := rng.IntN(100); {
-		case p < 50 && len(w.live) < maxLivePerW:
+		case p < 40 && len(w.live) < maxLivePerW:
 			w.seq++
 			id := fmt.Sprintf("r%03d-w%d-%05d", round, w.id, w.seq)
 			doc := normalize(map[string]any{"_id": id, "w": w.id, "round": round, "seq": w.seq, "payload": randHex(64 + rng.IntN(96))})
@@ -326,7 +332,9 @@ func (w *writerState) run(ctx context.Context, url string, round int, rng *mrand
 				w.live = append(w.live, id)
 				w.ops["insert"]++
 			}
-		case p < 70 && len(w.live) > 0:
+		case p < 50 && len(w.live) < maxLivePerW:
+			err = w.insertBatch(ctx, c, round, rng)
+		case p < 62 && len(w.live) > 0:
 			id := w.live[rng.IntN(len(w.live))]
 			st := w.docs[id]
 			next := normalize(st.acked)
@@ -340,7 +348,9 @@ func (w *writerState) run(ctx context.Context, url string, round int, rng *mrand
 				st.acked, st.hasPending, st.pending = next, false, nil
 				w.ops["update"]++
 			}
-		case p < 85 && len(w.live) > 0:
+		case p < 70 && len(w.live) > 1:
+			err = w.updateBatch(ctx, c, rng)
+		case p < 80 && len(w.live) > 0:
 			i := rng.IntN(len(w.live))
 			id := w.live[i]
 			st := w.docs[id]
@@ -351,6 +361,8 @@ func (w *writerState) run(ctx context.Context, url string, round int, rng *mrand
 				w.live = append(w.live[:i], w.live[i+1:]...)
 				w.ops["delete"]++
 			}
+		case p < 85 && len(w.live) > 1:
+			err = w.deleteBatch(ctx, c, rng)
 		default:
 			// Conditional increment of this writer's counter.
 			w.counterPending = true
@@ -373,10 +385,190 @@ func (w *writerState) run(ctx context.Context, url string, round int, rng *mrand
 	return nil
 }
 
+// pickLive returns n distinct ids from w.live (2 <= n <= len(w.live)),
+// with their positions in w.live.
+func (w *writerState) pickLive(rng *mrand.Rand, n int) ([]string, []int) {
+	perm := rng.Perm(len(w.live))[:n]
+	ids := make([]string, n)
+	for i, j := range perm {
+		ids[i] = w.live[j]
+	}
+	return ids, perm
+}
+
+// removeLive removes the ids from w.live.
+func (w *writerState) removeLive(ids []string) {
+	gone := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		gone[id] = true
+	}
+	kept := w.live[:0]
+	for _, id := range w.live {
+		if !gone[id] {
+			kept = append(kept, id)
+		}
+	}
+	w.live = kept
+}
+
+// nextBatch returns a new batch name for docState.batch.
+func (w *writerState) nextBatch(kind string) string {
+	w.batches++
+	return fmt.Sprintf("w%d-%s-%d", w.id, kind, w.batches)
+}
+
+// insertBatch inserts 2 to 5 new documents with one insert_documents call
+// (one atomic batch WAL record).
+func (w *writerState) insertBatch(ctx context.Context, c *client, round int, rng *mrand.Rand) error {
+	n := 2 + rng.IntN(4)
+	batch := w.nextBatch("insert")
+	docs := make([]map[string]any, n)
+	ids := make([]string, n)
+	states := make([]*docState, n)
+	for i := range docs {
+		w.seq++
+		ids[i] = fmt.Sprintf("r%03d-w%d-%05d", round, w.id, w.seq)
+		docs[i] = normalize(map[string]any{"_id": ids[i], "w": w.id, "round": round, "seq": w.seq, "batch": batch, "payload": randHex(32 + rng.IntN(64))})
+		states[i] = &docState{hasPending: true, pending: docs[i], batch: batch}
+		w.docs[ids[i]] = states[i]
+	}
+	var out struct {
+		IDs      []string `json:"ids"`
+		Inserted int      `json:"inserted"`
+	}
+	if err := c.call(ctx, "insert_documents", map[string]any{"collection": docsColl, "documents": docs}, &out); err != nil {
+		return err
+	}
+	if out.Inserted != n || !reflect.DeepEqual(out.IDs, ids) {
+		return fmt.Errorf("insert_documents %s: inserted %d, ids %v; want %d, %v", batch, out.Inserted, out.IDs, n, ids)
+	}
+	for i, st := range states {
+		st.acked, st.hasPending, st.pending, st.batch = docs[i], false, nil, ""
+	}
+	w.live = append(w.live, ids...)
+	w.ops["insert_documents"]++
+	return nil
+}
+
+// updateBatch updates 2 to 4 live documents with one update_documents call
+// by _id: a field set and an inc operator.
+func (w *writerState) updateBatch(ctx context.Context, c *client, rng *mrand.Rand) error {
+	ids, _ := w.pickLive(rng, min(2+rng.IntN(3), len(w.live)))
+	batch := w.nextBatch("update")
+	v := rng.IntN(1000)
+	payload := randHex(24)
+	nexts := make([]map[string]any, len(ids))
+	for i, id := range ids {
+		st := w.docs[id]
+		next := normalize(st.acked)
+		next["v"] = v
+		next["payload"] = payload
+		hits, _ := next["hits"].(float64) // a missing field starts at 0
+		next["hits"] = hits + 1
+		nexts[i] = normalize(next)
+		st.hasPending, st.pending, st.batch = true, nexts[i], batch
+	}
+	var out struct {
+		Matched  int `json:"matched"`
+		Modified int `json:"modified"`
+	}
+	err := c.call(ctx, "update_documents", map[string]any{"collection": docsColl,
+		"query":   map[string]any{"filters": []map[string]any{{"field": "_id", "operator": "in", "value": ids}}},
+		"updates": map[string]any{"v": v, "payload": payload},
+		"inc":     map[string]any{"hits": 1}}, &out)
+	if err != nil {
+		return err
+	}
+	if out.Matched != len(ids) || out.Modified != len(ids) {
+		return fmt.Errorf("update_documents %s: matched %d, modified %d; want %d", batch, out.Matched, out.Modified, len(ids))
+	}
+	for i, id := range ids {
+		st := w.docs[id]
+		st.acked, st.hasPending, st.pending, st.batch = nexts[i], false, nil, ""
+	}
+	w.ops["update_documents"]++
+	return nil
+}
+
+// deleteBatch deletes 2 to 3 live documents with one delete_documents call
+// by _id.
+func (w *writerState) deleteBatch(ctx context.Context, c *client, rng *mrand.Rand) error {
+	ids, _ := w.pickLive(rng, min(2+rng.IntN(2), len(w.live)))
+	batch := w.nextBatch("delete")
+	for _, id := range ids {
+		st := w.docs[id]
+		st.hasPending, st.pending, st.batch = true, nil, batch
+	}
+	var out struct {
+		Matched int `json:"matched"`
+		Deleted int `json:"deleted"`
+	}
+	err := c.call(ctx, "delete_documents", map[string]any{"collection": docsColl,
+		"query": map[string]any{"filters": []map[string]any{{"field": "_id", "operator": "in", "value": ids}}}}, &out)
+	if err != nil {
+		return err
+	}
+	if out.Matched != len(ids) || out.Deleted != len(ids) {
+		return fmt.Errorf("delete_documents %s: matched %d, deleted %d; want %d", batch, out.Matched, out.Deleted, len(ids))
+	}
+	for _, id := range ids {
+		st := w.docs[id]
+		st.acked, st.hasPending, st.batch = nil, false, ""
+	}
+	w.removeLive(ids)
+	w.ops["delete_documents"]++
+	return nil
+}
+
 // ---- verification ----
 
 type findOutput struct {
 	Documents []map[string]any `json:"documents"`
+	HasMore   bool             `json:"has_more"`
+	NextSkip  int              `json:"next_skip"`
+}
+
+// findAll reads every document find_documents args matches, a page at a
+// time: it follows has_more and next_skip (limit 0 means the server's
+// default limit). It fails the test if next_skip does not continue right
+// after the page, or a document comes back twice.
+func findAll(t *testing.T, ctx context.Context, c *client, args map[string]any, limit int) []map[string]any {
+	t.Helper()
+	var all []map[string]any
+	seen := map[string]bool{}
+	skip := 0
+	for page := 0; ; page++ {
+		query := map[string]any{"skip": skip}
+		if limit > 0 {
+			query["limit"] = limit
+		}
+		call := map[string]any{"query": query}
+		for k, v := range args {
+			call[k] = v
+		}
+		var out findOutput
+		if err := c.call(ctx, "find_documents", call, &out); err != nil {
+			t.Fatalf("find_documents %v (page %d): %v", args, page, err)
+		}
+		if limit > 0 && len(out.Documents) > limit {
+			t.Fatalf("find_documents %v: page %d has %d documents, limit %d", args, page, len(out.Documents), limit)
+		}
+		for _, d := range out.Documents {
+			id, _ := d["_id"].(string)
+			if seen[id] {
+				t.Fatalf("find_documents %v: document %s returned twice while paging", args, id)
+			}
+			seen[id] = true
+		}
+		all = append(all, out.Documents...)
+		if !out.HasMore {
+			return all
+		}
+		if len(out.Documents) == 0 || out.NextSkip != skip+len(out.Documents) {
+			t.Fatalf("find_documents %v: page %d at skip %d returned %d documents, has_more with next_skip %d", args, page, skip, len(out.Documents), out.NextSkip)
+		}
+		skip = out.NextSkip
+	}
 }
 
 type countOutput struct {
@@ -384,8 +576,10 @@ type countOutput struct {
 }
 
 // verify checks the restarted server against every writer's
-// acknowledged state, then resolves in-flight writes to what landed.
-func verify(t *testing.T, ctx context.Context, url string, ws []*writerState) {
+// acknowledged state, then resolves in-flight writes to what landed. It
+// returns how many in-flight batch calls it checked for atomicity and how
+// many of those landed.
+func verify(t *testing.T, ctx context.Context, url string, ws []*writerState) (batches, batchesLanded int) {
 	t.Helper()
 	c, err := connect(ctx, url)
 	if err != nil {
@@ -411,27 +605,26 @@ func verify(t *testing.T, ctx context.Context, url string, ws []*writerState) {
 			if err := c.call(ctx, "describe_collection", map[string]any{"database": d, "collection": coll}, nil); err != nil {
 				t.Errorf("describe_collection %s/%s: %v", d, coll, err)
 			}
-			var all findOutput
+			// Pages of the server's default size (limit omitted).
+			all := findAll(t, ctx, c, map[string]any{"database": d, "collection": coll}, 0)
 			var n countOutput
-			if err := c.call(ctx, "find_documents", map[string]any{"database": d, "collection": coll}, &all); err != nil {
-				t.Fatalf("find_documents %s/%s: %v", d, coll, err)
-			}
 			if err := c.call(ctx, "count_documents", map[string]any{"database": d, "collection": coll}, &n); err != nil {
 				t.Fatalf("count_documents %s/%s: %v", d, coll, err)
 			}
-			if n.Count != len(all.Documents) {
-				t.Errorf("%s/%s: count_documents %d, a scan finds %d", d, coll, n.Count, len(all.Documents))
+			if n.Count != len(all) {
+				t.Errorf("%s/%s: count_documents %d, a scan finds %d", d, coll, n.Count, len(all))
 			}
 		}
 	}
 
-	var all findOutput
-	if err := c.call(ctx, "find_documents", map[string]any{"collection": docsColl}, &all); err != nil {
-		t.Fatalf("find_documents: %v", err)
-	}
-	stored := make(map[string]map[string]any, len(all.Documents))
+	// Pages of an explicit, odd size.
+	all := findAll(t, ctx, c, map[string]any{"collection": docsColl}, 37)
+	stored := make(map[string]map[string]any, len(all))
 	perWriter := map[float64]int{}
-	for _, d := range all.Documents {
+	// landed records, per batch, whether each of its pending writes
+	// landed: all or none may.
+	landed := map[string][]bool{}
+	for _, d := range all {
 		id, _ := d["_id"].(string)
 		stored[id] = d
 		if w, ok := d["w"].(float64); ok {
@@ -454,8 +647,14 @@ func verify(t *testing.T, ctx context.Context, url string, ws []*writerState) {
 			switch {
 			case reflect.DeepEqual(got, st.acked) && present == (st.acked != nil):
 				// the acknowledged version
+				if st.hasPending && st.batch != "" {
+					landed[st.batch] = append(landed[st.batch], false)
+				}
 			case st.hasPending && reflect.DeepEqual(got, st.pending) && present == (st.pending != nil):
 				st.acked = st.pending // the in-flight write landed
+				if st.batch != "" {
+					landed[st.batch] = append(landed[st.batch], true)
+				}
 			case st.acked == nil && st.hasPending:
 				t.Errorf("document %s: stored %v, want absent or the in-flight %v", id, got, st.pending)
 			case st.acked == nil:
@@ -463,11 +662,12 @@ func verify(t *testing.T, ctx context.Context, url string, ws []*writerState) {
 			default:
 				t.Errorf("LOST ACKNOWLEDGED WRITE: document %s: stored %v (present %v), want %v (or in-flight %v)", id, got, present, st.acked, st.pending)
 			}
-			st.hasPending, st.pending = false, nil
+			st.hasPending, st.pending, st.batch = false, nil, ""
 			if st.acked != nil {
 				w.live = append(w.live, id)
 			}
 		}
+		slices.Sort(w.live) // map order is random; keep the next round reproducible from its seed
 
 		var ctr findOutput
 		if err := c.call(ctx, "find_documents", map[string]any{"collection": countersColl,
@@ -487,6 +687,15 @@ func verify(t *testing.T, ctx context.Context, url string, ws []*writerState) {
 		}
 		w.counterPending = false
 	}
+	for batch, l := range landed {
+		if slices.Contains(l, true) && slices.Contains(l, false) {
+			t.Errorf("BATCH NOT ATOMIC: %s: of its in-flight writes, some landed and some did not: %v", batch, l)
+		}
+		batches++
+		if slices.Contains(l, true) {
+			batchesLanded++
+		}
+	}
 	for id := range stored {
 		known := false
 		for _, w := range ws {
@@ -498,6 +707,7 @@ func verify(t *testing.T, ctx context.Context, url string, ws []*writerState) {
 			t.Errorf("document %s is stored but was never written", id)
 		}
 	}
+	return batches, batchesLanded
 }
 
 // ---- the test ----
@@ -565,6 +775,7 @@ func TestKillRecovery(t *testing.T) {
 	}()
 
 	cleanStops, kills, replayedAfterKill := 0, 0, 0
+	inFlightBatches, inFlightBatchesLanded := 0, 0 // batch calls cut by a stop, checked by verify
 	prevClean := false
 	for round := 1; round <= rounds && !t.Failed(); round++ {
 		if round > 1 {
@@ -576,7 +787,9 @@ func TestKillRecovery(t *testing.T) {
 			if !prevClean && replayed {
 				replayedAfterKill++
 			}
-			verify(t, ctx, srv.url, ws)
+			b, bl := verify(t, ctx, srv.url, ws)
+			inFlightBatches += b
+			inFlightBatchesLanded += bl
 			if t.Failed() {
 				break
 			}
@@ -623,7 +836,9 @@ func TestKillRecovery(t *testing.T) {
 	// Final restart and check, then a clean stop.
 	if !t.Failed() {
 		srv = startServer(t, bin, dir, logs, rounds+1, freePort(t))
-		verify(t, ctx, srv.url, ws)
+		b, bl := verify(t, ctx, srv.url, ws)
+		inFlightBatches += b
+		inFlightBatchesLanded += bl
 		srv.stop(t, syscall.SIGTERM)
 		if srv.waitErr != nil {
 			t.Errorf("final clean stop exited with %v", srv.waitErr)
@@ -646,4 +861,14 @@ func TestKillRecovery(t *testing.T) {
 		fmt.Fprintf(&b, " w%d=%v", w.id, w.counter)
 	}
 	t.Logf("counters:%s", b.String())
+	t.Logf("%d in-flight batch calls checked for atomicity (%d landed, %d did not)",
+		inFlightBatches, inFlightBatchesLanded, inFlightBatches-inFlightBatchesLanded)
+	// F-050: the run exercised every batch write tool.
+	if !t.Failed() {
+		for _, op := range []string{"insert_documents", "update_documents", "delete_documents"} {
+			if total[op] == 0 {
+				t.Errorf("no %s call was acknowledged over %d rounds; the batch writes were not exercised", op, rounds)
+			}
+		}
+	}
 }

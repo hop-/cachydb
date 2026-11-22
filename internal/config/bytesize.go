@@ -14,8 +14,8 @@ import (
 // case-insensitive and a fractional number ("1.5GiB") is allowed as long
 // as the result is a whole, non-negative number of bytes.
 //
-// ByteSize implements envconfig.Decoder (env vars) and pflag.Value
-// (command-line flags).
+// ParseByteSize reads the environment variables; ByteSize implements
+// pflag.Value for the command-line flags.
 type ByteSize int64
 
 // Binary size units.
@@ -53,8 +53,8 @@ func ParseByteSize(s string) (ByteSize, error) {
 
 	num, mult := lower, int64(1)
 	for _, u := range byteUnits {
-		if strings.HasSuffix(lower, u.suffix) {
-			num, mult = strings.TrimSpace(strings.TrimSuffix(lower, u.suffix)), u.mult
+		if before, ok := strings.CutSuffix(lower, u.suffix); ok {
+			num, mult = strings.TrimSpace(before), u.mult
 			break
 		}
 	}
@@ -106,7 +106,8 @@ func (b ByteSize) String() string {
 	return strconv.FormatInt(int64(b), 10) + "B"
 }
 
-// Decode implements envconfig.Decoder.
+// Decode sets b from value, like Set. It was the envconfig decoder hook
+// and has no caller outside the tests now.
 func (b *ByteSize) Decode(value string) error {
 	return b.Set(value)
 }

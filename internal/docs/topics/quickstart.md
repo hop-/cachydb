@@ -49,6 +49,14 @@ insert_document {"collection": "products", "document": {"_id": "p1", "name": "Pe
 insert_document {"collection": "products", "document": {"name": "Book", "price": 12}}
 ```
 
+Insert many at once with `insert_documents`: all of them, or none if
+one fails. Read one by id with `get_document`:
+
+```json
+insert_documents {"collection": "products", "documents": [{"_id": "p2", "name": "Ink", "price": 4}, {"name": "Pad", "price": 6}]}
+get_document {"collection": "products", "id": "p2"}
+```
+
 Query. Filters go inside `query.filters`; results are sorted by `_id`
 unless `sort` is given, and `fields` limits what comes back:
 
@@ -62,22 +70,44 @@ find_documents {"collection": "products", "query": {"filters": [{"field": "name"
 count_documents {"collection": "products"}
 ```
 
+One call returns at most 100 documents (and 1 MiB) unless you pass a
+`limit` or the server is configured otherwise. When the result has
+`"has_more": true`, repeat the call with `"skip"` set to its `next_skip`:
+
+```json
+find_documents {"collection": "products", "query": {"skip": 100}}
+```
+
 Update merges top-level fields (`unset` removes some; `{"$now": true}` is
-the server time); `if` makes it conditional; delete removes a document:
+the server time); `if` makes it conditional; `inc`, `push`,
+`add_to_set`, and `pull` change a number or an array in place (see
+`cachydb docs query`); delete removes a document:
 
 ```json
 update_document {"collection": "products", "id": "p1", "updates": {"price": 3, "updated": {"$now": true}}, "unset": ["draft"]}
 update_document {"collection": "products", "id": "p1", "updates": {"price": 4}, "if": [{"field": "price", "operator": "eq", "value": 3}]}
 update_document {"collection": "products", "id": "p9", "updates": {"name": "Ink"}, "upsert": true}
+update_document {"collection": "products", "id": "p1", "inc": {"stock": -1}, "add_to_set": {"tags": "sale"}}
 delete_document {"collection": "products", "id": "p1"}
 ```
 
-Speed up equality and tag (`has`) lookups with an index; inspect the
-collection:
+Change or delete every match in one atomic call. An empty query is
+rejected unless you pass `"all": true`:
+
+```json
+update_documents {"collection": "products", "query": {"filters": [{"field": "price", "operator": "gt", "value": 5}]}, "updates": {"sale": true}}
+delete_documents {"collection": "products", "query": {"filters": [{"field": "sale", "operator": "eq", "value": true}]}}
+```
+
+Speed up lookups, ranges, and sorts on a field with an index (`unique`
+also rejects a second document with the same value); inspect the
+collection and the sizes of what you can read:
 
 ```json
 create_index {"collection": "products", "index_name": "by_name", "field_name": "name"}
+create_index {"collection": "products", "index_name": "by_sku", "field_name": "sku", "unique": true}
 describe_collection {"collection": "products"}
+server_stats {}
 ```
 
 ## 3. Inspect from the command line
@@ -95,6 +125,7 @@ With the server stopped (utility commands take the data-directory lock):
 cachydb utils list -c -R /path/to/data   # databases, collections, document counts
 cachydb utils find -d shop -c products -R /path/to/data
 cachydb utils export -o backup.jsonl -R /path/to/data
+cachydb utils import -i seed.jsonl --on-conflict keep -R /path/to/data   # seed: create only what is missing
 ```
 
 ## Next

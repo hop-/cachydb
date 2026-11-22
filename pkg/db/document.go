@@ -5,14 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"slices"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
+	"uuid"
 
 	"github.com/hop-/cachydb/pkg/db/internal/cache"
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
 	"github.com/hop-/cachydb/pkg/db/internal/segment"
 	"github.com/hop-/cachydb/pkg/db/internal/wal"
 )
@@ -20,17 +19,29 @@ import (
 // Document write and read paths (§5.2, §5.3).
 //
 // Write: Database.mu (shared, held to the end) → docLock(id) → read the
-// current version → build and validate the after-image → register
-// inflight → WAL append (the commit point) → hookAfterWALSync → apply to
-// the memtable, indexes, cache, and count under Collection.mu.
+// current version → build and validate the after-image → lock and check
+// the new values of unique indexes (unique.go) → register inflight → WAL
+// append (the commit point) → hookAfterWALSync → apply to
+// the memtable (with the replaced version's index keys, memEntry.base),
+// cache, and count under Collection.mu. The secondary indexes in the index
+// file change with the flush.
 //
-// Read: memtable → flushing → cache → keydir + data segment. Documents
-// stored in the memtable and the cache are immutable; callers of the read
-// path get deep clones and never share memory with them.
+// Read: memtable → flushing → key table (a read transaction on the index
+// file) → cache or data segment. Documents stored in the memtable and the
+// cache are immutable; callers of the read path get deep clones and never
+// share memory with them.
+//
+// Snapshot rule (approach-index-and-query §5): a reader looks at the
+// overlay (memtable and flushing) under Collection.mu first and only then
+// starts its read transaction on the index file. The flusher clears
+// flushing only after its index transaction committed, so a change is
+// always in the overlay or in the transaction's snapshot, never in
+// neither. An id found in the overlay is answered from the overlay alone.
 
-// maxIDLen is the longest document id the WAL and segment formats can
-// store (u16 length prefix).
-const maxIDLen = math.MaxUint16
+// maxIDLen is the longest document id the engine stores: what an index
+// key in the index file can carry (idxstore.MaxIDLen). The WAL and segment
+// formats could hold up to 65,535 bytes.
+const maxIDLen = idxstore.MaxIDLen
 
 // maxReadRetries bounds how often a read restarts after the segment it was
 // about to read was retired (compaction moved the document meanwhile).
@@ -41,15 +52,29 @@ const maxReadRetries = 8
 const findCtxCheckEvery = 256
 
 // memEntryOverhead approximates the fixed memory cost of a memtable entry
-// beyond its id and encoded document, for the MemtableSize trigger.
+// beyond its id and document, for the MemtableSize trigger.
 const memEntryOverhead = 64
 
+// memEntrySize is the size a memtable entry for id with the encoded
+// after-image payload (nil for a tombstone) is charged, for MemtableSize
+// and MaxPendingBytes: the id, the payload bytes the entry keeps for the
+// flush, the decoded document (estimated at the payload's length, as
+// before the payload was kept), and the fixed overhead.
+func memEntrySize(id string, payload []byte) int64 {
+	return int64(len(id)+2*len(payload)) + memEntryOverhead
+}
+
 // errSegmentRetired reports that a data segment was retired between the
-// keydir lookup and the read; the caller looks the document up again.
+// key-table lookup and the read; the caller looks the document up again.
 var errSegmentRetired = errors.New("data segment retired")
 
-// docLock returns the stripe lock serializing writes to id (FNV-1a).
+// docLock returns the stripe lock serializing writes to id.
 func (c *Collection) docLock(id string) *sync.Mutex {
+	return &c.docLocks[docStripe(id)]
+}
+
+// docStripe returns the index of the stripe lock of id (FNV-1a).
+func docStripe(id string) int {
 	const (
 		offset32 = 2166136261
 		prime32  = 16777619
@@ -59,7 +84,7 @@ func (c *Collection) docLock(id string) *sync.Mutex {
 		h ^= uint32(id[i])
 		h *= prime32
 	}
-	return &c.docLocks[h%numDocLocks]
+	return int(h % numDocLocks)
 }
 
 func (c *Collection) cacheKey(id string) cache.Key {
@@ -67,34 +92,63 @@ func (c *Collection) cacheKey(id string) cache.Key {
 }
 
 // Insert adds doc and returns its id. An empty doc.ID gets a generated
-// UUID. It fails with ErrExists if a document with the id exists and with
-// ErrSchemaValidation if the document does not satisfy the collection's
-// schema or carries "_id" in its data. doc is not modified or retained.
+// UUID v7, so generated ids sort in creation order. It fails with
+// ErrExists if a document with the id exists and with ErrSchemaValidation
+// if the document does not satisfy the collection's schema or carries
+// "_id" in its data. doc is not modified or retained.
 func (c *Collection) Insert(ctx context.Context, doc *Document) (string, error) {
+	w, err := c.prepareInsert(doc, "", nowString(time.Now()))
+	if err != nil {
+		return "", err
+	}
+	if _, err := c.write(ctx, w.id, w.build); err != nil {
+		return "", err
+	}
+	return w.id, nil
+}
+
+// docWrite is one prepared document write: the id it changes and the build
+// callback of write. Insert, UpdateWith, Replace, and DeleteWith prepare
+// one; Batch prepares one per operation, so both apply the same rules.
+type docWrite struct {
+	id    string
+	build func(cur *Document) (*Document, error)
+	// upserted is set by build when an update created the document.
+	upserted bool
+	// skipped is set by writeBatch when build returned errSkipWrite.
+	skipped bool
+}
+
+// prepareInsert checks an insert of doc and returns its write. id, when
+// not empty, is the id to use (doc.ID must then be empty or the same);
+// otherwise doc.ID is used, and an empty one gets a generated UUID v7. $now
+// values resolve to ts.
+func (c *Collection) prepareInsert(doc *Document, id, ts string) (*docWrite, error) {
 	if doc == nil {
-		return "", errors.New("inserting document: document is nil")
+		return nil, errors.New("inserting document: document is nil")
 	}
 	if _, ok := doc.Data["_id"]; ok {
-		return "", fmt.Errorf("%w: inserting document: field \"_id\" in data is reserved; set Document.ID", ErrSchemaValidation)
+		return nil, fmt.Errorf("%w: inserting document: field \"_id\" in data is reserved; set Document.ID", ErrSchemaValidation)
 	}
-	id := doc.ID
+	switch {
+	case id == "":
+		id = doc.ID
+	case doc.ID != "" && doc.ID != id:
+		return nil, fmt.Errorf("%w: inserting document %q: the document has a different _id %q", ErrSchemaValidation, id, doc.ID)
+	}
 	if id == "" {
-		id = uuid.NewString()
+		id = uuid.NewV7().String()
 	}
 	if len(id) > maxIDLen {
-		return "", fmt.Errorf("inserting document: id is %d bytes, max %d", len(id), maxIDLen)
+		return nil, invalidArgf("inserting document: id is %d bytes, max %d", len(id), maxIDLen)
 	}
-	data := resolveNowData(doc.Data, nowString(time.Now()))
-	_, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
+	data := resolveNowData(doc.Data, ts)
+	return &docWrite{id: id, build: func(cur *Document) (*Document, error) {
 		if cur != nil {
 			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrExists)
 		}
 		return &Document{ID: id, Data: data}, nil
-	})
-	if err != nil {
-		return "", err
-	}
-	return id, nil
+	}}, nil
 }
 
 // Get returns a copy of the document id (ErrNotFound if absent).
@@ -138,31 +192,53 @@ func (c *Collection) Update(ctx context.Context, id string, set map[string]any) 
 // with ErrConditionFailed and writes nothing. A missing document fails
 // with ErrConditionFailed if u.If is not empty, is created as {_id: id} +
 // u.Set if u.Upsert (upserted is then true), and fails with ErrNotFound
-// otherwise. $now values in u.Set and u.If are resolved once. It fails
-// with ErrSchemaValidation if u.Set or u.Unset names "_id", a field is in
-// both, or the result does not satisfy the schema.
+// otherwise. The operators of u (Inc, Push, AddToSet, Pull) apply after
+// Set and Unset, also to an upserted document; one applied to a field of
+// the wrong type fails with ErrInvalidUpdate. $now values in u.Set, the
+// operators, and u.If are resolved once. It fails with ErrSchemaValidation
+// if u.Set or u.Unset names "_id", a field is in both, or the result does
+// not satisfy the schema, and with ErrInvalidUpdate if an operator names
+// "_id" or a field another part of u names, or an Inc value is not a
+// number.
 func (c *Collection) UpdateWith(ctx context.Context, id string, u UpdateSpec) (doc *Document, upserted bool, err error) {
-	if _, ok := u.Set["_id"]; ok {
-		return nil, false, fmt.Errorf("%w: updating document %q: field \"_id\" cannot be changed", ErrSchemaValidation, id)
+	w, err := c.prepareUpdate(id, u, nil, nowString(time.Now()))
+	if err != nil {
+		return nil, false, err
 	}
-	for _, f := range u.Unset {
-		if f == "_id" {
-			return nil, false, fmt.Errorf("%w: updating document %q: field \"_id\" cannot be unset", ErrSchemaValidation, id)
-		}
-		if _, ok := u.Set[f]; ok {
-			return nil, false, fmt.Errorf("%w: updating document %q: field %q in both updates and unset", ErrSchemaValidation, id, f)
-		}
+	next, err := c.write(ctx, id, w.build)
+	if err != nil {
+		return nil, false, err
+	}
+	return next.Clone(), w.upserted, nil
+}
+
+// prepareUpdate checks the update u of the document id and returns its
+// write. extra holds more filters the stored version must match, besides
+// u.If. $now values resolve to ts.
+func (c *Collection) prepareUpdate(id string, u UpdateSpec, extra Condition, ts string) (*docWrite, error) {
+	if p := updateFieldsProblem(u); p != "" {
+		return nil, fmt.Errorf("%w: updating document %q: %s", ErrSchemaValidation, id, p)
+	}
+	if err := checkUpdateOps(&u, fmt.Sprintf("updating document %q", id)); err != nil {
+		return nil, err
 	}
 	if u.Upsert {
 		if err := checkDocID(id); err != nil {
-			return nil, false, fmt.Errorf("upserting document: %w", err)
+			return nil, fmt.Errorf("upserting document: %w", err)
 		}
 	}
-	ts := nowString(time.Now())
-	set := resolveNowData(u.Set, ts)
-	cond := resolveNowFilters(u.If, ts)
-	next, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
-		upserted = false
+	ru := resolveNowUpdate(u, ts)
+	filters := u.If
+	if len(extra) > 0 {
+		filters = slices.Concat(extra, u.If)
+	}
+	cond, err := compileFilters(resolveNowFilters(filters, ts))
+	if err != nil {
+		return nil, fmt.Errorf("updating document %q: if: %w", id, err)
+	}
+	w := &docWrite{id: id}
+	w.build = func(cur *Document) (*Document, error) {
+		w.upserted = false
 		if err := c.checkCondition(id, cur, cond); err != nil {
 			return nil, err
 		}
@@ -170,28 +246,33 @@ func (c *Collection) UpdateWith(ctx context.Context, id string, u UpdateSpec) (d
 			if !u.Upsert {
 				return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
 			}
-			upserted = true
-			return &Document{ID: id, Data: set}, nil
+			w.upserted = true
 		}
-		// A new top-level map: cur is shared (memtable) and must not
-		// change. Nested values are only read; write re-encodes the
-		// after-image into fresh values.
-		data := make(map[string]any, len(cur.Data)+len(set))
-		for k, v := range cur.Data {
-			data[k] = v
-		}
-		for k, v := range set {
-			data[k] = v
-		}
-		for _, k := range u.Unset {
-			delete(data, k)
+		data, err := applyUpdate(id, cur, &ru)
+		if err != nil {
+			return nil, err
 		}
 		return &Document{ID: id, Data: data}, nil
-	})
-	if err != nil {
-		return nil, false, err
 	}
-	return next.Clone(), upserted, nil
+	return w, nil
+}
+
+// updateFieldsProblem describes what is wrong with the fields u sets and
+// unsets ("" if nothing): "_id" cannot be set or unset, and no field may
+// be in both.
+func updateFieldsProblem(u UpdateSpec) string {
+	if _, ok := u.Set["_id"]; ok {
+		return `field "_id" cannot be changed`
+	}
+	for _, f := range u.Unset {
+		if f == "_id" {
+			return `field "_id" cannot be unset`
+		}
+		if _, ok := u.Set[f]; ok {
+			return fmt.Sprintf("field %q in both updates and unset", f)
+		}
+	}
+	return ""
 }
 
 // Replace atomically replaces the whole document id with doc and returns
@@ -202,6 +283,20 @@ func (c *Collection) UpdateWith(ctx context.Context, id string, u UpdateSpec) (d
 // its filters (ErrConditionFailed otherwise). $now values are resolved;
 // the result must satisfy the schema. doc is not modified or retained.
 func (c *Collection) Replace(ctx context.Context, id string, doc *Document, cond Condition) (*Document, error) {
+	w, err := c.prepareReplace(id, doc, cond, nowString(time.Now()))
+	if err != nil {
+		return nil, err
+	}
+	next, err := c.write(ctx, id, w.build)
+	if err != nil {
+		return nil, err
+	}
+	return next.Clone(), nil
+}
+
+// prepareReplace checks the replacement of the document id by doc under
+// cond and returns its write. $now values resolve to ts.
+func (c *Collection) prepareReplace(id string, doc *Document, cond Condition, ts string) (*docWrite, error) {
 	if doc == nil {
 		return nil, errors.New("replacing document: document is nil")
 	}
@@ -211,22 +306,20 @@ func (c *Collection) Replace(ctx context.Context, id string, doc *Document, cond
 	if _, ok := doc.Data["_id"]; ok {
 		return nil, fmt.Errorf("%w: replacing document %q: field \"_id\" in data is reserved; set Document.ID", ErrSchemaValidation, id)
 	}
-	ts := nowString(time.Now())
 	data := resolveNowData(doc.Data, ts)
-	cond = resolveNowFilters(cond, ts)
-	next, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
-		if err := c.checkCondition(id, cur, cond); err != nil {
+	ccond, err := compileFilters(resolveNowFilters(cond, ts))
+	if err != nil {
+		return nil, fmt.Errorf("replacing document %q: if: %w", id, err)
+	}
+	return &docWrite{id: id, build: func(cur *Document) (*Document, error) {
+		if err := c.checkCondition(id, cur, ccond); err != nil {
 			return nil, err
 		}
 		if cur == nil {
 			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
 		}
 		return &Document{ID: id, Data: data}, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return next.Clone(), nil
+	}}, nil
 }
 
 // Delete removes the document id (ErrNotFound if absent). It is
@@ -240,23 +333,36 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 // and the document does not match it or is absent, and with ErrNotFound
 // if cond is empty and the document is absent.
 func (c *Collection) DeleteWith(ctx context.Context, id string, cond Condition) error {
-	cond = resolveNowFilters(cond, nowString(time.Now()))
-	_, err := c.write(ctx, id, func(cur *Document) (*Document, error) {
-		if err := c.checkCondition(id, cur, cond); err != nil {
+	w, err := c.prepareDelete(id, cond, nowString(time.Now()))
+	if err != nil {
+		return err
+	}
+	_, err = c.write(ctx, id, w.build)
+	return err
+}
+
+// prepareDelete checks the deletion of the document id under cond and
+// returns its write. $now values resolve to ts.
+func (c *Collection) prepareDelete(id string, cond Condition, ts string) (*docWrite, error) {
+	ccond, err := compileFilters(resolveNowFilters(cond, ts))
+	if err != nil {
+		return nil, fmt.Errorf("deleting document %q: if: %w", id, err)
+	}
+	return &docWrite{id: id, build: func(cur *Document) (*Document, error) {
+		if err := c.checkCondition(id, cur, ccond); err != nil {
 			return nil, err
 		}
 		if cur == nil {
 			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, ErrNotFound)
 		}
 		return nil, nil
-	})
-	return err
+	}}, nil
 }
 
 // checkCondition returns ErrConditionFailed if cond is not empty and cur
 // (the stored version of id, nil if absent) does not match all of it.
-func (c *Collection) checkCondition(id string, cur *Document, cond Condition) error {
-	if len(cond) == 0 || (cur != nil && matchesAll(cur, cond)) {
+func (c *Collection) checkCondition(id string, cur *Document, cond []compiledFilter) error {
+	if len(cond) == 0 || (cur != nil && matchAll(cur, cond)) {
 		return nil
 	}
 	return fmt.Errorf("%w: document %s no longer matches if", ErrConditionFailed, id)
@@ -265,10 +371,10 @@ func (c *Collection) checkCondition(id string, cur *Document, cond Condition) er
 // checkDocID checks that id can be stored.
 func checkDocID(id string) error {
 	if id == "" {
-		return errors.New("document id must not be empty")
+		return invalidArgf("document id must not be empty")
 	}
 	if len(id) > maxIDLen {
-		return fmt.Errorf("id is %d bytes, max %d", len(id), maxIDLen)
+		return invalidArgf("id is %d bytes, max %d", len(id), maxIDLen)
 	}
 	return nil
 }
@@ -311,7 +417,7 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 	lk.Lock()
 	defer lk.Unlock()
 
-	cur, _, err := c.current(id)
+	cur, curOff, err := c.currentVersion(id)
 	if err != nil {
 		return nil, err
 	}
@@ -322,28 +428,28 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 
 	rec := wal.Record{Op: wal.OpDeleteDoc, DB: d.name, Coll: c.name, ID: id}
 	if next != nil {
-		// The WAL payload is the full after-image including _id (§3.1).
-		// The stored document is decoded from it, so it holds exactly
-		// what replay and segment reads will produce, and shares no
-		// memory with the caller's values.
-		payload, err := json.Marshal(&Document{ID: id, Data: next.Data})
-		if err != nil {
-			return nil, fmt.Errorf("encoding document %q: %w", id, err)
-		}
-		if next, err = decodeDocument(id, payload); err != nil {
+		var payload []byte
+		if payload, next, err = c.encodeAfterImage(id, next); err != nil {
 			return nil, err
 		}
-		if err := c.schema.ValidateDocument(next); err != nil {
-			// A *SchemaError, which wraps ErrSchemaValidation.
-			return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, err)
-		}
 		rec.Op, rec.Payload = wal.OpPutDoc, payload
+
+		// Unique indexes (unique.go): lock the new values' stripes (held
+		// until the write is applied, so across the WAL append) and check
+		// them against the overlay and the index file. No read transaction
+		// is open after checkUnique returns.
+		if vals := c.changedUniqueValues(cur, next); len(vals) > 0 {
+			unlock := c.lockUnique(vals)
+			defer unlock()
+			if err := c.checkUnique(id, vals); err != nil {
+				return nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, err)
+			}
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	size := int64(len(id)+len(rec.Payload)) + memEntryOverhead
 	lb := c.registerInflight()
 	off, err := e.appendWAL(context.WithoutCancel(ctx), rec) // commit point
 	if err != nil {
@@ -353,8 +459,33 @@ func (c *Collection) write(ctx context.Context, id string, build func(cur *Docum
 	if err := e.hook(hookAfterWALSync); err != nil {
 		return nil, err // simulated crash: no cleanup
 	}
-	c.apply(id, cur, next, off, lb, size)
+	// The index keys of the version this write replaces, for the flush
+	// (memEntry.base); computed outside mu. The index set cannot change:
+	// Database.mu is held shared.
+	c.apply(id, cur != nil, c.indexKeysAll(cur), curOff, next, rec.Payload, off, lb)
 	return next, nil
+}
+
+// encodeAfterImage encodes next, the after-image of id built by a write,
+// as its WAL payload: the full document including _id (§3.1). It returns
+// the payload and the document to store, decoded from the payload, so the
+// stored document holds exactly what replay and segment reads will produce
+// and shares no memory with the caller's values. It fails if the document
+// does not satisfy the collection's schema. Callers hold Database.mu.
+func (c *Collection) encodeAfterImage(id string, next *Document) ([]byte, *Document, error) {
+	payload, err := json.Marshal(&Document{ID: id, Data: next.Data})
+	if err != nil {
+		return nil, nil, fmt.Errorf("encoding document %q: %w", id, err)
+	}
+	stored, err := decodeDocument(id, payload)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := c.schema.ValidateDocument(stored); err != nil {
+		// A *SchemaError, which wraps ErrSchemaValidation.
+		return nil, nil, fmt.Errorf("document %q in collection %q: %w", id, c.name, err)
+	}
+	return payload, stored, nil
 }
 
 // registerInflight records that a document write is about to be appended
@@ -384,32 +515,39 @@ func (c *Collection) removeInflightLocked(lb uint64) {
 	}
 }
 
-// apply makes a durable write visible (§5.2 step 5). prev is the version
-// the write replaced (nil if none); next is the after-image (nil for a
-// delete); size is the entry's approximate size for the MemtableSize
-// flush trigger. Memory only.
-func (c *Collection) apply(id string, prev, next *Document, off, lb uint64, size int64) {
+// apply makes a durable write visible (§5.2 step 5). existed reports
+// whether the write replaced a live version; base and baseOff are that
+// version's index keys and WAL offset (nil and 0 if there was none); next
+// is the after-image (nil for a delete) and payload its encoding as written
+// to the WAL (nil for a delete), kept for the flush. Memory only.
+func (c *Collection) apply(id string, existed bool, base indexBase, baseOff uint64, next *Document, payload []byte, off, lb uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.removeInflightLocked(lb)
-	c.applyLocked(id, prev != nil, prev, next, off, size)
+	c.applyLocked(id, existed, base, baseOff, next, payload, off)
 }
 
 // applyLocked is apply without the inflight bookkeeping, shared with WAL
 // replay. existed reports whether a live version of id existed before the
-// write; prev is that version when the caller has it (needed only to
-// update the indexes, so replay passes nil when the collection has none).
-// Callers hold mu exclusively.
-func (c *Collection) applyLocked(id string, existed bool, prev, next *Document, off uint64, size int64) {
+// write (decided from the overlay first, then the key table). base and
+// baseOff describe the version the write replaced (see memEntry); they
+// are used only when id has no memtable entry yet, since an existing entry
+// keeps the base it captured first. payload is next's encoding (nil for a
+// delete); it is kept, not copied. Callers hold mu exclusively.
+func (c *Collection) applyLocked(id string, existed bool, base indexBase, baseOff uint64, next *Document, payload []byte, off uint64) {
 	me, ok := c.memtable[id]
 	if ok && me.walOffset >= off {
 		return // never happens under the doc lock; replay relies on the same rule
 	}
+	size := memEntrySize(id, payload)
 	delta := size
 	if ok {
 		c.memBytes -= me.size
 		delta -= me.size
+		base, baseOff = me.base, me.baseOff
+		c.replaceUniquePendingLocked(id, me.doc, next)
 	}
+	c.addUniquePendingLocked(id, next)
 	c.db.e.pending.add(delta)
 	// memMin stays a lower bound of the memtable's offsets: an overwritten
 	// entry may leave it lower than the true minimum, which only makes the
@@ -417,18 +555,10 @@ func (c *Collection) applyLocked(id string, existed bool, prev, next *Document, 
 	if len(c.memtable) == 0 || off < c.memMin {
 		c.memMin = off
 	}
-	c.memtable[id] = memEntry{doc: next, walOffset: off, size: size}
+	c.memtable[id] = memEntry{doc: next, payload: payload, walOffset: off, size: size, base: base, baseOff: baseOff}
 	c.memBytes += size
 	if c.memBytes > c.db.e.opts.MemtableSize {
 		c.db.e.kickFlush()
-	}
-	for _, ix := range c.indexes {
-		if prev != nil {
-			ix.remove(id, prev)
-		}
-		if next != nil {
-			ix.add(id, next)
-		}
 	}
 	c.db.e.cache.Invalidate(c.cacheKey(id))
 	switch {
@@ -440,40 +570,56 @@ func (c *Collection) applyLocked(id string, existed bool, prev, next *Document, 
 }
 
 // current returns the live version of id through the read path (§5.3):
-// memtable → flushing → cache → keydir + data segment. doc is nil when the
-// document does not exist. When owned is false, doc is shared with the
-// memtable or the cache and must be neither modified nor handed out
-// without a Clone; otherwise it is a private copy. (Every path currently
-// returns shared documents, so callers clone only what they hand out.)
+// memtable → flushing → key table → cache or data segment. doc is nil
+// when the document does not exist. When owned is false, doc is shared
+// with the memtable or the cache and must be neither modified nor handed
+// out without a Clone; otherwise it is a private copy. (Every path
+// currently returns shared documents, so callers clone only what they
+// hand out.)
 func (c *Collection) current(id string) (doc *Document, owned bool, err error) {
+	doc, _, err = c.currentVersion(id)
+	return doc, false, err
+}
+
+// currentVersion is current that also returns the WAL offset of the
+// version it found (0 when the document does not exist). The document is
+// shared, as current's with owned false.
+func (c *Collection) currentVersion(id string) (*Document, uint64, error) {
 	for attempt := 0; ; attempt++ {
+		// The overlay first, under mu; the read transaction only after it
+		// (the snapshot rule above).
 		c.mu.RLock()
 		if c.dropped {
 			c.mu.RUnlock()
-			return nil, false, c.errDropped()
+			return nil, 0, c.errDropped()
 		}
-		if me, ok := c.memtable[id]; ok {
-			c.mu.RUnlock()
-			return me.doc, false, nil
-		}
-		if me, ok := c.flushing[id]; ok {
-			c.mu.RUnlock()
-			return me.doc, false, nil
-		}
-		ke, ok := c.keydir[id]
-		c.mu.RUnlock()
+		me, ok := c.memtable[id]
 		if !ok {
-			return nil, false, nil
+			me, ok = c.flushing[id]
+		}
+		c.mu.RUnlock()
+		if ok {
+			if me.doc == nil {
+				return nil, 0, nil // deleted
+			}
+			return me.doc, me.walOffset, nil
 		}
 
+		ke, ok, err := c.storedEntry(id)
+		if err != nil {
+			return nil, 0, err
+		}
+		if !ok {
+			return nil, 0, nil
+		}
 		doc, err := c.readStored(id, ke)
 		if errors.Is(err, errSegmentRetired) && attempt < maxReadRetries {
 			continue // compaction moved it; look it up again
 		}
 		if err != nil {
-			return nil, false, err
+			return nil, 0, err
 		}
-		return doc, false, nil
+		return doc, ke.WALOffset, nil
 	}
 }
 
@@ -493,35 +639,47 @@ func newDocCache(maxBytes int64) *cache.LRU[cachedDoc] {
 	return cache.New(maxBytes, func(v cachedDoc) int64 { return v.size })
 }
 
-// readStored reads the version of id described by the keydir entry ke,
+// readStored reads the version of id described by the key-table entry ke,
 // from the cache or else from its data segment (and caches it). The
 // returned document is shared with the cache: it must be neither modified
 // nor handed out without a Clone.
-func (c *Collection) readStored(id string, ke keyEntry) (*Document, error) {
+func (c *Collection) readStored(id string, ke idxstore.Entry) (*Document, error) {
 	lru, key := c.db.e.cache, c.cacheKey(id)
-	if v, ok := lru.Get(key, ke.walOffset); ok {
+	if v, ok := lru.Get(key, ke.WALOffset); ok {
 		return v.doc, nil
 	}
 
-	r, err := c.acquireReader(ke.loc.Seg)
+	r, err := c.acquireReader(ke.Seg)
 	if err != nil {
 		return nil, err
 	}
-	rec, err := r.Read(ke.loc)
+	rec, err := r.Read(entryLocation(ke))
 	r.Release()
 	if err != nil {
 		return nil, fmt.Errorf("reading document %q of collection %q: %w", id, c.name, err)
 	}
-	if rec.Type != segment.TypePut || rec.ID != id || rec.WALOffset != ke.walOffset {
+	if rec.Type != segment.TypePut || rec.ID != id || rec.WALOffset != ke.WALOffset {
 		return nil, fmt.Errorf("reading document %q of collection %q: %w: record at segment %d byte %d is %s %q@%d, want put@%d",
-			id, c.name, segment.ErrCorrupt, ke.loc.Seg, ke.loc.Pos, rec.Type, rec.ID, rec.WALOffset, ke.walOffset)
+			id, c.name, segment.ErrCorrupt, ke.Seg, ke.Pos, rec.Type, rec.ID, rec.WALOffset, ke.WALOffset)
 	}
 	doc, err := decodeDocument(id, rec.Doc)
 	if err != nil {
 		return nil, err
 	}
-	lru.Put(key, ke.walOffset, cachedDoc{doc: doc, size: cachedDocSize(len(rec.Doc))})
+	lru.Put(key, ke.WALOffset, cachedDoc{doc: doc, size: cachedDocSize(len(rec.Doc))})
 	return doc, nil
+}
+
+// entryLocation returns the data-segment location a key-table entry
+// points at.
+func entryLocation(ke idxstore.Entry) segment.Location {
+	return segment.Location{Seg: ke.Seg, Pos: ke.Pos, Size: ke.Size}
+}
+
+// locationEntry returns the key-table entry for the record at loc written
+// by the change with WAL offset off.
+func locationEntry(loc segment.Location, off uint64) idxstore.Entry {
+	return idxstore.Entry{Seg: loc.Seg, Pos: loc.Pos, Size: loc.Size, WALOffset: off}
 }
 
 // acquireReader returns the reader of data segment seg with a reference
@@ -594,137 +752,92 @@ func decodeDocument(id string, data []byte) (*Document, error) {
 	return doc, nil
 }
 
-// candidates returns, sorted, the ids Find must examine for filters: the
-// smallest candidate set among eq filters on _id and the index-backed
-// filters on an indexed field (eq and has with an indexable value; has_any,
-// the union of its values' sets; has_all, their intersection), otherwise
-// every live id. Candidates are a superset of the matches: Find re-checks
-// every filter.
-func (c *Collection) candidates(filters []QueryFilter) ([]string, error) {
+// captureOverlay returns the overlay M of the snapshot rule (see the top
+// of this file): every id with a change that is not in the index file yet,
+// with its document (nil = deleted; the memtable wins over flushing), and
+// the index file to read after it. The documents are shared with the
+// memtable and immutable. A read transaction started on the returned store
+// after this call sees every change that is not in M.
+func (c *Collection) captureOverlay() (map[string]*Document, *idxstore.Store, error) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.dropped {
-		return nil, c.errDropped()
+	st, err := c.storeLocked()
+	var overlay map[string]*Document
+	if err == nil {
+		overlay = c.overlayLocked()
 	}
-	if ids, ok := c.indexedCandidatesLocked(filters); ok {
-		return ids, nil
-	}
-	return c.liveIDsLocked(), nil
-}
-
-// indexedCandidatesLocked returns the smallest index-backed candidate set
-// for filters (see candidates), or false if no filter can use an index.
-// Callers hold mu.
-func (c *Collection) indexedCandidatesLocked(filters []QueryFilter) ([]string, bool) {
-	var best []string
-	found := false
-	for _, f := range filters {
-		ids, ok := c.filterCandidatesLocked(f)
-		if ok && (!found || len(ids) < len(best)) {
-			best, found = ids, true
-		}
-	}
-	return best, found
-}
-
-// filterCandidatesLocked returns the sorted ids that may match f through
-// the primary key or a secondary index, or false if f cannot use one.
-// Callers hold mu.
-func (c *Collection) filterCandidatesLocked(f QueryFilter) ([]string, bool) {
-	if f.Field == "_id" {
-		if f.Operator != "eq" {
-			return nil, false
-		}
-		// The keydir/memtable are the primary index. A non-string value
-		// equals no id.
-		if s, ok := f.Value.(string); ok {
-			return []string{s}, true
-		}
-		return nil, true
-	}
-	switch f.Operator {
-	case "eq", "has", "has_any", "has_all":
-	default:
-		return nil, false
-	}
-	ix := c.indexOnLocked(f.Field)
-	if ix == nil {
-		return nil, false
-	}
-	switch f.Operator {
-	case "has_any":
-		vals, ok := listValues(f.Value)
-		if !ok {
-			return nil, true // matches nothing
-		}
-		return ix.lookupAny(vals)
-	case "has_all":
-		vals, ok := listValues(f.Value)
-		if !ok {
-			return nil, true // matches nothing
-		}
-		return ix.lookupAll(vals)
-	default: // eq, has
-		if _, ok := indexKey(f.Value); !ok {
-			return nil, false // objects/arrays/NaN: not indexed, scan
-		}
-		return ix.lookup(f.Value), true
-	}
-}
-
-// indexOnLocked returns an index on field (the one with the smallest name
-// if there are several), or nil. Callers hold mu.
-func (c *Collection) indexOnLocked(field string) *index {
-	var best *index
-	for _, ix := range c.indexes {
-		if ix.field == field && (best == nil || ix.name < best.name) {
-			best = ix
-		}
-	}
-	return best
-}
-
-// liveIDsLocked returns every live id, sorted: keydir ∪ flushing ∪
-// memtable, newer layers overriding older ones (tombstones remove).
-// Callers hold mu.
-func (c *Collection) liveIDsLocked() []string {
-	set := make(map[string]struct{}, len(c.keydir)+len(c.memtable))
-	for id := range c.keydir {
-		set[id] = struct{}{}
-	}
-	for _, layer := range []map[string]memEntry{c.flushing, c.memtable} {
-		for id, me := range layer {
-			if me.doc == nil {
-				delete(set, id)
-			} else {
-				set[id] = struct{}{}
-			}
-		}
-	}
-	return sortedIDs(set)
-}
-
-// buildIndex builds the index name on field from every live document.
-// Callers hold Database.mu exclusively, so no document write runs.
-func (c *Collection) buildIndex(ctx context.Context, name, field string) (*index, error) {
-	c.mu.RLock()
-	ids := c.liveIDsLocked()
 	c.mu.RUnlock()
-
-	ix := newIndex(name, field)
-	for i, id := range ids {
-		if i%findCtxCheckEvery == 0 {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-		}
-		doc, _, err := c.current(id)
-		if err != nil {
-			return nil, err
-		}
-		if doc != nil {
-			ix.add(id, doc)
+	if err != nil {
+		return nil, nil, err
+	}
+	if st == nil {
+		// A renamed collection opening its file on first use: still after
+		// the overlay was captured.
+		if st, err = c.openStoreOnUse(); err != nil {
+			return nil, nil, err
 		}
 	}
-	return ix, nil
+	return overlay, st, nil
+}
+
+// overlayLocked returns the overlay: every id of the memtable and
+// flushing with its document (nil = deleted; the memtable wins), or nil
+// when both are empty. Callers hold mu.
+func (c *Collection) overlayLocked() map[string]*Document {
+	n := len(c.memtable) + len(c.flushing)
+	if n == 0 {
+		return nil
+	}
+	overlay := make(map[string]*Document, n)
+	for id, me := range c.flushing {
+		overlay[id] = me.doc
+	}
+	for id, me := range c.memtable {
+		overlay[id] = me.doc
+	}
+	return overlay
+}
+
+// liveIDs returns every live id in ascending order: an ordered walk of
+// the key table merged with the overlay, whose entries override the key
+// table's (a deleted id is left out, a new one added in its place).
+// Callers hold no collection lock.
+func (c *Collection) liveIDs() ([]string, error) {
+	overlay, st, err := c.captureOverlay()
+	if err != nil {
+		return nil, err
+	}
+	added := make([]string, 0, len(overlay)) // the overlay's live ids, ascending
+	for id, doc := range overlay {
+		if doc != nil {
+			added = append(added, id)
+		}
+	}
+	slices.Sort(added)
+
+	var ids []string
+	err = st.View(func(tx *idxstore.Tx) error {
+		n, err := tx.Count()
+		if err != nil {
+			return err
+		}
+		ids = make([]string, 0, int(n)+len(added))
+		next := 0 // added[next:] is not merged yet
+		cur := tx.KeyCursor()
+		for k, _, ok := cur.First(); ok; k, _, ok = cur.Next() {
+			for next < len(added) && added[next] < string(k) {
+				ids = append(ids, added[next])
+				next++
+			}
+			if _, changed := overlay[string(k)]; changed {
+				continue // the overlay decides: merged from added, or deleted
+			}
+			ids = append(ids, string(k))
+		}
+		ids = append(ids, added[next:]...)
+		return cur.Err()
+	})
+	if err != nil {
+		return nil, c.storeErr(err)
+	}
+	return ids, nil
 }

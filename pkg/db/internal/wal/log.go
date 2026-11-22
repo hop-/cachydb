@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -281,8 +282,7 @@ func (l *Log) scanSegment(f *os.File, path string, newest bool, expected *uint64
 		if err == io.EOF {
 			return size, nil
 		}
-		var re *recordError
-		if errors.As(err, &re) {
+		if re, ok := errors.AsType[*recordError](err); ok {
 			if newest {
 				torn, err := isTornTail(f, re, size)
 				if err != nil {
@@ -581,10 +581,7 @@ func (l *Log) ReadFrom(from uint64, fn func(Record) error) error {
 	if len(segs) == 0 {
 		return fmt.Errorf("%w: no segments in %s", ErrCorrupt, l.dir)
 	}
-	i := sort.Search(len(segs), func(i int) bool { return segs[i].start > from }) - 1
-	if i < 0 {
-		i = 0
-	}
+	i := max(sort.Search(len(segs), func(i int) bool { return segs[i].start > from })-1, 0)
 	expected := segs[i].start
 	for ; i < len(segs) && expected < limit; i++ {
 		s := segs[i]
@@ -635,8 +632,7 @@ func readSegment(path string, from, limit uint64, expected *uint64, fn func(Reco
 		if err == io.EOF {
 			return nil
 		}
-		var re *recordError
-		if errors.As(err, &re) {
+		if re, ok := errors.AsType[*recordError](err); ok {
 			return corruptErr(path, re.pos, re.reason)
 		}
 		if err != nil {
@@ -653,4 +649,25 @@ func readSegment(path string, from, limit uint64, expected *uint64, fn func(Reco
 		}
 	}
 	return nil
+}
+
+// Size returns the total size in bytes of the WAL segment files in the
+// log's directory. A segment retention removes meanwhile is not counted.
+func (l *Log) Size() (int64, error) {
+	segs, err := listSegments(l.dir)
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, s := range segs {
+		fi, err := os.Stat(s.path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return 0, fmt.Errorf("wal: %w", err)
+		}
+		total += fi.Size()
+	}
+	return total, nil
 }

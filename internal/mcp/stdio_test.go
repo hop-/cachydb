@@ -70,7 +70,7 @@ func TestStdioEarlyEOF(t *testing.T) {
 			}
 			// Responses to requests in flight at EOF may be dropped by the
 			// SDK; whatever was written must be JSON-RPC only.
-			for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
 				if line != "" && !strings.HasPrefix(line, `{"jsonrpc":"2.0"`) {
 					t.Errorf("non-JSON-RPC output on stdout: %q", line)
 				}

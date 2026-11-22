@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
 	"github.com/hop-/cachydb/pkg/db/internal/segment"
 )
 
@@ -239,19 +242,86 @@ func TestRecoveryRegressionF5OffsetsContinue(t *testing.T) {
 	}
 }
 
+// closedIndexMeta reads the covered position, the checkpoint, and the
+// registered segments of the index file of the collection directory dir,
+// which no engine has open.
+func closedIndexMeta(t *testing.T, dir string) (idxstore.Position, uint64, []idxstore.SegmentStats) {
+	t.Helper()
+	st, err := idxstore.Open(dir, idxstore.Options{})
+	if err != nil {
+		t.Fatalf("opening the index file of %s: %v", dir, err)
+	}
+	defer func() {
+		if err := st.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	var (
+		covered idxstore.Position
+		cp      uint64
+		segs    []idxstore.SegmentStats
+	)
+	if err := st.View(func(tx *idxstore.Tx) (err error) {
+		if covered, err = tx.Covered(); err != nil {
+			return err
+		}
+		if cp, err = tx.Checkpoint(); err != nil {
+			return err
+		}
+		segs, err = tx.Segments()
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return covered, cp, segs
+}
+
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.Size()
+}
+
 // TestCrashRegressionF7SegSyncBeforeKeydir: a crash between the segment
-// fsync and the keydir update recovers exactly, and replaying records that
-// are already in the data segments is a no-op.
+// fsync and the index commit (AC-6, approach-index-and-query §4). The
+// segment then holds records the index file does not know. Open truncates
+// the active segment to the index file's covered position, or deletes a
+// segment file the index file does not register; the checkpoint did not
+// advance, so replay restores the changes from the WAL into the memtable,
+// and the next flush writes them exactly once.
 func TestCrashRegressionF7SegSyncBeforeKeydir(t *testing.T) {
-	for _, markerLost := range []bool{false, true} {
-		t.Run(fmt.Sprintf("marker-lost=%v", markerLost), func(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		newSeg   bool // every flush seals: the crashed flush writes an unregistered segment
+		tornTail bool // the crashed flush's last record is torn as well
+	}{
+		{name: "active segment truncated to covered"},
+		{name: "torn tail truncated to covered", tornTail: true},
+		{name: "unregistered segment deleted", newSeg: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			opts, e, c := newCrashColl(t, nil, nil)
+			opts, e, c := newCrashColl(t, func(o *Options) {
+				if tc.newSeg {
+					o.DataSegmentSize = 1
+				}
+			}, nil)
+			if err := c.CreateIndex(ctx, "by_v", "v"); err != nil {
+				t.Fatal(err)
+			}
 			mustInsert(t, c, "a", map[string]any{"v": 1})
 			mustInsert(t, c, "b", map[string]any{"v": 2})
 			mustFlush(t, c)
 			cp0 := checkpointOf(c)
 			e.abandon()
+			before := segRecordCount(t, c.dir)
+			covered0, storedCP0, segs0 := closedIndexMeta(t, c.dir)
+			if storedCP0 != cp0 {
+				t.Fatalf("index file checkpoint = %d, collection checkpoint = %d", storedCP0, cp0)
+			}
 
 			armed := opts
 			crashAt(t, &armed, hookAfterSegSync)
@@ -267,32 +337,68 @@ func TestCrashRegressionF7SegSyncBeforeKeydir(t *testing.T) {
 				t.Fatalf("flush = %v, want a simulated crash", err)
 			}
 			e.abandon()
-			before := segRecordCount(t, c.dir)
-			if markerLost {
-				// The records are durable in the segment, the marker is not:
-				// replay re-reads them from the WAL.
-				chopTail(t, newestDataSegment(t, c.dir), 3)
-				before--
+
+			// The crashed flush's records are durable in a segment; the index
+			// file is unchanged.
+			if got := segRecordCount(t, c.dir); got != before+3 {
+				t.Fatalf("segments hold %d records after the crashed flush, want %d", got, before+3)
+			}
+			covered, storedCP, segs := closedIndexMeta(t, c.dir)
+			if covered != covered0 || storedCP != cp0 || !slices.Equal(segs, segs0) {
+				t.Fatalf("index file changed by the crashed flush: covered %+v -> %+v, checkpoint %d -> %d, segments %+v -> %+v",
+					covered0, covered, cp0, storedCP, segs0, segs)
+			}
+			newest := newestDataSegment(t, c.dir)
+			registered := false
+			for _, st := range segs {
+				registered = registered || segment.DataPath(c.dir, st.Seg) == newest
+			}
+			if registered == tc.newSeg {
+				t.Fatalf("newest segment %s registered = %v, want %v", newest, registered, !tc.newSeg)
+			}
+			if !tc.newSeg {
+				if size := fileSize(t, newest); uint64(size) <= covered.End || segment.DataPath(c.dir, covered.Seg) != newest {
+					t.Fatalf("active segment %s is %d bytes, covered %+v: want records beyond covered", newest, size, covered)
+				}
+			}
+			if tc.tornTail {
+				chopTail(t, newest, 3)
 			}
 
 			e, c = openColl(t, opts)
-			want := model{"app": {"c": {indexes: map[string]string{}, docs: map[string]map[string]any{"a": {"v": 10}, "c": {"v": 3}}}}}
+			want := model{"app": {"c": {indexes: map[string]string{"by_v": "v"}, docs: map[string]map[string]any{"a": {"v": 10}, "c": {"v": 3}}}}}
 			checkModel(t, e, want)
+			if tc.newSeg {
+				if fileExistsT(t, newest) {
+					t.Errorf("unregistered segment %s kept by open", newest)
+				}
+			} else if size := fileSize(t, newest); uint64(size) != covered.End {
+				t.Errorf("active segment %s is %d bytes after open, want truncated to covered %d", newest, size, covered.End)
+			}
+			if got := segRecordCount(t, c.dir); got != before {
+				t.Errorf("segments hold %d records after open, want %d (the crashed flush's records removed)", got, before)
+			}
 			c.mu.RLock()
 			memLen, cp := len(c.memtable), c.checkpoint
 			c.mu.RUnlock()
-			if memLen != 0 {
-				t.Errorf("memtable holds %d entries after replaying already-flushed records, want 0", memLen)
+			if memLen != 3 {
+				t.Errorf("memtable holds %d entries after replay, want 3 (a, the tombstone of b, c)", memLen)
 			}
-			if markerLost && cp != cp0 {
-				t.Errorf("checkpoint = %d, want the previous marker %d", cp, cp0)
+			if cp != cp0 {
+				t.Errorf("checkpoint = %d, want %d (the crashed flush never committed)", cp, cp0)
 			}
-			if !markerLost && cp <= cp0 {
-				t.Errorf("checkpoint = %d, want above %d (the crashed flush's marker is durable)", cp, cp0)
+			if got := e.recov.replayApplied.Load(); got != 3 {
+				t.Errorf("replay applied %d records, want 3", got)
 			}
-			if got := segRecordCount(t, c.dir); got != before {
-				t.Errorf("open wrote %d segment records", got-before)
+
+			mustFlush(t, c)
+			if got := segRecordCount(t, c.dir); got != before+3 {
+				t.Errorf("flush after replay: segments hold %d records, want %d", got, before+3)
 			}
+			if got := storedCheckpoint(t, c); got <= cp0 {
+				t.Errorf("index file checkpoint after the flush = %d, want above %d", got, cp0)
+			}
+			checkModel(t, e, want)
 			e = reopen(t, e)
 			checkModel(t, e, want)
 		})
@@ -388,9 +494,7 @@ func TestConcurrentWritesDuringFlushCrashRegressionF10(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, writers)
 	for g := range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			docs := map[string]map[string]any{}
 			for i := range ops {
 				id := fmt.Sprintf("g%d-%d", g, i%idsPer)
@@ -416,7 +520,7 @@ func TestConcurrentWritesDuringFlushCrashRegressionF10(t *testing.T) {
 				}
 			}
 			results[g] = docs
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)
@@ -427,9 +531,7 @@ func TestConcurrentWritesDuringFlushCrashRegressionF10(t *testing.T) {
 
 	want := model{"app": {"c": {indexes: map[string]string{"by_w": "w"}, docs: map[string]map[string]any{}}}}
 	for _, docs := range results {
-		for id, data := range docs {
-			want["app"]["c"].docs[id] = data
-		}
+		maps.Copy(want["app"]["c"].docs, docs)
 	}
 	opts.FlushInterval = time.Hour
 	e = openEngine(t, opts)
@@ -596,8 +698,11 @@ func TestRecoveryReplayToMemtable(t *testing.T) {
 		t.Errorf("replay applied %d records, want 5", got)
 	}
 	mustFlush(t, c)
-	if got := segRecordCount(t, c.dir); got != before+6 {
-		t.Errorf("flush after replay wrote %d records, want 6 (5 documents + marker)", got-before)
+	if got := segRecordCount(t, c.dir); got != before+5 {
+		t.Errorf("flush after replay wrote %d records, want 5 (the documents; no checkpoint marker)", got-before)
+	}
+	if got, want := storedCheckpoint(t, c), checkpointOf(c); got != want {
+		t.Errorf("index file checkpoint after the flush = %d, want %d", got, want)
 	}
 }
 
@@ -663,205 +768,4 @@ func TestRecoveryManyCollectionsParallel(t *testing.T) {
 	e.abandon()
 	e = openEngine(t, opts)
 	checkModel(t, e, want)
-}
-
-// sealOpts makes every flush seal its data segment, which writes the hint
-// file and the index snapshots.
-func sealOpts(o *Options) { o.DataSegmentSize = 1 }
-
-// TestRecoveryIndexSnapshotCatchUp: a valid snapshot plus catch-up of the
-// data written after it gives the same index as a full rebuild.
-func TestRecoveryIndexSnapshotCatchUp(t *testing.T) {
-	for _, source := range []string{"seal", "close"} {
-		t.Run(source, func(t *testing.T) {
-			ctx := context.Background()
-			mod := func(*Options) {}
-			if source == "seal" {
-				mod = sealOpts
-			}
-			opts, e, c := newCrashColl(t, mod, nil)
-			if err := c.CreateIndex(ctx, "by_g", "g"); err != nil {
-				t.Fatal(err)
-			}
-			want := model{"app": {"c": {indexes: map[string]string{"by_g": "g"}, docs: map[string]map[string]any{}}}}
-			docs := want["app"]["c"].docs
-			for i := range 20 {
-				id := fmt.Sprintf("d%02d", i)
-				mustInsert(t, c, id, map[string]any{"g": float64(i % 4)})
-				docs[id] = map[string]any{"g": float64(i % 4)}
-			}
-			mustFlush(t, c) // "seal": seals segment 1 and writes the snapshot
-			if source == "close" {
-				e = reopen(t, e) // Close writes the snapshot
-			} else {
-				e.abandon()
-				e = openEngine(t, crashOpts(opts.Dir)) // default segment size from now on
-			}
-			c = mustColl(t, mustDB(t, e, "app"), "c")
-			if _, err := segment.ReadIndexSnapshot(c.dir, "by_g"); err != nil {
-				t.Fatalf("no snapshot to start from: %v", err)
-			}
-
-			// Changes after the snapshot: flushed (catch-up) ...
-			for i := range 8 {
-				id := fmt.Sprintf("d%02d", i)
-				switch i % 3 {
-				case 0:
-					if err := c.Delete(ctx, id); err != nil {
-						t.Fatal(err)
-					}
-					delete(docs, id)
-				default:
-					if _, err := c.Update(ctx, id, map[string]any{"g": "moved"}); err != nil {
-						t.Fatal(err)
-					}
-					docs[id] = map[string]any{"g": "moved"}
-				}
-			}
-			mustInsert(t, c, "n1", map[string]any{"g": 1.0})
-			docs["n1"] = map[string]any{"g": 1.0}
-			mustFlush(t, c)
-			// ... and only in the WAL (replay).
-			if _, err := c.Update(ctx, "d10", map[string]any{"g": "late"}); err != nil {
-				t.Fatal(err)
-			}
-			docs["d10"] = map[string]any{"g": "late"}
-			if err := c.Delete(ctx, "d11"); err != nil {
-				t.Fatal(err)
-			}
-			delete(docs, "d11")
-			e.abandon()
-
-			e = openEngine(t, crashOpts(opts.Dir))
-			if got := e.recov.snapshotsLoaded.Load(); got != 1 {
-				t.Errorf("snapshots loaded = %d, want 1", got)
-			}
-			if got := e.recov.indexesRebuilt.Load(); got != 0 {
-				t.Errorf("indexes rebuilt = %d, want 0", got)
-			}
-			checkModel(t, e, want) // includes index == full rebuild
-		})
-	}
-}
-
-// TestRecoveryIndexSnapshotInvalid: a missing, corrupt, or mismatched
-// snapshot is ignored and the index rebuilt.
-func TestRecoveryIndexSnapshotInvalid(t *testing.T) {
-	tests := []struct {
-		name   string
-		damage func(t *testing.T, dir string)
-	}{
-		{"missing", func(t *testing.T, dir string) {
-			if err := segment.RemoveIndexSnapshot(dir, "by_g"); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{"corrupt", func(t *testing.T, dir string) {
-			path := filepath.Join(dir, "idx-by_g.snap")
-			data, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			data[len(data)/2] ^= 0xff
-			if err := os.WriteFile(path, data, 0o644); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{"other field", func(t *testing.T, dir string) {
-			rewriteSnapshot(t, dir, func(s *segment.IndexSnapshot) { s.Field = "other" })
-		}},
-		{"missing segment", func(t *testing.T, dir string) {
-			rewriteSnapshot(t, dir, func(s *segment.IndexSnapshot) { s.CoversSeg = 99 })
-		}},
-		{"past segment end", func(t *testing.T, dir string) {
-			rewriteSnapshot(t, dir, func(s *segment.IndexSnapshot) { s.CoversPos = 1 << 40 })
-		}},
-		{"inside a record", func(t *testing.T, dir string) {
-			rewriteSnapshot(t, dir, func(s *segment.IndexSnapshot) { s.CoversPos = 17 })
-		}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			opts, e, c := newCrashColl(t, nil, nil)
-			if err := c.CreateIndex(context.Background(), "by_g", "g"); err != nil {
-				t.Fatal(err)
-			}
-			want := model{"app": {"c": {indexes: map[string]string{"by_g": "g"}, docs: map[string]map[string]any{}}}}
-			for i := range 6 {
-				id := fmt.Sprintf("d%d", i)
-				mustInsert(t, c, id, map[string]any{"g": float64(i % 2)})
-				want["app"]["c"].docs[id] = map[string]any{"g": float64(i % 2)}
-			}
-			// Make the snapshot stale too: a rebuild must not trust it.
-			if err := e.Close(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			tt.damage(t, c.dir)
-
-			e = openEngine(t, opts)
-			if got := e.recov.indexesRebuilt.Load(); got != 1 {
-				t.Errorf("indexes rebuilt = %d, want 1", got)
-			}
-			if got := e.recov.snapshotsLoaded.Load(); got != 0 {
-				t.Errorf("snapshots loaded = %d, want 0", got)
-			}
-			checkModel(t, e, want)
-		})
-	}
-}
-
-// rewriteSnapshot rewrites the by_g snapshot in dir after mod changes it,
-// also replacing its keys with garbage that a rebuild must not keep.
-func rewriteSnapshot(t *testing.T, dir string, mod func(*segment.IndexSnapshot)) {
-	t.Helper()
-	s, err := segment.ReadIndexSnapshot(dir, "by_g")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.Keys = map[string][]string{"s:bogus": {"nobody"}}
-	mod(s)
-	if err := segment.WriteIndexSnapshot(dir, s); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// TestRecoveryHintFiles: sealed segments load from their hint files; an
-// invalid hint is ignored, the segment scanned, and the hint rewritten.
-func TestRecoveryHintFiles(t *testing.T) {
-	for _, damaged := range []bool{false, true} {
-		t.Run(fmt.Sprintf("damaged=%v", damaged), func(t *testing.T) {
-			ctx := context.Background()
-			opts, e, c := newCrashColl(t, sealOpts, nil)
-			mustInsert(t, c, "a", map[string]any{"v": 1})
-			mustInsert(t, c, "b", map[string]any{"v": 2})
-			mustFlush(t, c) // seals segment 1
-			if _, err := c.Update(ctx, "a", map[string]any{"v": 3}); err != nil {
-				t.Fatal(err)
-			}
-			if err := c.Delete(ctx, "b"); err != nil {
-				t.Fatal(err)
-			}
-			mustFlush(t, c) // seals segment 2
-			e.abandon()
-			if damaged {
-				path := filepath.Join(c.dir, "seg-000001.hint")
-				if err := os.WriteFile(path, []byte("garbage"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			e = openEngine(t, opts)
-			wantHints := int64(2)
-			if damaged {
-				wantHints = 1
-			}
-			if got := e.recov.hintsLoaded.Load(); got != wantHints {
-				t.Errorf("hints loaded = %d, want %d", got, wantHints)
-			}
-			checkModel(t, e, model{"app": {"c": {indexes: map[string]string{}, docs: map[string]map[string]any{"a": {"v": 3}}}}})
-			if _, err := segment.ReadHint(c.dir, 1); err != nil {
-				t.Errorf("hint of segment 1 after open: %v", err)
-			}
-		})
-	}
 }

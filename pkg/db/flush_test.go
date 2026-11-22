@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
 	"github.com/hop-/cachydb/pkg/db/internal/segment"
 )
 
@@ -88,6 +90,47 @@ func (w *hookedSegWriter) Sync() error {
 	return w.segmentWriter.Sync()
 }
 
+var errCommitInjected = errors.New("injected index commit error")
+
+// commitFault makes one index transaction fail (via Options.testIndexCommit,
+// set only in the Options passed to Open). The test arms it on the open
+// engine through the mutex, never by writing the engine's options, which
+// the background flusher and compactor read. hook runs inside the write
+// transaction when committed is false, so it only returns an error.
+type commitFault struct {
+	mu        sync.Mutex
+	site      string
+	committed bool
+	armed     bool
+	fired     int
+}
+
+// arm makes the next index transaction at site fail: inside the
+// transaction before the commit (committed false, rolled back) or after
+// it committed (committed true, a late commit failure).
+func (f *commitFault) arm(site string, committed bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.site, f.committed, f.armed = site, committed, true
+}
+
+func (f *commitFault) hook(site string, committed bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.armed || site != f.site || committed != f.committed {
+		return nil
+	}
+	f.armed = false
+	f.fired++
+	return errCommitInjected
+}
+
+func (f *commitFault) firedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fired
+}
+
 // newFlushColl is newTestColl with the flusher's timer effectively off
 // (flushes are triggered by the test) and the segment writer hooked.
 func newFlushColl(t *testing.T, mod func(*Options)) (*Engine, *Collection, *segHooks) {
@@ -128,10 +171,9 @@ func memOffset(t *testing.T, c *Collection, id string) uint64 {
 	return me.walOffset
 }
 
-func inKeydir(c *Collection, id string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	_, ok := c.keydir[id]
+func inKeydir(t *testing.T, c *Collection, id string) bool {
+	t.Helper()
+	_, ok := keyEntryOf(t, c, id)
 	return ok
 }
 
@@ -169,6 +211,25 @@ func segRecords(t *testing.T, dir string) []segment.Record {
 		}
 	}
 	return out
+}
+
+// storedCheckpoint returns the checkpoint stored in c's index file: the
+// durable checkpoint since checkpoint marker records are no longer written
+// (approach-index-and-query §4).
+func storedCheckpoint(t *testing.T, c *Collection) uint64 {
+	t.Helper()
+	st, err := c.indexStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cp uint64
+	if err := st.View(func(tx *idxstore.Tx) error {
+		cp, err = tx.Checkpoint()
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return cp
 }
 
 func markers(recs []segment.Record) []uint64 {
@@ -287,7 +348,7 @@ func TestFlushTriggers(t *testing.T) {
 			name: "interval",
 			mod:  func(o *Options) { o.FlushInterval = 5 * time.Millisecond },
 			trigger: func(t *testing.T, e *Engine, c *Collection) *Collection {
-				waitFor(t, "interval flush", func() bool { return inKeydir(c, "a") })
+				waitFor(t, "interval flush", func() bool { return inKeydir(t, c, "a") })
 				return c
 			},
 		},
@@ -295,7 +356,7 @@ func TestFlushTriggers(t *testing.T) {
 			name: "memtable size",
 			mod:  func(o *Options) { o.FlushInterval = time.Hour; o.MemtableSize = 1 },
 			trigger: func(t *testing.T, e *Engine, c *Collection) *Collection {
-				waitFor(t, "size-triggered flush", func() bool { return inKeydir(c, "a") })
+				waitFor(t, "size-triggered flush", func() bool { return inKeydir(t, c, "a") })
 				return c
 			},
 		},
@@ -303,7 +364,7 @@ func TestFlushTriggers(t *testing.T) {
 			name: "close",
 			mod:  func(o *Options) { o.FlushInterval = time.Hour },
 			trigger: func(t *testing.T, e *Engine, c *Collection) *Collection {
-				if inKeydir(c, "a") {
+				if inKeydir(t, c, "a") {
 					t.Fatal("flushed before Close")
 				}
 				_, c2 := reopenColl(t, e)
@@ -315,10 +376,16 @@ func TestFlushTriggers(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			e, c := newTestColl(t, tt.mod, nil)
 			mustInsert(t, c, "a", map[string]any{"v": 1})
+			a := memOffset(t, c, "a")
 			c = tt.trigger(t, e, c)
+			// The flush writes only the document: the checkpoint is stored in
+			// the index file, in the transaction that indexes the record.
 			recs := segRecords(t, c.dir)
-			if len(recs) != 2 || recs[0].Type != segment.TypePut || recs[0].ID != "a" || recs[1].Type != segment.TypeCheckpoint {
-				t.Fatalf("segment records = %+v, want put a + checkpoint", recs)
+			if len(recs) != 1 || recs[0].Type != segment.TypePut || recs[0].ID != "a" {
+				t.Fatalf("segment records = %+v, want put a only (no checkpoint marker)", recs)
+			}
+			if cp := storedCheckpoint(t, c); cp < a {
+				t.Errorf("index file checkpoint = %d, want >= %d (the offset of a)", cp, a)
 			}
 			if got := mustGet(t, c, "a"); got.Data["v"] != 1.0 {
 				t.Errorf("Get(a) = %+v", got)
@@ -337,11 +404,19 @@ func TestFlushWritesOnlyChanges(t *testing.T) {
 		t.Fatalf("after first flush: %d appends, %d syncs; want 1, 1", n, s)
 	}
 	first := h.appends[0]
-	if len(first) != 4 {
-		t.Fatalf("first flush wrote %d records, want 3 puts + marker", len(first))
+	if len(first) != 3 {
+		t.Fatalf("first flush wrote %d records, want 3 puts (no checkpoint marker)", len(first))
 	}
-	if !slices.IsSortedFunc(first[:3], func(a, b segment.Record) int { return int(a.WALOffset) - int(b.WALOffset) }) {
+	for _, r := range first {
+		if r.Type != segment.TypePut {
+			t.Errorf("first flush wrote a %v record, want puts only", r.Type)
+		}
+	}
+	if !slices.IsSortedFunc(first, func(a, b segment.Record) int { return int(a.WALOffset) - int(b.WALOffset) }) {
 		t.Errorf("records not sorted by WAL offset: %+v", first)
+	}
+	if got, want := storedCheckpoint(t, c), checkpointOf(c); got != want {
+		t.Errorf("index file checkpoint after the first flush = %d, checkpoint = %d", got, want)
 	}
 
 	if _, err := c.Update(context.Background(), "b", map[string]any{"x": 1}); err != nil {
@@ -352,11 +427,11 @@ func TestFlushWritesOnlyChanges(t *testing.T) {
 		t.Fatalf("after second flush: %d appends, %d syncs; want 2, 2", n, s)
 	}
 	second := h.appends[1]
-	if len(second) != 2 || second[0].ID != "b" || second[0].Type != segment.TypePut || second[1].Type != segment.TypeCheckpoint {
-		t.Errorf("second flush wrote %+v, want put b + marker", second)
+	if len(second) != 1 || second[0].ID != "b" || second[0].Type != segment.TypePut {
+		t.Errorf("second flush wrote %+v, want put b only", second)
 	}
-	if got, want := second[1].WALOffset, checkpointOf(c); got != want {
-		t.Errorf("marker = %d, checkpoint = %d", got, want)
+	if got, want := storedCheckpoint(t, c), checkpointOf(c); got != want || got < second[0].WALOffset {
+		t.Errorf("index file checkpoint = %d, checkpoint = %d, want equal and >= %d", got, want, second[0].WALOffset)
 	}
 
 	mustFlush(t, c) // nothing changed
@@ -466,10 +541,13 @@ func TestFlushCheckpointExcludesConcurrentWrites(t *testing.T) {
 	if cp < a || cp >= x || cp >= b {
 		t.Fatalf("checkpoint = %d; want a=%d <= cp < x=%d and < b=%d", cp, a, x, b)
 	}
-	if m := markers(segRecords(t, c.dir)); len(m) != 1 || m[0] != cp {
-		t.Errorf("markers on disk = %v, want [%d]", m, cp)
+	if got := storedCheckpoint(t, c); got != cp {
+		t.Errorf("index file checkpoint = %d, want %d", got, cp)
 	}
-	if !inKeydir(c, "a") || inKeydir(c, "x") || inKeydir(c, "b") {
+	if m := markers(segRecords(t, c.dir)); len(m) != 0 {
+		t.Errorf("markers on disk = %v, want none (the checkpoint is in the index file)", m)
+	}
+	if !inKeydir(t, c, "a") || inKeydir(t, c, "x") || inKeydir(t, c, "b") {
 		t.Error("keydir after the flush should hold a only")
 	}
 	if lw := e.lowWater(); lw > x {
@@ -486,31 +564,103 @@ func TestFlushCheckpointExcludesConcurrentWrites(t *testing.T) {
 	}
 }
 
+// segRecordLoc is a data segment record's header and location.
+type segRecordLoc struct {
+	rec string // "put a", "tombstone a"
+	loc segment.Location
+}
+
+// segRecordLocs returns the record headers and locations of every data
+// segment in dir, in order.
+func segRecordLocs(t *testing.T, dir string) []segRecordLoc {
+	t.Helper()
+	segs, err := segment.ListSegments(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []segRecordLoc
+	for _, seg := range segs {
+		if _, err := segment.ScanHeaders(dir, seg, func(r segment.Record, loc segment.Location) error {
+			out = append(out, segRecordLoc{rec: r.Type.String() + " " + r.ID, loc: loc})
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return out
+}
+
+func recNames(recs []segRecordLoc) []string {
+	out := make([]string, len(recs))
+	for i, r := range recs {
+		out[i] = r.rec
+	}
+	return out
+}
+
+// Failure modes of TestFlushFailureKeepsCheckpoint.
+const (
+	flushFailAppend        = "append"
+	flushFailSync          = "sync"
+	flushFailIndexEarly    = "index commit before the commit"
+	flushFailIndexLate     = "index commit fails late"
+	flushLateCommitWarning = "the index transaction of a flush failed at commit; keeping its records in the data segment"
+)
+
 // TestFlushFailureKeepsCheckpoint (F8): a failed flush keeps flushing
 // readable and the old checkpoint, the retry writes everything, and
-// nothing is lost after reopen.
+// nothing is lost after reopen. The failure is an append or sync error of
+// the data segment, or a failed index transaction (task 02 Amendment 2):
+// one that never reached its commit truncates the records away like a
+// failed append; one that failed late, after bbolt wrote the transaction,
+// keeps them (the key table may point at them) and logs a WARN, and the
+// retry counts its own second copies as dead.
 func TestFlushFailureKeepsCheckpoint(t *testing.T) {
-	for _, mode := range []string{"append", "sync"} {
+	for _, mode := range []string{flushFailAppend, flushFailSync, flushFailIndexEarly, flushFailIndexLate} {
 		t.Run(mode, func(t *testing.T) {
-			e, c, h := newFlushColl(t, nil)
+			ctx := context.Background()
+			fault := &commitFault{}
+			logs := &syncBuffer{}
+			e, c, h := newFlushColl(t, func(o *Options) {
+				o.testIndexCommit = fault.hook
+				o.Logger = slog.New(slog.NewTextHandler(logs, nil))
+			})
+			idx := map[string]string{"by_v": "v"}
+			if err := c.CreateIndex(ctx, "by_v", "v"); err != nil {
+				t.Fatal(err)
+			}
 			mustInsert(t, c, "a", map[string]any{"v": 1})
 			mustFlush(t, c)
 			cp0 := checkpointOf(c)
 
 			mustInsert(t, c, "b", map[string]any{"v": 2})
 			b := memOffset(t, c, "b")
-			if err := c.Delete(context.Background(), "a"); err != nil {
+			if err := c.Delete(ctx, "a"); err != nil {
 				t.Fatal(err)
 			}
-			h.mu.Lock()
-			if mode == "append" {
+			wantErr := errInjected
+			switch mode {
+			case flushFailAppend:
+				h.mu.Lock()
 				h.failAppend = 1
-			} else {
+				h.mu.Unlock()
+			case flushFailSync:
+				h.mu.Lock()
 				h.failSync = 1
+				h.mu.Unlock()
+			case flushFailIndexEarly:
+				fault.arm(indexCommitFlush, false)
+				wantErr = errCommitInjected
+			case flushFailIndexLate:
+				fault.arm(indexCommitFlush, true)
+				wantErr = errCommitInjected
 			}
-			h.mu.Unlock()
-			if err := c.flush(); !errors.Is(err, errInjected) {
+			if err := c.flush(); !errors.Is(err, wantErr) {
 				t.Fatalf("flush = %v, want the injected error", err)
+			}
+			late := mode == flushFailIndexLate
+			if wantErr == errCommitInjected && fault.firedCount() != 1 {
+				t.Fatalf("the index commit fault fired %d times, want 1", fault.firedCount())
 			}
 
 			c.mu.RLock()
@@ -531,8 +681,37 @@ func TestFlushFailureKeepsCheckpoint(t *testing.T) {
 			if lw := e.lowWater(); lw > b {
 				t.Errorf("lowWater = %d after failed flush, want <= %d", lw, b)
 			}
-			if m := markers(segRecords(t, c.dir)); len(m) != 1 {
-				t.Errorf("markers on disk after failure = %v, want only the first flush's", m)
+			warned := strings.Contains(logs.String(), flushLateCommitWarning)
+			if late {
+				// bbolt wrote the transaction: the index file shows the
+				// flush, so its records must stay in the segment.
+				if got := storedCheckpoint(t, c); got <= cp0 {
+					t.Errorf("index file checkpoint after the late commit failure = %d, want the flush's (> %d)", got, cp0)
+				}
+				if got, want := recNames(segRecordLocs(t, c.dir)), []string{"put a", "put b", "tombstone a"}; !slices.Equal(got, want) {
+					t.Errorf("segment records after the late commit failure = %v, want %v (kept)", got, want)
+				}
+				if !inKeydir(t, c, "b") {
+					t.Error("the committed key table has no entry for b")
+				}
+				if !warned || !strings.Contains(logs.String(), "level=WARN") {
+					t.Errorf("no WARN %q logged: %q", flushLateCommitWarning, logs.String())
+				}
+			} else {
+				if got := storedCheckpoint(t, c); got != cp0 {
+					t.Errorf("index file checkpoint after the failed flush = %d, want %d", got, cp0)
+				}
+				// The failed attempt's records were truncated away: the segment
+				// holds only what the index file knows.
+				if recs := segRecords(t, c.dir); len(recs) != 1 || recs[0].ID != "a" || recs[0].Type != segment.TypePut {
+					t.Errorf("segment records after the failed flush = %+v, want only the first flush's put a", recs)
+				}
+				if inKeydir(t, c, "b") {
+					t.Error("the key table has an entry for b after a rolled-back flush")
+				}
+				if warned {
+					t.Errorf("the late-commit WARN was logged for a failure before the commit: %q", logs.String())
+				}
 			}
 
 			mustInsert(t, c, "c", map[string]any{"v": 3})
@@ -547,18 +726,61 @@ func TestFlushFailureKeepsCheckpoint(t *testing.T) {
 			if !idle {
 				t.Error("flushing or memtable not empty after a successful retry")
 			}
-			if m := markers(segRecords(t, c.dir)); len(m) != 2 {
-				t.Errorf("markers on disk = %v, want 2", m)
+			if got, want := storedCheckpoint(t, c), checkpointOf(c); got != want {
+				t.Errorf("index file checkpoint after the retry = %d, want %d", got, want)
+			}
+			if m := markers(segRecords(t, c.dir)); len(m) != 0 {
+				t.Errorf("markers on disk = %v, want none", m)
 			}
 
-			_, c = reopenColl(t, e)
-			if _, err := c.Get(context.Background(), "a"); !errors.Is(err, ErrNotFound) {
+			// The retry wrote b, the tombstone of a, and c once; after a late
+			// failure it appended b and the tombstone again, and b's entry
+			// still points at the first copy, the one the committed
+			// transaction referenced.
+			recs := segRecordLocs(t, c.dir)
+			wantRecs := []string{"put a", "put b", "tombstone a", "put c"}
+			if late {
+				wantRecs = []string{"put a", "put b", "tombstone a", "put b", "tombstone a", "put c"}
+			}
+			if got := recNames(recs); !slices.Equal(got, wantRecs) {
+				t.Fatalf("segment records after the retry = %v, want %v", got, wantRecs)
+			}
+			liveB, liveC := recs[1].loc, recs[len(recs)-1].loc
+			for id, loc := range map[string]segment.Location{"b": liveB, "c": liveC} {
+				if ke, ok := keyEntryOf(t, c, id); !ok || ke.Seg != loc.Seg || ke.Pos != loc.Pos || ke.Size != loc.Size {
+					t.Errorf("key table entry of %s = %+v, %v; want %+v", id, ke, ok, loc)
+				}
+			}
+			wantDead := map[uint32]int64{}
+			wantTotal := map[uint32]int64{}
+			for _, r := range recs {
+				wantTotal[r.loc.Seg] += int64(r.loc.Size)
+				if r.loc != liveB && r.loc != liveC {
+					wantDead[r.loc.Seg] += int64(r.loc.Size)
+				}
+			}
+			totals, dead := segAccounting(t, c)
+			for seg, n := range wantTotal {
+				if totals[seg] != n || dead[seg] != wantDead[seg] {
+					t.Errorf("segment %d accounting = %d record bytes, %d dead; want %d, %d (the retry's own copies dead)",
+						seg, totals[seg], dead[seg], n, wantDead[seg])
+				}
+			}
+			want := docsModel(idx, map[string]map[string]any{"b": {"v": 2.0}, "c": {"v": 3.0}})
+			checkModel(t, e, want)
+
+			e, c = reopenColl(t, e)
+			if _, err := c.Get(ctx, "a"); !errors.Is(err, ErrNotFound) {
 				t.Errorf("after reopen Get(a) = %v, want ErrNotFound", err)
 			}
 			mustGet(t, c, "b")
 			mustGet(t, c, "c")
 			if c.Count() != 2 {
 				t.Errorf("Count after reopen = %d, want 2", c.Count())
+			}
+			checkModel(t, e, want)
+			if _, dead2 := segAccounting(t, c); !maps.Equal(dead2, dead) {
+				t.Errorf("dead bytes after reopen = %v, want %v", dead2, dead)
 			}
 		})
 	}
@@ -571,7 +793,7 @@ func TestFlushFailureRetriedOnTick(t *testing.T) {
 		o.testSegWriter = func(w segmentWriter) segmentWriter { return &hookedSegWriter{segmentWriter: w, h: h} }
 	}, nil)
 	mustInsert(t, c, "a", map[string]any{"v": 1})
-	waitFor(t, "flush after injected failures", func() bool { return inKeydir(c, "a") })
+	waitFor(t, "flush after injected failures", func() bool { return inKeydir(t, c, "a") })
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.failAppend != 0 {
@@ -598,12 +820,13 @@ func TestSegmentRoll(t *testing.T) {
 			// The flushed entries are still in flushing and the keydir
 			// does not point at them yet.
 			c.mu.RLock()
-			defer c.mu.RUnlock()
-			if len(c.flushing) == 0 {
+			flushing := maps.Clone(c.flushing)
+			c.mu.RUnlock()
+			if len(flushing) == 0 {
 				t.Errorf("at %s: flushing is empty", p)
 			}
-			for id, me := range c.flushing {
-				if ke, ok := c.keydir[id]; ok && ke.walOffset >= me.walOffset {
+			for id, me := range flushing {
+				if ke, ok := keyEntryOf(t, c, id); ok && ke.WALOffset >= me.walOffset {
 					t.Errorf("at %s: keydir already repointed for %q", p, id)
 				}
 			}
@@ -623,27 +846,9 @@ func TestSegmentRoll(t *testing.T) {
 		t.Fatalf("hook points = %v, want %v", gotPoints, want)
 	}
 
-	// Segment 1 is sealed: hint and snapshot written, segment 2 open.
-	hint, err := segment.ReadHint(c.dir, 1)
-	if err != nil {
-		t.Fatalf("ReadHint(1): %v", err)
-	}
-	if len(hint) != 2 || hint[0].ID != "d" || hint[0].Type != segment.TypePut || hint[1].Type != segment.TypeCheckpoint {
-		t.Errorf("hint of segment 1 = %+v", hint)
-	}
-	fi, err := os.Stat(segment.DataPath(c.dir, 1))
-	if err != nil {
+	// Segment 1 is sealed, segment 2 open.
+	if _, err := os.Stat(segment.DataPath(c.dir, 1)); err != nil {
 		t.Fatal(err)
-	}
-	snap, err := segment.ReadIndexSnapshot(c.dir, "byv")
-	if err != nil {
-		t.Fatalf("ReadIndexSnapshot: %v", err)
-	}
-	if snap.Field != "v" || snap.CoversSeg != 1 || snap.CoversPos != uint64(fi.Size()) || snap.CoversWAL != checkpointOf(c) {
-		t.Errorf("snapshot header = %+v (segment size %d, checkpoint %d)", snap, fi.Size(), checkpointOf(c))
-	}
-	if ids := snap.Keys["s:one"]; !slices.Equal(ids, []string{"d"}) {
-		t.Errorf("snapshot keys = %v", snap.Keys)
 	}
 	if _, err := os.Stat(segment.DataPath(c.dir, 2)); err != nil {
 		t.Errorf("next segment not created: %v", err)
@@ -653,15 +858,8 @@ func TestSegmentRoll(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustFlush(t, c)
-	if _, err := segment.ReadHint(c.dir, 2); err != nil {
-		t.Errorf("ReadHint(2): %v", err)
-	}
-	if snap, err := segment.ReadIndexSnapshot(c.dir, "byv"); err != nil || snap.CoversSeg != 2 || len(snap.Keys["s:two"]) != 1 || len(snap.Keys["s:one"]) != 0 {
-		t.Errorf("snapshot after second roll = %+v, %v", snap, err)
-	}
-	c.mu.RLock()
-	dead1 := c.deadBytes[1]
-	c.mu.RUnlock()
+	_, deadBytes := segAccounting(t, c)
+	dead1 := deadBytes[1]
 	if dead1 == 0 {
 		t.Error("superseded version in segment 1 not counted as dead bytes")
 	}
@@ -776,32 +974,51 @@ func TestDeadBytes(t *testing.T) {
 	}
 	mustFlush(t, c)
 
-	c.flushMu.Lock()
-	hint := slices.Clone(c.activeHint)
-	c.flushMu.Unlock()
-	// Records: put a, put b, marker | put a', tombstone b, marker. Only a'
-	// is live.
-	if len(hint) != 6 {
-		t.Fatalf("active segment holds %d records, want 6", len(hint))
+	type hintEntry struct { // a record's header and location
+		ID        string
+		Type      segment.RecordType
+		WALOffset uint64
+		Loc       segment.Location
+	}
+	var hint []hintEntry // the active segment's records
+	if _, err := segment.ScanHeaders(c.dir, 1, func(r segment.Record, loc segment.Location) error {
+		hint = append(hint, hintEntry{ID: r.ID, Type: r.Type, WALOffset: r.WALOffset, Loc: loc})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Records: put a, put b | put a', tombstone b (no checkpoint markers).
+	// Only a' is live.
+	wantRecs := []string{"put a", "put b", "put a", "tombstone b"}
+	var gotRecs []string
+	for _, h := range hint {
+		gotRecs = append(gotRecs, h.Type.String()+" "+h.ID)
+	}
+	if !slices.Equal(gotRecs, wantRecs) {
+		t.Fatalf("active segment holds %v, want %v", gotRecs, wantRecs)
 	}
 	var total, live int64
 	for i, h := range hint {
 		total += int64(h.Loc.Size)
-		if i == 3 {
+		if i == 2 {
 			live = int64(h.Loc.Size)
 		}
 	}
-	c.mu.RLock()
-	got := c.deadBytes[1]
-	c.mu.RUnlock()
+	totals, deadBytes := segAccounting(t, c)
+	got := deadBytes[1]
 	if got != total-live {
 		t.Errorf("deadBytes[1] = %d, want %d", got, total-live)
 	}
+	if totals[1] != total {
+		t.Errorf("record bytes of segment 1 = %d, want %d", totals[1], total)
+	}
+	if ke, ok := keyEntryOf(t, c, "a"); !ok || ke.Pos != hint[2].Loc.Pos || ke.Size != hint[2].Loc.Size {
+		t.Errorf("key table entry of a = %+v, %v; want the second put at %+v", ke, ok, hint[2].Loc)
+	}
 
 	_, c = reopenColl(t, e)
-	c.mu.RLock()
-	reloaded := c.deadBytes[1]
-	c.mu.RUnlock()
+	_, deadBytes = segAccounting(t, c)
+	reloaded := deadBytes[1]
 	if reloaded != got {
 		t.Errorf("deadBytes after reopen = %d, want %d", reloaded, got)
 	}

@@ -49,7 +49,8 @@ about 124 KB). If a future engine API drops something the generator
 uses, keep the old calls working in the generator for older tags, or
 note the adaptation here.
 
-The v0.0.4 and v0.0.5 fixtures were generated this way from the tags
-`v0.0.4` (`656005a`) and `v0.0.5` (`daca77c`). Both releases have every
-option the generator uses (including `DataSegmentSize` and
-`FlushInterval`), so no adaptation was needed.
+The v0.0.4, v0.0.5 and v0.0.6 fixtures were generated this way from the
+tags `v0.0.4` (`656005a`), `v0.0.5` (`daca77c`) and `v0.0.6`
+(`3800afd`). These releases have every option the generator uses
+(including `DataSegmentSize` and `FlushInterval`), so no adaptation was
+needed.

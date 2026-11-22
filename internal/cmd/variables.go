@@ -17,9 +17,16 @@ var (
 
 	generalRootDir          string
 	generalServerPort       int
+	generalHost             string
+	generalAuth             string
+	generalTLSCert          string
+	generalTLSKey           string
 	generalTransport        string
 	generalDBName           string
 	generalWALRetentionAge  time.Duration
 	generalWALRetentionSize config.ByteSize
 	generalCacheSize        config.ByteSize
+	generalDefaultLimit     int
+	generalMaxResultBytes   config.ByteSize
+	generalResultText       string
 )

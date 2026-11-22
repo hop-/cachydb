@@ -9,9 +9,9 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"uuid"
 
-	"github.com/google/uuid"
-
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
 	"github.com/hop-/cachydb/pkg/db/internal/segment"
 	"github.com/hop-/cachydb/pkg/db/internal/wal"
 )
@@ -59,7 +59,7 @@ func docIDs(docs []*Document) []string {
 }
 
 // seedSegment writes docs as put records into a new data segment seg of c
-// and points the keydir at them, as a flush would have (task 10).
+// and points the key table at them, as a flush would have (task 10).
 func seedSegment(t *testing.T, c *Collection, seg uint32, walOffset uint64, docs ...*Document) {
 	t.Helper()
 	w, err := segment.Create(c.dir, seg)
@@ -81,10 +81,14 @@ func seedSegment(t *testing.T, c *Collection, seg uint32, walOffset uint64, docs
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	entries := make(map[string]idxstore.Entry, len(docs))
+	var size int64
 	for i, d := range docs {
-		c.keydir[d.ID] = keyEntry{loc: locs[i], walOffset: walOffset}
+		entries[d.ID] = locationEntry(locs[i], walOffset)
+		size += int64(locs[i].Size)
+	}
+	putKeyEntries(t, c, seg, size, entries)
+	for range docs {
 		c.count.Add(1)
 	}
 }
@@ -97,8 +101,20 @@ func TestInsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := uuid.Parse(id); err != nil {
-		t.Errorf("generated id %q is not a UUID: %v", id, err)
+	u, err := uuid.Parse(id)
+	if err != nil {
+		t.Fatalf("generated id %q is not a UUID: %v", id, err)
+	}
+	// RFC 9562: the version is the high nibble of byte 6, the variant the
+	// two high bits of byte 8.
+	if version := u[6] >> 4; version != 7 {
+		t.Errorf("generated id %q is a version %d UUID, want version 7", id, version)
+	}
+	if variant := u[8] >> 6; variant != 0b10 {
+		t.Errorf("generated id %q has variant bits %02b, want 10 (RFC 9562)", id, variant)
+	}
+	if id != u.String() {
+		t.Errorf("generated id %q is not in the canonical form %q", id, u.String())
 	}
 	if got := mustGet(t, c, id); got.ID != id || got.Data["a"] != 1.0 {
 		t.Errorf("Get = %+v", got)
@@ -147,6 +163,46 @@ func TestInsert(t *testing.T) {
 	}
 	if want := map[string]any{"_id": "x", "b": "v"}; !reflect.DeepEqual(payload, want) {
 		t.Errorf("payload = %v, want %v", payload, want)
+	}
+}
+
+// TestInsertGeneratedIDsSortInCreationOrder checks that ids generated one
+// after the other are distinct and increasing, so the default _id order of
+// Find is the insertion order. (UUID v7 keeps this order unless the system
+// clock steps back.)
+func TestInsertGeneratedIDsSortInCreationOrder(t *testing.T) {
+	ctx := context.Background()
+	_, c := newTestColl(t, nil, nil)
+
+	const n = 200 // many per millisecond, so the order within one timestamp counts too
+	ids := make([]string, n)
+	for i := range n {
+		id, err := c.Insert(ctx, &Document{Data: map[string]any{"seq": i}})
+		if err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+		if i > 0 && id <= ids[i-1] {
+			t.Fatalf("id %d = %q does not sort after id %d = %q", i, id, i-1, ids[i-1])
+		}
+		ids[i] = id
+	}
+
+	docs, err := c.Find(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := docIDs(docs); !slices.Equal(got, ids) {
+		t.Fatalf("Find returned %d ids in an order other than the insertion order", len(got))
+	}
+	for i, d := range docs {
+		if d.Data["seq"] != float64(i) {
+			t.Fatalf("document %d in _id order has seq %v, want %d", i, d.Data["seq"], i)
+		}
+	}
+
+	// A caller-supplied id is used as given.
+	if got := mustInsert(t, c, "custom-id", map[string]any{"seq": -1}); got != "custom-id" {
+		t.Errorf("Insert with an id returned %q, want custom-id", got)
 	}
 }
 
@@ -536,9 +592,7 @@ func TestConcurrentWritesDifferentDocuments(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, workers)
 	for w := range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := range perWorker {
 				id := fmt.Sprintf("w%d-%02d", w, i)
 				if _, err := c.Insert(ctx, &Document{ID: id, Data: map[string]any{"g": w % 2}}); err != nil {
@@ -556,7 +610,7 @@ func TestConcurrentWritesDifferentDocuments(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)
@@ -815,11 +869,9 @@ func TestReadFromSegmentAndCache(t *testing.T) {
 func TestReadFromSegmentMismatch(t *testing.T) {
 	_, c := newTestColl(t, nil, nil)
 	seedSegment(t, c, 1, 7, &Document{ID: "s1", Data: map[string]any{"v": 1}})
-	c.mu.Lock()
-	ke := c.keydir["s1"]
-	ke.walOffset = 8 // keydir and record disagree
-	c.keydir["s1"] = ke
-	c.mu.Unlock()
+	ke, _ := keyEntryOf(t, c, "s1")
+	ke.WALOffset = 8 // keydir and record disagree
+	putKeyEntries(t, c, 1, 0, map[string]idxstore.Entry{"s1": ke})
 	if _, err := c.Get(context.Background(), "s1"); !errors.Is(err, segment.ErrCorrupt) {
 		t.Fatalf("Get = %v, want segment.ErrCorrupt", err)
 	}
@@ -844,9 +896,7 @@ func TestCreateIndexOnPopulatedCollection(t *testing.T) {
 		t.Fatal(err)
 	}
 	lookup := func(v any) []string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		return c.indexes["by_g"].lookup(v)
+		return indexLookup(t, c, "by_g", v)
 	}
 	if got, want := lookup("a"), []string{"m1", "m2", "s1"}; !slices.Equal(got, want) {
 		t.Errorf("index a = %v, want %v", got, want)
@@ -968,12 +1018,8 @@ func TestCachedDocumentIsNeverShared(t *testing.T) {
 	mustFlush(t, c) // now read from the data segment, through the cache
 
 	first := mustGet(t, c, "a")
-	ke := func() keyEntry {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		return c.keydir["a"]
-	}()
-	cached, ok := e.cache.Get(c.cacheKey("a"), ke.walOffset)
+	ke, _ := keyEntryOf(t, c, "a")
+	cached, ok := e.cache.Get(c.cacheKey("a"), ke.WALOffset)
 	if !ok {
 		t.Fatal("document not cached after a Get")
 	}

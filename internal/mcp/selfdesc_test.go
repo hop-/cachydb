@@ -109,6 +109,23 @@ func TestToolSchemaEnums(t *testing.T) {
 	}
 }
 
+// TestCreateCollectionSchemaDescription checks that the schema parameter
+// of create_collection tells the agent how to change a schema later
+// (update_schema, which must exist) instead of calling it fixed.
+func TestCreateCollectionSchemaDescription(t *testing.T) {
+	tools := listTools(t, connect(t, newTestServer(t)))
+	toolNamed(t, tools, "update_schema")
+
+	s := schemaAt(t, toolNamed(t, tools, "create_collection").InputSchema, "properties", "schema")
+	desc, _ := s["description"].(string)
+	if !strings.Contains(desc, "update_schema") {
+		t.Errorf("create_collection schema description %q does not mention update_schema", desc)
+	}
+	if strings.Contains(strings.ToLower(desc), "fixed") {
+		t.Errorf("create_collection schema description %q still says the schema is fixed", desc)
+	}
+}
+
 func TestToolAnnotationsAndOutputSchemas(t *testing.T) {
 	type hints struct{ readOnly, destructive, idempotent bool }
 	want := map[string]hints{
@@ -134,6 +151,12 @@ func TestToolAnnotationsAndOutputSchemas(t *testing.T) {
 		"copy_collection":     {},
 		"delete_collection":   {destructive: true, idempotent: true},
 		"drop_index":          {destructive: true, idempotent: true},
+		// plan 013 (approach-agent-interface §3)
+		"get_document":     {readOnly: true, idempotent: true},
+		"insert_documents": {},
+		"update_documents": {},
+		"delete_documents": {destructive: true, idempotent: true},
+		"server_stats":     {readOnly: true, idempotent: true},
 	}
 	tools := listTools(t, connect(t, newTestServer(t)))
 	if len(tools) != len(want) {
@@ -195,7 +218,7 @@ func TestToolDefinitionsMatchRegistered(t *testing.T) {
 		t.Fatalf("DocsTopic(tools): %v", err)
 	}
 	var documented []string
-	for _, line := range strings.Split(topic.Content, "\n") {
+	for line := range strings.SplitSeq(topic.Content, "\n") {
 		if name, ok := strings.CutPrefix(line, "## "); ok && name != "Tools" {
 			documented = append(documented, name)
 		}
@@ -221,11 +244,11 @@ func TestToolExamplesAreValid(t *testing.T) {
 	}
 	order := []string{
 		"list_databases", "create_database", "use_database", "current_database",
-		"create_collection", "list_collections", "insert_document", "find_documents",
-		"count_documents", "distinct", "update_document", "replace_document",
-		"create_index", "describe_collection", "update_schema", "copy_collection",
-		"rename_collection", "delete_collection", "drop_index", "delete_document",
-		"delete_database",
+		"create_collection", "list_collections", "insert_document", "insert_documents",
+		"get_document", "find_documents", "count_documents", "distinct", "update_document",
+		"update_documents", "replace_document", "create_index", "describe_collection",
+		"server_stats", "update_schema", "copy_collection", "rename_collection", "delete_collection",
+		"drop_index", "delete_documents", "delete_document", "delete_database",
 	}
 	if len(order) != len(examples) {
 		t.Fatalf("order lists %d tools, %d have examples", len(order), len(examples))

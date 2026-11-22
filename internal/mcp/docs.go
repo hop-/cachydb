@@ -26,9 +26,12 @@ type ToolDoc struct {
 	Example      map[string]any       `json:"example"`
 }
 
-// ToolDocs returns every tool's documentation, in registration order.
-func ToolDocs() []ToolDoc {
-	specs := toolSpecs()
+// ToolDocs returns the documentation of every tool the server always
+// registers, in registration order; the tools topic renders it. The user
+// tools are in AccessToolDocs.
+func ToolDocs() []ToolDoc { return toolDocs(toolSpecs()) }
+
+func toolDocs(specs []toolSpec) []ToolDoc {
 	out := make([]ToolDoc, len(specs))
 	for i, sp := range specs {
 		out[i] = ToolDoc{
@@ -43,19 +46,30 @@ func ToolDocs() []ToolDoc {
 	return out
 }
 
-// DocsTopics returns every docs topic in display order, with the tools
-// topic's generated reference appended to its static introduction.
+// DocsTopics returns every docs topic in display order, with the
+// generated tool references appended to the static introductions of the
+// tools topic (ToolDocs) and the access topic (AccessToolDocs).
 func DocsTopics() ([]docs.Topic, error) {
 	topics, err := docs.All()
 	if err != nil {
 		return nil, err
 	}
 	for i := range topics {
-		if topics[i].Name == docs.ToolsTopic {
-			topics[i].Content += renderTools(ToolDocs())
-		}
+		topics[i].Content += generatedContent(topics[i].Name)
 	}
 	return topics, nil
+}
+
+// generatedContent returns the generated part of topic name, if any.
+func generatedContent(name string) string {
+	switch name {
+	case docs.ToolsTopic:
+		return renderTools("Tools", ToolDocs())
+	case docs.AccessTopic:
+		return renderTools("User tools", AccessToolDocs())
+	default:
+		return ""
+	}
 }
 
 // DocsTopic returns one topic as DocsTopics renders it.
@@ -64,16 +78,14 @@ func DocsTopic(name string) (docs.Topic, error) {
 	if err != nil {
 		return docs.Topic{}, err
 	}
-	if name == docs.ToolsTopic {
-		t.Content += renderTools(ToolDocs())
-	}
+	t.Content += generatedContent(name)
 	return t, nil
 }
 
-// renderTools renders the tool reference as markdown.
-func renderTools(tools []ToolDoc) string {
+// renderTools renders a tool reference as markdown under heading.
+func renderTools(heading string, tools []ToolDoc) string {
 	var b strings.Builder
-	b.WriteString("\n## Tools\n\n")
+	fmt.Fprintf(&b, "\n## %s\n\n", heading)
 	for _, t := range tools {
 		fmt.Fprintf(&b, "- `%s`: %s\n", t.Name, annotationSummary(t.Annotations))
 	}
@@ -122,15 +134,15 @@ func Instructions() string {
 	b.WriteString(`cachydb is a document database: databases hold collections, collections hold JSON documents with a string _id.
 
 Workflow:
-1. list_databases; use_database (this session) or pass "database"; else the server default (current_database).
+1. list_databases; use_database (this session) or pass "database"; else your default, then the server default.
 2. create_collection, optionally with a schema; describe_collection shows schema, indexes, count.
-3. insert_document {"collection", "document"}; _id optional (UUID).
-4. find_documents {"query": {"filters": [{"field": "age", "operator": "gte", "value": 18}], "any": [[...], [...]], "sort": [{"field": "age", "order": "desc"}], "fields": ["name"], "limit": 10}}. Operators: eq ne gt gte lt lte in, contains (case-insensitive substring), has has_any has_all (array elements; indexed). Filters AND; "any" groups OR. A missing field matches nothing, not even ne. count_documents and distinct take the same filters.
-5. update_document: "updates" set fields, "unset" removes them, "upsert" creates; replace_document swaps a whole document. "if": [filters] on update/replace/delete writes only if the stored document still matches (compare-and-set; on "condition failed" re-read and retry).
-6. {"$now": true} as a value is the server time (RFC 3339 UTC).
-7. update_schema (checks every document), rename_collection, copy_collection, delete_collection, create_index, drop_index.
+3. insert_document {"collection", "document"} (_id optional); insert_documents takes many.
+4. find_documents {"query": {"filters": [{"field": "age", "operator": "gte", "value": 18}], "any": [[...]], "sort": [{"field": "age", "order": "desc"}], "fields": ["name"], "limit": 10}}. No limit: 100 docs, 1 MiB by default; if has_more, repeat with "skip": next_skip. "explain": true adds the plan. get_document {"collection", "id"} reads one. Operators: eq ne gt gte lt lte in, contains (case-insensitive), starts_with, has has_any has_all (array elements), exists. Fields may be paths (a.b). Filters AND; "any" groups OR. A missing field matches only exists.
+5. update_document: "updates" set, "unset" removes, inc/push/add_to_set/pull change in place, "upsert" creates; replace_document swaps the document. "if": [filters] writes only if the document still matches (on condition_failed re-read and retry). update_documents and delete_documents take a query; each batch call is atomic.
+6. {"$now": true} as a value is the server time.
+7. update_schema, rename_collection, copy_collection, delete_collection, create_index (unique optional), drop_index; server_stats shows sizes.
 
-Results sort by _id unless "sort" is given. Numbers are JSON numbers. Every successful write is durable.
+Errors start with a code such as [not_found] or [permission_denied]. With tokens, access is per database (whoami). Results sort by _id unless "sort" is given. Every successful write is durable.
 
 `)
 	b.WriteString(`Full documentation (read as resources):

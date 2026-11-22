@@ -6,7 +6,6 @@ import (
 	"errors"
 	"hash/crc32"
 	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -67,111 +66,10 @@ func FuzzSegmentRecordDecode(f *testing.F) {
 	})
 }
 
-// sealSidecar builds a sidecar file image around body with a valid
-// checksum.
-func sealSidecar(magic string, version uint16, body []byte) []byte {
-	buf := newSidecar(magic, version, len(body))
-	buf = append(buf, body...)
-	return finishSidecar(buf)
-}
-
-// FuzzSidecarRead writes random bytes as a hint file (kind even) or an
-// index snapshot (kind odd) and checks that ReadHint and ReadIndexSnapshot
-// never panic, fail only with ErrCorrupt, and that whatever they accept
-// re-encodes to identical data. With seal set, the bytes are the body of a
-// sidecar with a valid header and checksum, so the fuzzer reaches the
-// structural checks behind the checksum.
-func FuzzSidecarRead(f *testing.F) {
-	const seg = 6
-	seedDir := f.TempDir()
-	if err := WriteHint(seedDir, seg, hintEntries(seg, 12)); err != nil {
-		f.Fatal(err)
-	}
-	snap := &IndexSnapshot{Name: "ix", Field: "tags", CoversSeg: 3, CoversPos: 1234, CoversWAL: 99,
-		Keys: map[string][]string{`s:"a"`: {"1", "2"}, `n:3`: {"3"}, `b:true`: {}}}
-	if err := WriteIndexSnapshot(seedDir, snap); err != nil {
-		f.Fatal(err)
-	}
-	for kind, path := range []string{hintPath(seedDir, seg), filepath.Join(seedDir, "idx-ix.snap")} {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			f.Fatal(err)
-		}
-		body := data[sidecarHeaderSize : len(data)-sidecarCRCSize]
-		f.Add(uint8(kind), false, data)
-		f.Add(uint8(kind), false, data[:len(data)-1])
-		f.Add(uint8(kind), true, body)
-		f.Add(uint8(kind), true, body[:len(body)-3])
-		f.Add(uint8(kind), true, append(bytes.Clone(body), 0))
-		huge := bytes.Clone(body)
-		// The count after the hint's segment / the snapshot's fixed part.
-		at := 4
-		if kind == 1 {
-			at = 2 + 2 + 2 + 4 + 4 + 8 + 8
-		}
-		binary.LittleEndian.PutUint32(huge[at:], 0xFFFFFFFF)
-		f.Add(uint8(kind), true, huge)
-	}
-	f.Add(uint8(0), false, []byte{})
-	f.Add(uint8(1), true, []byte{})
-
-	f.Fuzz(func(t *testing.T, kind uint8, seal bool, data []byte) {
-		dir := t.TempDir()
-		if kind%2 == 0 {
-			if seal {
-				data = sealSidecar(hintMagic, hintVersion, data)
-			}
-			if err := os.WriteFile(hintPath(dir, seg), data, 0o644); err != nil {
-				t.Fatal(err)
-			}
-			entries, err := ReadHint(dir, seg)
-			if err != nil {
-				if !errors.Is(err, ErrCorrupt) {
-					t.Fatalf("ReadHint error %v does not wrap ErrCorrupt", err)
-				}
-				return
-			}
-			out := t.TempDir()
-			if err := WriteHint(out, seg, entries); err != nil {
-				t.Fatalf("WriteHint of accepted entries: %v", err)
-			}
-			if got := readFile(t, hintPath(out, seg)); !bytes.Equal(got, data) {
-				t.Fatalf("hint re-encodes differently:\n got %x\nwant %x", got, data)
-			}
-			return
-		}
-
-		const name = "ix"
-		if seal {
-			data = sealSidecar(snapshotMagic, snapshotVersion, data)
-		}
-		if err := os.WriteFile(filepath.Join(dir, "idx-"+name+".snap"), data, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		s, err := ReadIndexSnapshot(dir, name)
-		if err != nil {
-			if !errors.Is(err, ErrCorrupt) {
-				t.Fatalf("ReadIndexSnapshot error %v does not wrap ErrCorrupt", err)
-			}
-			return
-		}
-		out := t.TempDir()
-		if err := WriteIndexSnapshot(out, s); err != nil {
-			t.Fatalf("WriteIndexSnapshot of an accepted snapshot: %v", err)
-		}
-		again, err := ReadIndexSnapshot(out, name)
-		if err != nil {
-			t.Fatalf("reading the re-encoded snapshot: %v", err)
-		}
-		if !equalSnapshots(s, again) {
-			t.Fatalf("snapshot re-encodes differently: %+v -> %+v", s, again)
-		}
-	})
-}
-
 // FuzzSegmentScan writes random bytes as a data segment and checks that
-// Scan and Reader.Read never panic, fail only with ErrCorrupt, and that
-// every record Scan yields is the CRC-checked record at its location.
+// Scan, ScanHeaders, and Reader.Read never panic, fail only with ErrCorrupt,
+// that every record Scan yields is the CRC-checked record at its location,
+// and that ScanHeaders agrees with Scan.
 func FuzzSegmentScan(f *testing.F) {
 	const seg = 2
 	seedDir := f.TempDir()
@@ -229,6 +127,35 @@ func FuzzSegmentScan(f *testing.F) {
 		}
 		if len(got) > 0 && int64(pos) != end {
 			t.Fatalf("records end at %d, Scan reported %d", pos, end)
+		}
+
+		// ScanHeaders sees a prefix-compatible view: the same records at the
+		// same locations, without documents. It may go further than Scan
+		// only past a put whose document does not decompress.
+		var hdrs []scanned
+		hEnd, hErr := ScanHeaders(dir, seg, func(r Record, l Location) error {
+			hdrs = append(hdrs, scanned{r, l})
+			return nil
+		})
+		if hErr != nil && !errors.Is(hErr, ErrCorrupt) {
+			t.Fatalf("ScanHeaders error %v does not wrap ErrCorrupt", hErr)
+		}
+		if len(hdrs) < len(got) || hEnd < end {
+			t.Fatalf("ScanHeaders saw %d records to byte %d, Scan %d to byte %d", len(hdrs), hEnd, len(got), end)
+		}
+		for i, h := range hdrs {
+			if h.rec.Doc != nil {
+				t.Fatalf("ScanHeaders record %d has a document", i)
+			}
+			if i < len(got) && (h.loc != got[i].loc || h.rec.ID != got[i].rec.ID || h.rec.Type != got[i].rec.Type || h.rec.WALOffset != got[i].rec.WALOffset) {
+				t.Fatalf("ScanHeaders and Scan disagree on record %d", i)
+			}
+		}
+		if len(hdrs) > len(got) && (hdrs[len(got)].rec.Type != TypePut || err == nil) {
+			t.Fatalf("ScanHeaders went past Scan's stop (%v) at a %s record", err, hdrs[len(got)].rec.Type)
+		}
+		if len(hdrs) == len(got) && (hEnd != end || (hErr == nil) != (err == nil)) {
+			t.Fatalf("ScanHeaders = %d, %v; Scan = %d, %v", hEnd, hErr, end, err)
 		}
 
 		r, err := OpenReader(dir, seg)

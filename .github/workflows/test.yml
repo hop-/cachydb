@@ -1,6 +1,6 @@
 # Go tests for every pull request and every push to master.
 #
-# - lint: build, gofmt, vet, and go.mod/go.sum tidiness.
+# - lint: build, gofmt, vet, staticcheck, and go.mod/go.sum tidiness.
 # - test: go test -race and the quick stress loop on the minimum Go
 #   version (go.mod) and the current stable Go, on Linux only (macOS
 #   runners are too slow; darwin is covered by the cross-build).
@@ -61,6 +61,11 @@ jobs:
 
       - name: go vet
         run: go vet ./...
+
+      # Pinned, and run with "go run" so it stays out of go.mod. The same
+      # command is in dev-docs/DEVELOPMENT.md; change both together.
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 
       - name: go.mod and go.sum are tidy
         run: go mod tidy -diff

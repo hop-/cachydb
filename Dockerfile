@@ -3,6 +3,10 @@
 # Official cachydb image: a static Go binary on distroless, running as the
 # non-root user 65532 with its data in the /data volume. Configure it with
 # environment variables (TRANSPORT, PORT, DB_NAME, ...); see DOCKERHUB.md.
+# HOST=0.0.0.0 makes the server reachable from outside the container, so
+# under AUTH=auto clients need a token and the container exits at start
+# while no user exists: set BOOTSTRAP_ADMIN_TOKEN (or _FILE), create one
+# with "cachydb utils user add", or set AUTH=off on a trusted network.
 #
 # Build:   docker build --build-arg VERSION=v0.0.4 -t cachydb .
 # Release: .github/workflows/docker.yml builds linux/amd64 and linux/arm64
@@ -12,7 +16,7 @@
 # for TARGETOS/TARGETARCH (CGO_ENABLED=0), so multi-arch builds need no
 # emulation. Base images are pinned by digest; the comments name the tags.
 
-# golang:1.27 (Go 1.27.3; 1.25 is out of security support), multi-arch index digest. go.mod keeps 1.25.5 as the minimum.
+# golang:1.27 (Go 1.27.3), multi-arch index digest. go.mod sets the minimum, Go 1.27.0.
 FROM --platform=$BUILDPLATFORM golang:1.27@sha256:2920bb124f1a2e12a1d39f0cab756ae0068441ee1da7655dec7f5e374944095b AS build
 ARG TARGETOS
 ARG TARGETARCH
@@ -33,12 +37,12 @@ COPY --from=build --chown=65532:65532 /out/data /data
 # No flags in CMD: flags override environment variables, so the image is
 # configured through the environment. Arguments after the image name are
 # passed to cachydb (e.g. "version --json").
-ENV TRANSPORT=http PORT=7601 ROOT_DIR=/data DB_NAME=main
+ENV TRANSPORT=http HOST=0.0.0.0 PORT=7601 ROOT_DIR=/data DB_NAME=main
 EXPOSE 7601
 VOLUME ["/data"]
 USER 65532:65532
-# Probes http://127.0.0.1:$PORT/healthz; exits 0 without probing when
-# TRANSPORT=stdio.
+# Probes http://127.0.0.1:$PORT/healthz (https with TLS_CERT and TLS_KEY;
+# no token needed); exits 0 without probing when TRANSPORT=stdio.
 HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
   CMD ["/usr/local/bin/cachydb", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/cachydb"]

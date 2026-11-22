@@ -64,7 +64,7 @@ var retentionBase = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 // and a capturing logger.
 func retentionEnv(t *testing.T, age time.Duration, size int64) (*testEnv, *fakeClock, *captureHandler) {
 	t.Helper()
-	env := newEnv(t, segmentHeaderSize+2*recordSize(ptr(testRec(1))))
+	env := newEnv(t, segmentHeaderSize+2*recordSize(new(testRec(1))))
 	clock := newFakeClock(retentionBase)
 	h := &captureHandler{}
 	env.retentionAge, env.retentionSize = age, size
@@ -113,7 +113,7 @@ func span(from, to uint64) []uint64 {
 }
 
 func TestEnforceRetention(t *testing.T) {
-	recSize := recordSize(ptr(testRec(1)))
+	recSize := recordSize(new(testRec(1)))
 	sealed := segmentHeaderSize + 2*recSize // S
 	active := segmentHeaderSize + recSize   // the active segment holds record 11
 	total := 5*sealed + active
@@ -351,7 +351,7 @@ func TestReadFromSurvivesConcurrentRetention(t *testing.T) {
 }
 
 func TestRetentionConcurrentWithAppendsAndReads(t *testing.T) {
-	env := newEnv(t, segmentHeaderSize+2*recordSize(ptr(testRec(1))))
+	env := newEnv(t, segmentHeaderSize+2*recordSize(new(testRec(1))))
 	env.retentionSize = 1
 	l := env.mustOpen(t, nil)
 	// Everything but the last few records counts as processed.
@@ -363,20 +363,16 @@ func TestRetentionConcurrentWithAppendsAndReads(t *testing.T) {
 	defer cancel()
 	var wg sync.WaitGroup
 	errc := make(chan error, 4)
-	wg.Add(1)
-	go func() { // retention pressure in addition to the post-rotation passes
-		defer wg.Done()
+	wg.Go(func() { // retention pressure in addition to the post-rotation passes
 		for ctx.Err() == nil {
 			if err := l.EnforceRetention(); err != nil {
 				errc <- err
 				return
 			}
 		}
-	}()
+	})
 	for range 2 {
-		wg.Add(1)
-		go func() { // readers start at the low-water mark, as engine recovery would
-			defer wg.Done()
+		wg.Go(func() { // readers start at the low-water mark, as engine recovery would
 			for ctx.Err() == nil {
 				from := lowWater()
 				prev := uint64(0)
@@ -392,7 +388,7 @@ func TestRetentionConcurrentWithAppendsAndReads(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	for i := 1; i <= n; i++ {
 		mustAppend(t, l, testRec(i))

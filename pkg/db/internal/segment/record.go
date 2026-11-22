@@ -167,69 +167,94 @@ func appendRecord(buf []byte, r *Record) ([]byte, error) {
 
 var errBadBody = errors.New("malformed record body")
 
-// decodeBody decodes the crc-covered part of a record, decompressing the
-// document. The returned record does not alias body.
-func decodeBody(body []byte) (Record, error) {
+// parseBody validates the crc-covered part of a record and returns its
+// header fields (Doc left nil) with the stored document: its uncompressed
+// length, codec, and bytes as they are on disk. It checks everything that
+// can be checked without decompressing. The returned record does not alias
+// body; payload does.
+func parseBody(body []byte) (r Record, rawLen uint32, codec byte, payload []byte, err error) {
 	le := binary.LittleEndian
 	if len(body) < recordFixedBody {
-		return Record{}, errBadBody
+		return Record{}, 0, 0, nil, errBadBody
 	}
-	var r Record
 	r.Type = RecordType(body[0])
 	if !r.Type.valid() {
-		return Record{}, fmt.Errorf("%w: unknown type %d", errBadBody, body[0])
+		return Record{}, 0, 0, nil, fmt.Errorf("%w: unknown type %d", errBadBody, body[0])
 	}
 	r.WALOffset = le.Uint64(body[1:])
 	idLen := int(le.Uint16(body[9:]))
 	rest := body[11:]
 	if len(rest) < idLen+4+1 {
-		return Record{}, errBadBody
+		return Record{}, 0, 0, nil, errBadBody
 	}
 	r.ID = string(rest[:idLen])
 	rest = rest[idLen:]
-	rawLen := le.Uint32(rest)
-	codec := rest[4]
-	payload := rest[5:]
+	rawLen = le.Uint32(rest)
+	codec = rest[4]
+	payload = rest[5:]
 
 	if r.Type != TypePut {
 		if rawLen != 0 || codec != codecNone || len(payload) != 0 {
-			return Record{}, fmt.Errorf("%w: %s record with a body", errBadBody, r.Type)
+			return Record{}, 0, 0, nil, fmt.Errorf("%w: %s record with a body", errBadBody, r.Type)
 		}
 		if (r.Type == TypeCheckpoint) != (r.ID == "") {
-			return Record{}, fmt.Errorf("%w: %s record with bad id", errBadBody, r.Type)
+			return Record{}, 0, 0, nil, fmt.Errorf("%w: %s record with bad id", errBadBody, r.Type)
 		}
-		return r, nil
+		return r, rawLen, codec, payload, nil
 	}
 	if r.ID == "" {
-		return Record{}, fmt.Errorf("%w: put record without id", errBadBody)
+		return Record{}, 0, 0, nil, fmt.Errorf("%w: put record without id", errBadBody)
 	}
 	switch codec {
 	case codecNone:
 		if uint64(len(payload)) != uint64(rawLen) {
-			return Record{}, fmt.Errorf("%w: body length %d, raw length %d", errBadBody, len(payload), rawLen)
+			return Record{}, 0, 0, nil, fmt.Errorf("%w: body length %d, raw length %d", errBadBody, len(payload), rawLen)
 		}
-		r.Doc = append([]byte(nil), payload...)
 	case codecZstd:
-		// rawLen sizes the output buffer, so check it against the most
-		// the payload can expand to before allocating: a zstd block
-		// decodes to at most 128 KiB and takes at least 3 bytes.
+		// rawLen sizes the decoder's output buffer, so check it against
+		// the most the payload can expand to before anything allocates: a
+		// zstd block decodes to at most 128 KiB and takes at least 3 bytes.
 		if uint64(rawLen) > uint64(len(payload))*maxZstdExpansion {
-			return Record{}, fmt.Errorf("%w: raw length %d impossible for %d compressed bytes", errBadBody, rawLen, len(payload))
+			return Record{}, 0, 0, nil, fmt.Errorf("%w: raw length %d impossible for %d compressed bytes", errBadBody, rawLen, len(payload))
 		}
-		dec, err := zstdDecoder()
-		if err != nil {
-			return Record{}, fmt.Errorf("segment: creating zstd decoder: %w", err)
-		}
-		doc, err := dec.DecodeAll(payload, make([]byte, 0, rawLen))
-		if err != nil {
-			return Record{}, fmt.Errorf("%w: zstd: %v", errBadBody, err)
-		}
-		if uint64(len(doc)) != uint64(rawLen) {
-			return Record{}, fmt.Errorf("%w: decompressed %d bytes, raw length %d", errBadBody, len(doc), rawLen)
-		}
-		r.Doc = doc
 	default:
-		return Record{}, fmt.Errorf("%w: unknown codec %d", errBadBody, codec)
+		return Record{}, 0, 0, nil, fmt.Errorf("%w: unknown codec %d", errBadBody, codec)
 	}
+	return r, rawLen, codec, payload, nil
+}
+
+// decodeHeader decodes the crc-covered part of a record without its
+// document: Doc is nil and the zstd decoder is not called. It accepts
+// every body decodeBody accepts, plus puts whose compressed document is
+// damaged in a way only decompression finds. The returned record does not
+// alias body.
+func decodeHeader(body []byte) (Record, error) {
+	r, _, _, _, err := parseBody(body)
+	return r, err
+}
+
+// decodeBody decodes the crc-covered part of a record, decompressing the
+// document. The returned record does not alias body.
+func decodeBody(body []byte) (Record, error) {
+	r, rawLen, codec, payload, err := parseBody(body)
+	if err != nil || r.Type != TypePut {
+		return r, err
+	}
+	if codec == codecNone {
+		r.Doc = append([]byte(nil), payload...)
+		return r, nil
+	}
+	dec, err := zstdDecoder()
+	if err != nil {
+		return Record{}, fmt.Errorf("segment: creating zstd decoder: %w", err)
+	}
+	doc, err := dec.DecodeAll(payload, make([]byte, 0, rawLen))
+	if err != nil {
+		return Record{}, fmt.Errorf("%w: zstd: %v", errBadBody, err)
+	}
+	if uint64(len(doc)) != uint64(rawLen) {
+		return Record{}, fmt.Errorf("%w: decompressed %d bytes, raw length %d", errBadBody, len(doc), rawLen)
+	}
+	r.Doc = doc
 	return r, nil
 }

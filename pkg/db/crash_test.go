@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -34,21 +33,6 @@ type modelColl struct {
 	docs    map[string]map[string]any // id -> data
 }
 
-func (m model) clone() model {
-	out := make(model, len(m))
-	for dn, colls := range m {
-		out[dn] = make(map[string]*modelColl, len(colls))
-		for cn, mc := range colls {
-			docs := make(map[string]map[string]any, len(mc.docs))
-			for id, data := range mc.docs {
-				docs[id] = maps.Clone(data)
-			}
-			out[dn][cn] = &modelColl{schema: cloneSchema(mc.schema), indexes: maps.Clone(mc.indexes), docs: docs}
-		}
-	}
-	return out
-}
-
 // dump renders m deterministically, for comparisons with readable diffs.
 func (m model) dump() string {
 	var b strings.Builder
@@ -72,7 +56,8 @@ func (m model) dump() string {
 
 // captureModel reads the whole logical state of e. It also checks that
 // every collection's Count and every secondary index agree with its
-// documents (an index must equal one rebuilt from scratch).
+// documents (the index file's entries must equal those rebuilt from
+// scratch; see checkIndexEntries).
 func captureModel(t *testing.T, e *Engine) model {
 	t.Helper()
 	ctx := context.Background()
@@ -94,18 +79,7 @@ func captureModel(t *testing.T, e *Engine) model {
 				t.Errorf("%s/%s: Count = %d, Find returned %d documents", dn, cn, c.Count(), len(docs))
 			}
 			d.mu.RLock()
-			c.mu.RLock()
-			for name, ix := range c.indexes {
-				mc.indexes[name] = ix.field
-				want := newIndex(name, ix.field)
-				for _, doc := range docs {
-					want.add(doc.ID, doc)
-				}
-				if got, w := ix.snapshotKeys(), want.snapshotKeys(); !reflect.DeepEqual(got, w) {
-					t.Errorf("%s/%s: index %s = %v, rebuilt from the documents = %v", dn, cn, name, got, w)
-				}
-			}
-			c.mu.RUnlock()
+			mc.indexes = checkIndexEntries(t, c, docs)
 			d.mu.RUnlock()
 			m[dn][cn] = mc
 		}
@@ -125,7 +99,7 @@ func checkModel(t *testing.T, e *Engine, want model) {
 func lineDiff(got, want string) string {
 	count := func(s string) map[string]int {
 		m := map[string]int{}
-		for _, l := range strings.Split(strings.TrimSuffix(s, "\n"), "\n") {
+		for l := range strings.SplitSeq(strings.TrimSuffix(s, "\n"), "\n") {
 			m[l]++
 		}
 		return m
@@ -235,6 +209,52 @@ var crashOps = []struct {
 		apply: func(m model) { delete(m["app"]["c"].docs, "d") },
 	},
 	{
+		// One batch record (op 11) with every kind of operation: all of it
+		// lands or none (plan 013 §3.1).
+		name: "batch",
+		run: func(ctx context.Context, _ *Database, c *Collection) error {
+			_, err := c.Batch(ctx, []WriteOp{
+				{Kind: OpInsert, Document: &Document{ID: "new", Data: map[string]any{"g": "z", "v": 9}}},
+				{Kind: OpUpdate, ID: "u", Update: UpdateSpec{Set: map[string]any{"g": "y"}, Unset: []string{"v"}}},
+				{Kind: OpReplace, ID: "m", Document: &Document{Data: map[string]any{"g": "x", "r": true}}},
+				{Kind: OpDelete, ID: "d"},
+				{Kind: OpUpdate, ID: "ups", Update: UpdateSpec{Set: map[string]any{"g": "w"}, Upsert: true}},
+			})
+			return err
+		},
+		apply: func(m model) {
+			docs := m["app"]["c"].docs
+			docs["new"] = map[string]any{"g": "z", "v": 9}
+			docs["u"] = map[string]any{"g": "y"}
+			docs["m"] = map[string]any{"g": "x", "r": true}
+			delete(docs, "d")
+			docs["ups"] = map[string]any{"g": "w"}
+		},
+	},
+	{
+		name: "update_many",
+		run: func(ctx context.Context, _ *Database, c *Collection) error {
+			_, _, err := c.UpdateMany(ctx, &Query{Filters: []QueryFilter{eqf("g", "x")}}, UpdateSpec{Set: map[string]any{"h": 1}, Unset: []string{"v"}}, 0)
+			return err
+		},
+		apply: func(m model) {
+			docs := m["app"]["c"].docs
+			docs["u"] = map[string]any{"g": "x", "h": 1}
+			docs["d"] = map[string]any{"g": "x", "h": 1}
+		},
+	},
+	{
+		name: "delete_many",
+		run: func(ctx context.Context, _ *Database, c *Collection) error {
+			_, _, err := c.DeleteMany(ctx, &Query{Filters: []QueryFilter{eqf("g", "y")}}, 0)
+			return err
+		},
+		apply: func(m model) {
+			delete(m["app"]["c"].docs, "k")
+			delete(m["app"]["c"].docs, "m")
+		},
+	},
+	{
 		name: "create_coll_schema",
 		meta: true,
 		run: func(ctx context.Context, d *Database, _ *Collection) error {
@@ -270,7 +290,7 @@ var crashOps = []struct {
 // after it. The "torn" variants also lose the tail of the flush's
 // unsynced segment write.
 func TestCrashMatrix(t *testing.T) {
-	points := []hookPoint{hookMetaWrite, hookAfterWALSync, hookAfterSegWrite, hookAfterSegSync}
+	points := []hookPoint{hookMetaWrite, hookAfterWALSync, hookAfterSegWrite, hookAfterSegSync, hookAfterIndexCommit}
 	for _, p := range points {
 		for _, op := range crashOps {
 			for _, torn := range []bool{false, true} {
@@ -300,7 +320,7 @@ func TestCrashMatrix(t *testing.T) {
 						t.Fatalf("flush: %v", flushErr)
 					}
 					crashed := errors.Is(opErr, errSimulatedCrash) || errors.Is(flushErr, errSimulatedCrash)
-					wantCrash := p == hookAfterSegWrite || p == hookAfterSegSync || (p == hookMetaWrite) == op.meta
+					wantCrash := p == hookAfterSegWrite || p == hookAfterSegSync || p == hookAfterIndexCommit || (p == hookMetaWrite) == op.meta
 					if crashed != wantCrash {
 						t.Logf("expected state before the operation:\n%s", want.dump())
 						t.Fatalf("crashed = %v, want %v at hook %s (op error %v, flush error %v)", crashed, wantCrash, p, opErr, flushErr)

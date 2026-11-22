@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -246,11 +247,11 @@ func resultText(res *mcp.CallToolResult) string {
 			return string(data)
 		}
 	}
-	var out string
+	var out strings.Builder
 	for _, c := range res.Content {
 		if t, ok := c.(*mcp.TextContent); ok {
-			out += t.Text
+			out.WriteString(t.Text)
 		}
 	}
-	return out
+	return out.String()
 }

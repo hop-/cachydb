@@ -140,7 +140,7 @@ func TestEngineAdapterMissing(t *testing.T) {
 		{"Documents", func(d string) error { return a.Documents(ctx, d, "c", func(map[string]any) error { return nil }) }},
 		{"CreateCollection", func(d string) error { return a.CreateCollection(ctx, d, "c", nil) }},
 		{"UpdateSchema", func(d string) error { return a.UpdateSchema(ctx, d, "c", nil) }},
-		{"CreateIndex", func(d string) error { return a.CreateIndex(ctx, d, "c", "i", "f") }},
+		{"CreateIndex", func(d string) error { return a.CreateIndex(ctx, d, "c", db.IndexInfo{Name: "i", Field: "f"}) }},
 		{"DropIndex", func(d string) error { return a.DropIndex(ctx, d, "c", "i") }},
 		{"InsertDocument", func(d string) error { return a.InsertDocument(ctx, d, "c", map[string]any{"_id": "x"}) }},
 		{"ReplaceDocument", func(d string) error { return a.ReplaceDocument(ctx, d, "c", map[string]any{"_id": "x"}) }},

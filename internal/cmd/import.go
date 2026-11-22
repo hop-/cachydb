@@ -21,8 +21,13 @@ and indexes; documents keep their _id.
 --on-conflict decides what happens to a document whose _id exists:
   fail     stop there (the default) and report how many lines were applied
   skip     keep the existing document
-  replace  replace it; a collection whose schema differs gets the file's
-           schema (checked against its documents) and missing indexes
+  replace  overwrite it with the file's copy; a collection whose schema
+           differs gets the file's schema (checked against its documents)
+           and missing indexes
+  keep     seed: create only what is missing (databases, collections with
+           the file's schema and indexes, documents) and leave everything
+           that exists as it is, even a collection whose schema or indexes
+           differ from the file; safe to re-run
 With fail or skip, an existing collection with a different schema or
 index set is an error.
 
@@ -31,6 +36,7 @@ cachydb server is running on the same data directory; use
 "cachydb client import" against the running server instead.`,
 	Example: `  cachydb utils import -i backup.jsonl
   cachydb utils import -i backup.jsonl --on-conflict skip -R /new/data
+  cachydb utils import -i seed.jsonl --on-conflict keep
   cat backup.jsonl | cachydb utils import -i -`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -55,9 +61,12 @@ var (
 
 func init() {
 	importCmd.Flags().StringVarP(&importInput, "input", "i", "", "file to import (- for stdin)")
-	importCmd.Flags().StringVar(&importOnConflict, "on-conflict", string(exportfmt.Fail), "existing _id: fail, skip, or replace")
+	importCmd.Flags().StringVar(&importOnConflict, "on-conflict", string(exportfmt.Fail), onConflictUsage)
 	utilsCmd.AddCommand(importCmd)
 }
+
+// onConflictUsage is the usage of --on-conflict of both import commands.
+const onConflictUsage = "existing _id or collection: fail, skip, replace (overwrites documents), or keep (seed: create only what is missing)"
 
 // importOffline opens the engine with opts and imports r, reporting a
 // summary on diag.

@@ -34,7 +34,7 @@ func TestDescribeAccessors(t *testing.T) {
 	if c.Schema().Fields["name"].Type != TypeString {
 		t.Error("Schema() shares memory with the collection")
 	}
-	if want := []IndexInfo{{"by_a", "a"}, {"by_z", "z"}}; !reflect.DeepEqual(c.Indexes(), want) {
+	if want := []IndexInfo{{Name: "by_a", Field: "a"}, {Name: "by_z", Field: "z"}}; !reflect.DeepEqual(c.Indexes(), want) {
 		t.Errorf("Indexes() = %v, want %v", c.Indexes(), want)
 	}
 	d := mustDB(t, e, "app")

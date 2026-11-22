@@ -2,17 +2,26 @@ package mcpserver
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"maps"
+	"math"
 	"net"
 	"net/http"
 	"os"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/hop-/cachydb/internal/auth"
 	"github.com/hop-/cachydb/pkg/db"
+	sdkauth "github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -25,6 +34,37 @@ const httpSessionTimeout = 30 * time.Minute
 // context is cancelled.
 const httpShutdownTimeout = 5 * time.Second
 
+// Result bounds of find_documents (approach-agent-interface §2): the
+// defaults of Config.DefaultLimit and Config.MaxResultBytes.
+const (
+	DefaultFindLimit      = 100
+	DefaultMaxResultBytes = 1 << 20 // 1 MiB
+)
+
+// Result text modes (approach-agent-interface §8, FR-20): what the text
+// content of a successful tool result holds. The structured content is
+// always complete.
+const (
+	// ResultTextFull: the text content is the structured content's JSON
+	// (the SDK's fallback; the default, unchanged since v0.0.6).
+	ResultTextFull = "full"
+	// ResultTextSummary: the text content is one summary line, such as
+	// "12 documents, has_more: false".
+	ResultTextSummary = "summary"
+)
+
+// ResultTextModes lists the valid result text modes.
+var ResultTextModes = []string{ResultTextFull, ResultTextSummary}
+
+// ValidateResultText reports an error for a result text mode other than
+// full or summary.
+func ValidateResultText(mode string) error {
+	if !slices.Contains(ResultTextModes, mode) {
+		return fmt.Errorf("invalid result text mode %q: use full or summary", mode)
+	}
+	return nil
+}
+
 // Server is the CachyDB MCP server. Its tool handlers only call methods of
 // the *db.Engine it was given; the engine is owned by the caller, which
 // must close it after Close returns.
@@ -33,10 +73,28 @@ type Server struct {
 	server        *mcp.Server
 	defaultDBName string
 	transport     string
-	httpAddr      string
-	version       string        // build version, reported by /healthz
-	stderr        io.Writer     // startup/shutdown messages; never stdout
-	stdio         mcp.Transport // the stdio transport; tests replace it
+	httpAddr      string // host:port the HTTP transport listens on
+	tlsCert       string // PEM files; both set = HTTPS
+	tlsKey        string
+	version       string    // build version, reported by /healthz
+	started       time.Time // when New created the server (server_stats uptime)
+	// defaultLimit is the find_documents limit when the call gives none;
+	// maxResultBytes caps the JSON size of its documents.
+	defaultLimit   int
+	maxResultBytes int64
+	// summaryText: successful tool results carry a one-line summary as
+	// text content instead of the JSON (ResultTextSummary).
+	summaryText bool
+	// tokensRequired means every /mcp request must carry the token of a
+	// user in users; /healthz never needs one.
+	tokensRequired bool
+	users          *auth.Store   // set when tokensRequired, may be set otherwise
+	logger         *slog.Logger  // failed authentications, user-management changes
+	stderr         io.Writer     // startup/shutdown messages; never stdout
+	stdio          mcp.Transport // the stdio transport; tests replace it
+	// adminTools names the registered user-management tools, which
+	// tools/list shows only to server admins (filterToolsList).
+	adminTools map[string]bool
 
 	// sessions maps *mcp.ServerSession to *sessionState: the database the
 	// session selected with use_database.
@@ -65,32 +123,125 @@ func (st *sessionState) set(name string) {
 	st.database = name
 }
 
-// NewServer creates an MCP server on the opened engine. It creates the
-// default database if it does not exist. transport is "http" or anything
-// else for stdio; httpAddr is the listen address for HTTP; version is the
-// build version reported in the server's implementation info.
+// Config is the configuration of a Server.
+type Config struct {
+	// DefaultDatabase is created if missing and used when a tool call
+	// names no database and the session chose none.
+	DefaultDatabase string
+	// Transport is "http", or anything else for stdio.
+	Transport string
+	// Listen is where the HTTP transport listens, and whether it serves
+	// TLS.
+	Listen ListenConfig
+	// Version is the build version reported in the server's
+	// implementation info and by /healthz.
+	Version string
+	// TokensRequired makes every HTTP request to /mcp present the token
+	// of a user in Users (the start-up decision of auth.Decide). /healthz
+	// never needs a token, and stdio is never affected.
+	TokensRequired bool
+	// Users is the auth store; it must be set when TokensRequired is. It
+	// may be set without TokensRequired: delete_database then still
+	// removes the deleted database's grants, and every call keeps full
+	// access.
+	Users *auth.Store
+	// Logger receives failed authentications (INFO); nil means
+	// slog.Default().
+	Logger *slog.Logger
+	// DefaultLimit is the number of documents find_documents returns at
+	// most when the call gives no limit (or 0); 0 means DefaultFindLimit.
+	DefaultLimit int
+	// MaxResultBytes caps the JSON size of the documents find_documents
+	// returns, whatever the limit (at least one document is returned); 0
+	// means DefaultMaxResultBytes.
+	MaxResultBytes int64
+	// ResultText is the text content of successful tool results:
+	// ResultTextFull (the JSON; "" means full) or ResultTextSummary (one
+	// line). The structured content is complete in both.
+	ResultText string
+}
+
+// NewServer creates a server without TLS or tokens: New with the given
+// default database, transport, HTTP listen address ("host:port"; empty
+// means DefaultHost on a free port), and version.
 func NewServer(ctx context.Context, engine *db.Engine, defaultDBName, transport, httpAddr, version string) (*Server, error) {
+	var listen ListenConfig
+	if httpAddr != "" {
+		host, port, err := net.SplitHostPort(httpAddr)
+		if err != nil {
+			return nil, fmt.Errorf("creating MCP server: listen address: %w", err)
+		}
+		if listen.Port, err = strconv.Atoi(port); err != nil {
+			return nil, fmt.Errorf("creating MCP server: listen address %q: invalid port", httpAddr)
+		}
+		listen.Host = host
+	}
+	return New(ctx, engine, Config{
+		DefaultDatabase: defaultDBName,
+		Transport:       transport,
+		Listen:          listen,
+		Version:         version,
+	})
+}
+
+// New creates an MCP server on the opened engine. It creates the default
+// database if it does not exist.
+func New(ctx context.Context, engine *db.Engine, cfg Config) (*Server, error) {
 	if engine == nil {
 		return nil, errors.New("creating MCP server: engine is nil")
 	}
-	if _, err := engine.CreateDatabase(ctx, defaultDBName); err != nil {
-		return nil, fmt.Errorf("creating default database %q: %w", defaultDBName, err)
+	if err := cfg.Listen.Validate(); err != nil {
+		return nil, fmt.Errorf("creating MCP server: %w", err)
+	}
+	if cfg.TokensRequired && cfg.Users == nil {
+		return nil, errors.New("creating MCP server: tokens are required but there is no auth store")
+	}
+	if cfg.DefaultLimit < 0 || cfg.MaxResultBytes < 0 {
+		return nil, fmt.Errorf("creating MCP server: the default limit (%d) and the result byte cap (%d) must not be negative", cfg.DefaultLimit, cfg.MaxResultBytes)
+	}
+	if cfg.ResultText == "" {
+		cfg.ResultText = ResultTextFull
+	}
+	if err := ValidateResultText(cfg.ResultText); err != nil {
+		return nil, fmt.Errorf("creating MCP server: %w", err)
+	}
+	if cfg.DefaultLimit == 0 {
+		cfg.DefaultLimit = DefaultFindLimit
+	}
+	if cfg.MaxResultBytes == 0 {
+		cfg.MaxResultBytes = DefaultMaxResultBytes
+	}
+	if _, err := engine.CreateDatabase(ctx, cfg.DefaultDatabase); err != nil {
+		return nil, fmt.Errorf("creating default database %q: %w", cfg.DefaultDatabase, err)
 	}
 
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	s := &Server{
-		engine:        engine,
-		defaultDBName: defaultDBName,
-		transport:     transport,
-		httpAddr:      httpAddr,
-		version:       version,
-		stderr:        os.Stderr,
-		stdio:         &mcp.StdioTransport{},
+		engine:         engine,
+		defaultDBName:  cfg.DefaultDatabase,
+		transport:      cfg.Transport,
+		httpAddr:       cfg.Listen.Addr(),
+		tlsCert:        cfg.Listen.TLSCert,
+		tlsKey:         cfg.Listen.TLSKey,
+		version:        cfg.Version,
+		started:        time.Now(),
+		defaultLimit:   cfg.DefaultLimit,
+		maxResultBytes: cfg.MaxResultBytes,
+		summaryText:    cfg.ResultText == ResultTextSummary,
+		tokensRequired: cfg.TokensRequired,
+		users:          cfg.Users,
+		logger:         logger,
+		stderr:         os.Stderr,
+		stdio:          &mcp.StdioTransport{},
 	}
 
 	s.server = mcp.NewServer(&mcp.Implementation{
 		Name:    "cachydb",
 		Title:   "CachyDB document database",
-		Version: version,
+		Version: cfg.Version,
 	}, &mcp.ServerOptions{
 		Instructions: Instructions(),
 		InitializedHandler: func(_ context.Context, req *mcp.InitializedRequest) {
@@ -101,7 +252,12 @@ func NewServer(ctx context.Context, engine *db.Engine, defaultDBName, transport,
 	// handshake (server/discover), so InitializedHandler never runs for
 	// them: also track the session on every request it sends.
 	s.server.AddReceivingMiddleware(s.trackSessionMiddleware)
-	s.registerTools(s.server)
+	if s.tokensRequired {
+		s.server.AddReceivingMiddleware(s.filterToolsList)
+	}
+	if err := s.registerTools(s.server); err != nil {
+		return nil, fmt.Errorf("creating MCP server: %w", err)
+	}
 	if err := registerDocsResources(s.server); err != nil {
 		return nil, fmt.Errorf("creating MCP server: %w", err)
 	}
@@ -189,14 +345,12 @@ func (s *Server) trackSession(ss *mcp.ServerSession) *sessionState {
 	}
 	v, loaded := s.sessions.LoadOrStore(ss, &sessionState{})
 	if !loaded {
-		s.waiters.Add(1)
-		go func() {
-			defer s.waiters.Done()
+		s.waiters.Go(func() {
 			// The wait error only says how the session ended; there is
 			// nothing to do with it beyond forgetting the session.
 			_ = ss.Wait()
 			s.sessions.Delete(ss)
-		}()
+		})
 	}
 	return v.(*sessionState)
 }
@@ -247,14 +401,61 @@ func (s *Server) startStdio(ctx context.Context) error {
 }
 
 // httpHandler returns the HTTP handler: the Streamable HTTP transport
-// serving s.server at /mcp, and the health endpoint at /healthz.
+// serving s.server at /mcp, and the health endpoint at /healthz. When
+// tokens are required, /mcp answers 401 to a request without a valid
+// bearer token; /healthz stays open.
 func (s *Server) httpHandler() http.Handler {
-	mux := http.NewServeMux()
-	mux.Handle("/mcp", mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+	var mcpHandler http.Handler = mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return s.server
-	}, &mcp.StreamableHTTPOptions{SessionTimeout: httpSessionTimeout}))
+	}, &mcp.StreamableHTTPOptions{SessionTimeout: httpSessionTimeout})
+	if s.tokensRequired {
+		mcpHandler = s.logMissingToken(sdkauth.RequireBearerToken(s.verifyToken, &sdkauth.RequireBearerTokenOptions{
+			// Tokens do not expire.
+			AllowMissingExpiration: true,
+		})(mcpHandler))
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", mcpHandler)
 	mux.HandleFunc("/healthz", s.healthz)
 	return mux
+}
+
+// verifyToken is the bearer-token verifier of /mcp: it accepts the token
+// of any user and returns TokenInfo{UserID: user name}, or an error
+// wrapping the SDK's ErrInvalidToken (HTTP 401) for an unknown or revoked
+// token. The SDK binds each session to the user that created it and
+// answers 403 when another user's token reuses it; the tool handlers
+// authorize every call by the user's current grants.
+func (s *Server) verifyToken(_ context.Context, token string, r *http.Request) (*sdkauth.TokenInfo, error) {
+	p, err := s.users.Authenticate(token)
+	if err != nil {
+		s.logAuthFailure(r, "unknown or revoked token")
+		return nil, fmt.Errorf("%w: unknown or revoked token", sdkauth.ErrInvalidToken)
+	}
+	return &sdkauth.TokenInfo{UserID: p.Name}, nil
+}
+
+// logMissingToken logs the requests next will refuse for having no bearer
+// token at all; the SDK answers those without calling verifyToken.
+func (s *Server) logMissingToken(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The SDK's test: exactly "Bearer <token>", scheme case-insensitive.
+		fields := strings.Fields(r.Header.Get("Authorization"))
+		if len(fields) != 2 || !strings.EqualFold(fields[0], "bearer") {
+			s.logAuthFailure(r, "no bearer token")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// logAuthFailure logs a refused /mcp request at INFO with the client's
+// address and the reason; never the token.
+func (s *Server) logAuthFailure(r *http.Request, reason string) {
+	remote := ""
+	if r != nil {
+		remote = r.RemoteAddr
+	}
+	s.logger.Info("authentication failed", "remote", remote, "reason", reason)
 }
 
 // HTTPHandler returns the HTTP handler the http transport serves: the
@@ -296,15 +497,30 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 // startHTTP serves the Streamable HTTP transport (MCP spec 2025-03-26+) at
-// /mcp, and /healthz, until ctx is cancelled.
+// /mcp, and /healthz, until ctx is cancelled; over TLS when a certificate
+// and key are configured.
 func (s *Server) startHTTP(ctx context.Context) error {
-	ln, err := net.Listen("tcp", s.httpAddr)
-	if err != nil {
-		return fmt.Errorf("listening on %s: %w", s.httpAddr, err)
-	}
 	httpServer := &http.Server{
 		Handler:           s.httpHandler(),
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+	scheme := "http"
+	if s.tlsCert != "" || s.tlsKey != "" {
+		// Loaded before listening, so a bad file fails the start-up
+		// instead of the first connection.
+		cert, err := tls.LoadX509KeyPair(s.tlsCert, s.tlsKey)
+		if err != nil {
+			return fmt.Errorf("loading the TLS certificate and key: %w", err)
+		}
+		httpServer.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		scheme = "https"
+	}
+	ln, err := net.Listen("tcp", s.httpAddr)
+	if err != nil {
+		return fmt.Errorf("listening on %s: %w", s.httpAddr, err)
 	}
 
 	stop := make(chan struct{})
@@ -331,10 +547,19 @@ func (s *Server) startHTTP(ctx context.Context) error {
 		shutdownDone <- err
 	}()
 
-	addr := ln.Addr().String()
-	fmt.Fprintf(s.stderr, "CachyDB MCP server listening on http://%s/mcp (Streamable HTTP transport)\n", addr)
+	access := "no token needed"
+	if s.tokensRequired {
+		access = "tokens required"
+	}
+	fmt.Fprintf(s.stderr, "CachyDB MCP server listening on %s://%s/mcp (Streamable HTTP transport, %s)\n", scheme, ln.Addr(), access)
 
-	serveErr := httpServer.Serve(ln)
+	var serveErr error
+	if httpServer.TLSConfig != nil {
+		// The certificate is in TLSConfig, so no file names.
+		serveErr = httpServer.ServeTLS(ln, "", "")
+	} else {
+		serveErr = httpServer.Serve(ln)
+	}
 	close(stop)
 	shutdownErr := <-shutdownDone
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
@@ -354,15 +579,29 @@ func (s *Server) startHTTP(ctx context.Context) error {
 
 // toolError turns an engine error into the error a tool returns; the SDK
 // reports it to the client as a tool error (IsError) carrying the message.
-// Client errors end with a short hint on what to do next.
+// Client errors end with a short hint on what to do next. The text starts
+// with the error's stable code in brackets (errorCode, errors.go).
 func toolError(action string, err error) error {
+	return withCode(err, describeError(action, err))
+}
+
+// describeError is the text of a tool error without its code: the action,
+// the cause, and a hint.
+func describeError(action string, err error) error {
 	switch {
 	case errors.Is(err, db.ErrNotFound):
 		return fmt.Errorf("%s: %w (hint: list_databases and list_collections show what exists; current_database shows the database used when none is given)", action, err)
 	case errors.Is(err, db.ErrSchemaValidation):
 		return fmt.Errorf("%s: %w (hint: see resource cachydb://docs/schema)", action, err)
+	case errors.Is(err, db.ErrInvalidUpdate):
+		return fmt.Errorf("%s: %w (hint: get_document shows the field's current value; see the update operators in resource cachydb://docs/query)", action, err)
 	case errors.Is(err, db.ErrConditionFailed):
 		return fmt.Errorf("%s: %w; re-read it and retry", action, err)
+	case errors.Is(err, auth.ErrPermissionDenied):
+		// The auth message names the user, the database, and the level.
+		return fmt.Errorf("%s: %w (hint: ask a server admin for access)", action, err)
+	case errors.Is(err, auth.ErrUnauthenticated):
+		return fmt.Errorf("%s: %w (hint: ask a server admin for a valid token)", action, err)
 	case errors.Is(err, db.ErrExists), errors.Is(err, db.ErrInvalidName):
 		// The engine message names the object and the rule.
 		return fmt.Errorf("%s: %w", action, err)
@@ -377,22 +616,27 @@ func toolError(action string, err error) error {
 	}
 }
 
-// databaseName resolves the database for a request: the explicit input,
-// then the session's use_database choice, then the server default.
-func (s *Server) databaseName(ss *mcp.ServerSession, input string) string {
+// databaseName resolves the database for a request of principal p: the
+// explicit input, then the session's use_database choice, then the user's
+// default database, then the server default. Tool handlers get their
+// "database" argument already resolved (authorizeCall).
+func (s *Server) databaseName(ss *mcp.ServerSession, p auth.Principal, input string) string {
 	if input != "" {
 		return input
 	}
 	if name := s.sessionDatabase(ss); name != "" {
 		return name
 	}
+	if p.DefaultDatabase != "" {
+		return p.DefaultDatabase
+	}
 	return s.defaultDBName
 }
 
-// getCollection resolves the database (see databaseName) and the
-// collection in it.
-func (s *Server) getCollection(ss *mcp.ServerSession, dbName, collName, action string) (*db.Collection, error) {
-	database, err := s.engine.Database(s.databaseName(ss, dbName))
+// getCollection returns the collection collName of the database dbName,
+// an already resolved "database" argument.
+func (s *Server) getCollection(dbName, collName, action string) (*db.Collection, error) {
+	database, err := s.engine.Database(dbName)
 	if err != nil {
 		return nil, toolError(action, err)
 	}
@@ -420,23 +664,60 @@ func (s *Server) createDatabaseTool(ctx context.Context, _ *mcp.CallToolRequest,
 	return nil, MessageOutput{Success: true, Message: fmt.Sprintf("Database '%s' created successfully", in.Name)}, nil
 }
 
-func (s *Server) listDatabasesTool(context.Context, *mcp.CallToolRequest, ListDatabasesInput) (*mcp.CallToolResult, ListDatabasesOutput, error) {
-	return nil, ListDatabasesOutput{Success: true, Databases: nonNil(s.engine.ListDatabases())}, nil
+// listDatabasesTool lists the databases the principal can read.
+func (s *Server) listDatabasesTool(ctx context.Context, _ *mcp.CallToolRequest, _ ListDatabasesInput) (*mcp.CallToolResult, ListDatabasesOutput, error) {
+	p, ok := principalFrom(ctx)
+	if !ok {
+		return nil, ListDatabasesOutput{}, toolError("list databases", errNoPrincipal)
+	}
+	names := s.engine.ListDatabases()
+	if !p.Implicit {
+		readable := names[:0]
+		for _, name := range names {
+			// p is the user's current state (authorizeCall re-read it).
+			if p.Can(name, auth.LevelRead) {
+				readable = append(readable, name)
+			}
+		}
+		names = readable
+	}
+	return nil, ListDatabasesOutput{Success: true, Databases: nonNil(names)}, nil
 }
 
+// deleteDatabaseTool drops the database and then removes every user's
+// grant on it, so a database created later under that name starts with
+// no grants.
 func (s *Server) deleteDatabaseTool(ctx context.Context, _ *mcp.CallToolRequest, in DeleteDatabaseInput) (*mcp.CallToolResult, MessageOutput, error) {
 	if err := s.engine.DropDatabase(ctx, in.Name); err != nil {
 		return nil, MessageOutput{}, toolError("delete database", err)
 	}
+	if s.users != nil {
+		// The database is gone: finish the cleanup even if the request is
+		// cancelled now.
+		if err := s.users.ForgetDatabase(context.WithoutCancel(ctx), in.Name); err != nil {
+			return nil, MessageOutput{}, toolError("delete database",
+				fmt.Errorf("database %q deleted, but its grants were not all removed (retry delete_database after recreating it): %w", in.Name, err))
+		}
+	}
 	return nil, MessageOutput{Success: true, Message: fmt.Sprintf("Database '%s' deleted successfully", in.Name)}, nil
 }
 
-func (s *Server) useDatabaseTool(_ context.Context, req *mcp.CallToolRequest, in UseDatabaseInput) (*mcp.CallToolResult, UseDatabaseOutput, error) {
+// useDatabaseTool sets the session's database; the principal must be able
+// to read it. Access is checked before existence, so the answer does not
+// reveal which unreadable databases exist.
+func (s *Server) useDatabaseTool(ctx context.Context, req *mcp.CallToolRequest, in UseDatabaseInput) (*mcp.CallToolResult, UseDatabaseOutput, error) {
+	p, ok := principalFrom(ctx)
+	if !ok {
+		return nil, UseDatabaseOutput{}, toolError("use database", errNoPrincipal)
+	}
+	if err := s.authorize(p, in.Name, auth.LevelRead); err != nil {
+		return nil, UseDatabaseOutput{}, toolError("use database", err)
+	}
 	if _, err := s.engine.Database(in.Name); err != nil {
 		return nil, UseDatabaseOutput{}, toolError("use database", err)
 	}
 	if req.Session == nil {
-		return nil, UseDatabaseOutput{}, errors.New("use database: no MCP session")
+		return nil, UseDatabaseOutput{}, toolError("use database", errors.New("no MCP session"))
 	}
 	s.trackSession(req.Session).set(in.Name)
 	return nil, UseDatabaseOutput{
@@ -446,8 +727,12 @@ func (s *Server) useDatabaseTool(_ context.Context, req *mcp.CallToolRequest, in
 	}, nil
 }
 
-func (s *Server) currentDatabaseTool(_ context.Context, req *mcp.CallToolRequest, _ CurrentDatabaseInput) (*mcp.CallToolResult, CurrentDatabaseOutput, error) {
-	return nil, CurrentDatabaseOutput{Success: true, CurrentDatabase: s.databaseName(req.Session, "")}, nil
+func (s *Server) currentDatabaseTool(ctx context.Context, req *mcp.CallToolRequest, _ CurrentDatabaseInput) (*mcp.CallToolResult, CurrentDatabaseOutput, error) {
+	p, ok := principalFrom(ctx)
+	if !ok {
+		return nil, CurrentDatabaseOutput{}, toolError("current database", errNoPrincipal)
+	}
+	return nil, CurrentDatabaseOutput{Success: true, CurrentDatabase: s.databaseName(req.Session, p, "")}, nil
 }
 
 // toDBSchema converts the create_collection schema argument to a
@@ -464,7 +749,7 @@ func toDBSchema(in *SchemaDef) *db.Schema {
 }
 
 func (s *Server) createCollectionTool(ctx context.Context, req *mcp.CallToolRequest, in CreateCollectionInput) (*mcp.CallToolResult, MessageOutput, error) {
-	database, err := s.engine.Database(s.databaseName(req.Session, in.Database))
+	database, err := s.engine.Database(in.Database)
 	if err != nil {
 		return nil, MessageOutput{}, toolError("create collection", err)
 	}
@@ -478,7 +763,7 @@ func (s *Server) createCollectionTool(ctx context.Context, req *mcp.CallToolRequ
 }
 
 func (s *Server) listCollectionsTool(_ context.Context, req *mcp.CallToolRequest, in ListCollectionsInput) (*mcp.CallToolResult, ListCollectionsOutput, error) {
-	database, err := s.engine.Database(s.databaseName(req.Session, in.Database))
+	database, err := s.engine.Database(in.Database)
 	if err != nil {
 		return nil, ListCollectionsOutput{}, toolError("list collections", err)
 	}
@@ -490,15 +775,25 @@ func (s *Server) listCollectionsTool(_ context.Context, req *mcp.CallToolRequest
 }
 
 func (s *Server) insertDocumentTool(ctx context.Context, req *mcp.CallToolRequest, in InsertDocumentInput) (*mcp.CallToolResult, InsertDocumentOutput, error) {
-	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "insert document")
+	coll, err := s.getCollection(in.Database, in.Collection, "insert document")
 	if err != nil {
 		return nil, InsertDocumentOutput{}, err
 	}
 
-	// A string "_id" in the document is the client-chosen document ID; the
-	// engine takes it as Document.ID, not as a data field.
-	doc := &db.Document{Data: make(map[string]any, len(in.Document))}
-	for k, v := range in.Document {
+	id, err := coll.Insert(ctx, toDBDocument(in.Document))
+	if err != nil {
+		return nil, InsertDocumentOutput{}, toolError("insert document", err)
+	}
+	return nil, InsertDocumentOutput{Success: true, ID: id, Message: fmt.Sprintf("Document inserted with ID: %s", id)}, nil
+}
+
+// toDBDocument converts an inserted document argument. A string "_id" is
+// the client-chosen document ID; the engine takes it as Document.ID, not
+// as a data field. Any other "_id" stays in the data, where the engine
+// rejects it.
+func toDBDocument(in map[string]any) *db.Document {
+	doc := &db.Document{Data: make(map[string]any, len(in))}
+	for k, v := range in {
 		if k == "_id" {
 			if id, ok := v.(string); ok {
 				doc.ID = id
@@ -507,12 +802,134 @@ func (s *Server) insertDocumentTool(ctx context.Context, req *mcp.CallToolReques
 		}
 		doc.Data[k] = v
 	}
+	return doc
+}
 
-	id, err := coll.Insert(ctx, doc)
+// insertDocumentsTool inserts every document in one atomic batch. A
+// failing document is named by its position in the documents argument.
+func (s *Server) insertDocumentsTool(ctx context.Context, req *mcp.CallToolRequest, in InsertDocumentsInput) (*mcp.CallToolResult, InsertDocumentsOutput, error) {
+	coll, err := s.getCollection(in.Database, in.Collection, "insert documents")
 	if err != nil {
-		return nil, InsertDocumentOutput{}, toolError("insert document", err)
+		return nil, InsertDocumentsOutput{}, err
 	}
-	return nil, InsertDocumentOutput{Success: true, ID: id, Message: fmt.Sprintf("Document inserted with ID: %s", id)}, nil
+	ops := make([]db.WriteOp, len(in.Documents))
+	for i, d := range in.Documents {
+		ops[i] = db.WriteOp{Kind: db.OpInsert, Document: toDBDocument(d)}
+	}
+	res, err := coll.Batch(ctx, ops)
+	if err != nil {
+		if bie, ok := errors.AsType[*db.BatchItemError](err); ok {
+			err = fmt.Errorf("documents[%d]: %w", bie.Index, bie.Err)
+		}
+		return nil, InsertDocumentsOutput{}, toolError("insert documents", err)
+	}
+	return nil, InsertDocumentsOutput{Success: true, IDs: nonNil(res.IDs), Inserted: len(res.IDs)}, nil
+}
+
+// getDocumentTool returns one document by id. Without fields it reads
+// the document directly; with fields it runs an _id lookup with that
+// projection, so fields mean what they mean in find_documents.
+func (s *Server) getDocumentTool(ctx context.Context, req *mcp.CallToolRequest, in GetDocumentInput) (*mcp.CallToolResult, GetDocumentOutput, error) {
+	coll, err := s.getCollection(in.Database, in.Collection, "get document")
+	if err != nil {
+		return nil, GetDocumentOutput{}, err
+	}
+	var doc *db.Document
+	if len(in.Fields) == 0 {
+		doc, err = coll.Get(ctx, in.ID)
+	} else {
+		var docs []*db.Document
+		docs, err = coll.Find(ctx, &db.Query{
+			Filters: []db.QueryFilter{{Field: "_id", Operator: "eq", Value: in.ID}},
+			Fields:  in.Fields,
+		})
+		switch {
+		case err != nil:
+		case len(docs) == 0:
+			err = fmt.Errorf("document %q in collection %q: %w", in.ID, in.Collection, db.ErrNotFound)
+		default:
+			doc = docs[0]
+		}
+	}
+	if err != nil {
+		return nil, GetDocumentOutput{}, toolError("get document", err)
+	}
+	return nil, GetDocumentOutput{Success: true, Document: docMap(doc)}, nil
+}
+
+// emptyMatch reports whether q matches every document: no filters, and
+// no OR groups or an empty group (which every document matches).
+func emptyMatch(q *MatchQuery) bool {
+	if q == nil {
+		return true
+	}
+	if len(q.Filters) > 0 {
+		return false
+	}
+	return len(q.Any) == 0 || slices.ContainsFunc(q.Any, func(g []Filter) bool { return len(g) == 0 })
+}
+
+// checkBatchQuery rejects an empty query without all, and a negative
+// limit; action names the tool in the error.
+func checkBatchQuery(action string, q *MatchQuery, all bool, limit int) error {
+	if limit < 0 {
+		return toolError(action, invalidArgf("limit must not be negative, got %d", limit))
+	}
+	if !all && emptyMatch(q) {
+		return toolError(action, invalidArgf("the query is empty and would match every document; give query.filters or query.any, or set \"all\": true"))
+	}
+	return nil
+}
+
+// updateSpec builds the engine update of update_document and
+// update_documents, or returns nil if it changes nothing: no updates
+// object (an empty one counts, as before), no unset, and no operator.
+func updateSpec(updates map[string]any, unset []string, inc map[string]float64, push, addToSet, pull map[string]any) *db.UpdateSpec {
+	if updates == nil && len(unset) == 0 && len(inc) == 0 && len(push) == 0 && len(addToSet) == 0 && len(pull) == 0 {
+		return nil
+	}
+	u := &db.UpdateSpec{Set: updates, Unset: unset, Push: push, AddToSet: addToSet, Pull: pull}
+	if len(inc) > 0 {
+		u.Inc = make(map[string]any, len(inc))
+		for f, n := range inc {
+			u.Inc[f] = n
+		}
+	}
+	return u
+}
+
+func (s *Server) updateDocumentsTool(ctx context.Context, req *mcp.CallToolRequest, in UpdateDocumentsInput) (*mcp.CallToolResult, UpdateDocumentsOutput, error) {
+	if err := checkBatchQuery("update documents", in.Query, in.All, in.Limit); err != nil {
+		return nil, UpdateDocumentsOutput{}, err
+	}
+	u := updateSpec(in.Updates, in.Unset, in.Inc, in.Push, in.AddToSet, in.Pull)
+	if u == nil {
+		return nil, UpdateDocumentsOutput{}, toolError("update documents", invalidArgf("give updates, unset, or an operator (inc, push, add_to_set, pull)"))
+	}
+	coll, err := s.getCollection(in.Database, in.Collection, "update documents")
+	if err != nil {
+		return nil, UpdateDocumentsOutput{}, err
+	}
+	matched, modified, err := coll.UpdateMany(ctx, toDBMatchQuery(in.Query), *u, in.Limit)
+	if err != nil {
+		return nil, UpdateDocumentsOutput{}, toolError("update documents", err)
+	}
+	return nil, UpdateDocumentsOutput{Success: true, Matched: matched, Modified: modified}, nil
+}
+
+func (s *Server) deleteDocumentsTool(ctx context.Context, req *mcp.CallToolRequest, in DeleteDocumentsInput) (*mcp.CallToolResult, DeleteDocumentsOutput, error) {
+	if err := checkBatchQuery("delete documents", in.Query, in.All, in.Limit); err != nil {
+		return nil, DeleteDocumentsOutput{}, err
+	}
+	coll, err := s.getCollection(in.Database, in.Collection, "delete documents")
+	if err != nil {
+		return nil, DeleteDocumentsOutput{}, err
+	}
+	matched, deleted, err := coll.DeleteMany(ctx, toDBMatchQuery(in.Query), in.Limit)
+	if err != nil {
+		return nil, DeleteDocumentsOutput{}, toolError("delete documents", err)
+	}
+	return nil, DeleteDocumentsOutput{Success: true, Matched: matched, Deleted: deleted}, nil
 }
 
 // toDBFilters converts filters to engine filters.
@@ -569,32 +986,82 @@ func toDBMatchQuery(in *MatchQuery) *db.Query {
 // docMap returns doc as a flat object with its _id.
 func docMap(doc *db.Document) map[string]any {
 	m := make(map[string]any, len(doc.Data)+1)
-	for k, v := range doc.Data {
-		m[k] = v
-	}
+	maps.Copy(m, doc.Data)
 	m["_id"] = doc.ID
 	return m
 }
 
 func (s *Server) findDocumentsTool(ctx context.Context, req *mcp.CallToolRequest, in FindDocumentsInput) (*mcp.CallToolResult, FindDocumentsOutput, error) {
-	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "find documents")
+	coll, err := s.getCollection(in.Database, in.Collection, "find documents")
 	if err != nil {
 		return nil, FindDocumentsOutput{}, err
 	}
-	docs, err := coll.Find(ctx, toDBQuery(in.Query))
+	q := toDBQuery(in.Query)
+	limit := q.Limit
+	if limit <= 0 {
+		limit = s.defaultLimit
+	}
+	// Ask for one document more than the limit, to know whether more
+	// match (has_more) without counting them.
+	q.Limit = limit
+	if limit < math.MaxInt {
+		q.Limit = limit + 1
+	}
+	var (
+		out     = make([]map[string]any, 0)
+		size    = int64(len("[]")) // the JSON size of out
+		hasMore bool
+		encErr  error
+	)
+	plan, err := coll.IterateWithPlan(ctx, q, func(doc *db.Document) bool {
+		if len(out) == limit {
+			hasMore = true
+			return false
+		}
+		m := docMap(doc)
+		data, err := json.Marshal(m)
+		if err != nil {
+			encErr = err
+			return false
+		}
+		n := int64(len(data))
+		if len(out) > 0 {
+			n++ // the comma before it
+		}
+		if len(out) > 0 && size+n > s.maxResultBytes {
+			hasMore = true
+			return false
+		}
+		out = append(out, m)
+		size += n
+		return true
+	})
+	if err == nil {
+		err = encErr
+	}
 	if err != nil {
 		return nil, FindDocumentsOutput{}, toolError("find documents", err)
 	}
-
-	out := make([]map[string]any, len(docs))
-	for i, doc := range docs {
-		out[i] = docMap(doc)
+	res := FindDocumentsOutput{Success: true, Count: len(out), Documents: out, HasMore: hasMore}
+	if hasMore {
+		// Saturated: a skip near math.MaxInt must not wrap (has_more
+		// implies it cannot, but the sum is guarded anyway).
+		res.NextSkip = math.MaxInt
+		if skip := max(q.Skip, 0); skip <= math.MaxInt-len(out) {
+			res.NextSkip = skip + len(out)
+		}
 	}
-	return nil, FindDocumentsOutput{Success: true, Count: len(docs), Documents: out}, nil
+	if in.Explain {
+		// plan.Returned counts the look-ahead document too; report what
+		// this page returned.
+		res.Plan = &QueryPlan{Driver: plan.Driver, Index: plan.Index, OrderProvided: plan.OrderProvided,
+			Examined: plan.Examined, Returned: len(out)}
+	}
+	return nil, res, nil
 }
 
 func (s *Server) countDocumentsTool(ctx context.Context, req *mcp.CallToolRequest, in CountDocumentsInput) (*mcp.CallToolResult, CountDocumentsOutput, error) {
-	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "count documents")
+	coll, err := s.getCollection(in.Database, in.Collection, "count documents")
 	if err != nil {
 		return nil, CountDocumentsOutput{}, err
 	}
@@ -606,7 +1073,7 @@ func (s *Server) countDocumentsTool(ctx context.Context, req *mcp.CallToolReques
 }
 
 func (s *Server) distinctTool(ctx context.Context, req *mcp.CallToolRequest, in DistinctInput) (*mcp.CallToolResult, DistinctOutput, error) {
-	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "distinct")
+	coll, err := s.getCollection(in.Database, in.Collection, "distinct")
 	if err != nil {
 		return nil, DistinctOutput{}, err
 	}
@@ -621,16 +1088,16 @@ func (s *Server) distinctTool(ctx context.Context, req *mcp.CallToolRequest, in 
 }
 
 func (s *Server) updateDocumentTool(ctx context.Context, req *mcp.CallToolRequest, in UpdateDocumentInput) (*mcp.CallToolResult, UpdateDocumentOutput, error) {
-	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "update document")
+	coll, err := s.getCollection(in.Database, in.Collection, "update document")
 	if err != nil {
 		return nil, UpdateDocumentOutput{}, err
 	}
-	if in.Updates == nil && len(in.Unset) == 0 {
-		return nil, UpdateDocumentOutput{}, errors.New("update document: give updates, unset, or both")
+	u := updateSpec(in.Updates, in.Unset, in.Inc, in.Push, in.AddToSet, in.Pull)
+	if u == nil {
+		return nil, UpdateDocumentOutput{}, toolError("update document", invalidArgf("give updates, unset, or an operator (inc, push, add_to_set, pull)"))
 	}
-	_, upserted, err := coll.UpdateWith(ctx, in.ID, db.UpdateSpec{
-		Set: in.Updates, Unset: in.Unset, If: toDBFilters(in.If), Upsert: in.Upsert,
-	})
+	u.If, u.Upsert = toDBFilters(in.If), in.Upsert
+	_, upserted, err := coll.UpdateWith(ctx, in.ID, *u)
 	if err != nil {
 		return nil, UpdateDocumentOutput{}, toolError("update document", err)
 	}
@@ -642,7 +1109,7 @@ func (s *Server) updateDocumentTool(ctx context.Context, req *mcp.CallToolReques
 }
 
 func (s *Server) replaceDocumentTool(ctx context.Context, req *mcp.CallToolRequest, in ReplaceDocumentInput) (*mcp.CallToolResult, MessageOutput, error) {
-	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "replace document")
+	coll, err := s.getCollection(in.Database, in.Collection, "replace document")
 	if err != nil {
 		return nil, MessageOutput{}, err
 	}
@@ -664,7 +1131,7 @@ func (s *Server) replaceDocumentTool(ctx context.Context, req *mcp.CallToolReque
 }
 
 func (s *Server) deleteDocumentTool(ctx context.Context, req *mcp.CallToolRequest, in DeleteDocumentInput) (*mcp.CallToolResult, MessageOutput, error) {
-	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "delete document")
+	coll, err := s.getCollection(in.Database, in.Collection, "delete document")
 	if err != nil {
 		return nil, MessageOutput{}, err
 	}
@@ -688,14 +1155,14 @@ func fromDBSchema(in *db.Schema) *SchemaDef {
 }
 
 func (s *Server) describeCollectionTool(_ context.Context, req *mcp.CallToolRequest, in DescribeCollectionInput) (*mcp.CallToolResult, DescribeCollectionOutput, error) {
-	dbName := s.databaseName(req.Session, in.Database)
-	coll, err := s.getCollection(req.Session, dbName, in.Collection, "describe collection")
+	dbName := in.Database
+	coll, err := s.getCollection(dbName, in.Collection, "describe collection")
 	if err != nil {
 		return nil, DescribeCollectionOutput{}, err
 	}
 	indexes := make([]IndexDesc, 0)
 	for _, ix := range coll.Indexes() {
-		indexes = append(indexes, IndexDesc{Name: ix.Name, Field: ix.Field})
+		indexes = append(indexes, IndexDesc{Name: ix.Name, Field: ix.Field, Unique: ix.Unique})
 	}
 	return nil, DescribeCollectionOutput{
 		Success:  true,
@@ -708,7 +1175,7 @@ func (s *Server) describeCollectionTool(_ context.Context, req *mcp.CallToolRequ
 }
 
 func (s *Server) updateSchemaTool(ctx context.Context, req *mcp.CallToolRequest, in UpdateSchemaInput) (*mcp.CallToolResult, MessageOutput, error) {
-	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "update schema")
+	coll, err := s.getCollection(in.Database, in.Collection, "update schema")
 	if err != nil {
 		return nil, MessageOutput{}, err
 	}
@@ -723,7 +1190,7 @@ func (s *Server) updateSchemaTool(ctx context.Context, req *mcp.CallToolRequest,
 }
 
 func (s *Server) renameCollectionTool(ctx context.Context, req *mcp.CallToolRequest, in RenameCollectionInput) (*mcp.CallToolResult, MessageOutput, error) {
-	database, err := s.engine.Database(s.databaseName(req.Session, in.Database))
+	database, err := s.engine.Database(in.Database)
 	if err != nil {
 		return nil, MessageOutput{}, toolError("rename collection", err)
 	}
@@ -737,7 +1204,7 @@ func (s *Server) renameCollectionTool(ctx context.Context, req *mcp.CallToolRequ
 }
 
 func (s *Server) copyCollectionTool(ctx context.Context, req *mcp.CallToolRequest, in CopyCollectionInput) (*mcp.CallToolResult, CopyCollectionOutput, error) {
-	database, err := s.engine.Database(s.databaseName(req.Session, in.Database))
+	database, err := s.engine.Database(in.Database)
 	if err != nil {
 		return nil, CopyCollectionOutput{}, toolError("copy collection", err)
 	}
@@ -759,7 +1226,7 @@ func (s *Server) copyCollectionTool(ctx context.Context, req *mcp.CallToolReques
 }
 
 func (s *Server) deleteCollectionTool(ctx context.Context, req *mcp.CallToolRequest, in DeleteCollectionInput) (*mcp.CallToolResult, MessageOutput, error) {
-	database, err := s.engine.Database(s.databaseName(req.Session, in.Database))
+	database, err := s.engine.Database(in.Database)
 	if err != nil {
 		return nil, MessageOutput{}, toolError("delete collection", err)
 	}
@@ -773,21 +1240,25 @@ func (s *Server) deleteCollectionTool(ctx context.Context, req *mcp.CallToolRequ
 }
 
 func (s *Server) createIndexTool(ctx context.Context, req *mcp.CallToolRequest, in CreateIndexInput) (*mcp.CallToolResult, MessageOutput, error) {
-	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "create index")
+	coll, err := s.getCollection(in.Database, in.Collection, "create index")
 	if err != nil {
 		return nil, MessageOutput{}, err
 	}
-	if err := coll.CreateIndex(ctx, in.IndexName, in.FieldName); err != nil {
+	if err := coll.CreateIndex(ctx, in.IndexName, in.FieldName, db.Unique(in.Unique)); err != nil {
 		return nil, MessageOutput{}, toolError("create index", err)
+	}
+	kind := "Index"
+	if in.Unique {
+		kind = "Unique index"
 	}
 	return nil, MessageOutput{
 		Success: true,
-		Message: fmt.Sprintf("Index '%s' created on field '%s'", in.IndexName, in.FieldName),
+		Message: fmt.Sprintf("%s '%s' created on field '%s'", kind, in.IndexName, in.FieldName),
 	}, nil
 }
 
 func (s *Server) dropIndexTool(ctx context.Context, req *mcp.CallToolRequest, in DropIndexInput) (*mcp.CallToolResult, MessageOutput, error) {
-	coll, err := s.getCollection(req.Session, in.Database, in.Collection, "drop index")
+	coll, err := s.getCollection(in.Database, in.Collection, "drop index")
 	if err != nil {
 		return nil, MessageOutput{}, err
 	}
@@ -795,4 +1266,74 @@ func (s *Server) dropIndexTool(ctx context.Context, req *mcp.CallToolRequest, in
 		return nil, MessageOutput{}, toolError("drop index", err)
 	}
 	return nil, MessageOutput{Success: true, Message: fmt.Sprintf("Index '%s' dropped", in.IndexName)}, nil
+}
+
+// serverStatsTool reports the figures of the database asked for (its read
+// access was checked by authorizeCall), or of every database the
+// principal can read, and the server totals for server admins.
+func (s *Server) serverStatsTool(ctx context.Context, _ *mcp.CallToolRequest, in ServerStatsInput) (*mcp.CallToolResult, ServerStatsOutput, error) {
+	const action = "server stats"
+	p, ok := principalFrom(ctx)
+	if !ok {
+		return nil, ServerStatsOutput{}, toolError(action, errNoPrincipal)
+	}
+	names := []string{in.Database}
+	if in.Database == "" {
+		names = s.engine.ListDatabases()
+		if !p.Implicit {
+			readable := names[:0]
+			for _, name := range names {
+				if p.Can(name, auth.LevelRead) {
+					readable = append(readable, name)
+				}
+			}
+			names = readable
+		}
+	}
+	out := ServerStatsOutput{Success: true, Databases: []DatabaseStats{}}
+	for _, name := range names {
+		d, err := s.engine.Database(name)
+		var ds db.DatabaseStats
+		if err == nil {
+			ds, err = d.Stats(ctx)
+		}
+		if err != nil {
+			if in.Database == "" && errors.Is(err, db.ErrNotFound) {
+				continue // dropped meanwhile
+			}
+			return nil, ServerStatsOutput{}, toolError(action, err)
+		}
+		out.Databases = append(out.Databases, NewDatabaseStats(ds))
+	}
+	if p.Implicit || p.ServerAdmin {
+		srv, err := s.engine.ServerStats()
+		if err != nil {
+			return nil, ServerStatsOutput{}, toolError(action, err)
+		}
+		out.Server = &ServerTotals{
+			Version:       s.version,
+			UptimeSeconds: int64(time.Since(s.started).Seconds()),
+			WALBytes:      srv.WALBytes,
+			Cache:         NewCacheTotal(srv.Cache),
+		}
+	}
+	return nil, out, nil
+}
+
+// NewDatabaseStats converts the engine's figures of one database to the
+// server_stats form (also used by cachydb utils stats).
+func NewDatabaseStats(ds db.DatabaseStats) DatabaseStats {
+	out := DatabaseStats{Name: ds.Name, Documents: ds.Documents, DataBytes: ds.DataBytes, IndexBytes: ds.IndexBytes,
+		Collections: make([]CollectionStats, len(ds.Collections))}
+	for i, c := range ds.Collections {
+		out.Collections[i] = CollectionStats{Name: c.Name, Documents: c.Documents, DataBytes: c.DataBytes,
+			IndexBytes: c.IndexBytes, Indexes: nonNil(c.Indexes)}
+	}
+	return out
+}
+
+// NewCacheTotal converts the engine's cache figures to the server_stats
+// form.
+func NewCacheTotal(c db.CacheStats) CacheTotal {
+	return CacheTotal{Bytes: c.Bytes, MaxBytes: c.MaxBytes, Entries: c.Entries, Hits: c.Hits, Misses: c.Misses}
 }

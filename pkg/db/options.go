@@ -32,6 +32,8 @@ const (
 	defaultMemtableSize     int64         = 16 << 20 // 16 MiB per collection
 	defaultCacheSize        int64         = 64 << 20 // 64 MiB
 	defaultCompactionRatio  float64       = 0.5
+	defaultMaxBatchDocs     int           = 10_000
+	defaultMaxBatchBytes    int64         = 32 << 20 // 32 MiB
 	// maxDefaultPendingBytes caps the computed MaxPendingBytes default.
 	maxDefaultPendingBytes int64 = 1 << 30 // 1 GiB
 	// maxDefaultFlushWorkers caps the computed FlushWorkers default.
@@ -78,11 +80,25 @@ type Options struct {
 	// FlushWorkers is how many collections the flusher flushes in
 	// parallel. Default min(GOMAXPROCS, 4).
 	FlushWorkers int
+	// MaxBatchDocs is the most operations one Collection.Batch may carry
+	// (ErrBatchTooLarge above it). Default 10,000.
+	MaxBatchDocs int
+	// MaxBatchBytes bounds the encoded size of one batch's WAL payload:
+	// its ids and document after-images plus 7 bytes per operation and 4
+	// (ErrBatchTooLarge above it). Default 32 MiB.
+	MaxBatchBytes int64
 
 	testHook func(hookPoint) error // unexported; set only from export_test.go (see #crash-hooks)
 	// testSegWriter, when set (tests only), wraps every active data
 	// segment writer the flusher opens, to inject slow or failing I/O.
 	testSegWriter func(segmentWriter) segmentWriter
+	// testIndexCommit, when set (tests only; set from export_test.go), is
+	// called by the index transaction of a flush and of a compaction swap
+	// (site indexCommitFlush or indexCommitCompact): inside the transaction
+	// before its commit (committed false; an error rolls it back) and after
+	// it committed (committed true; an error is handled as a commit error
+	// after bbolt may already have written the transaction).
+	testIndexCommit func(site string, committed bool) error
 }
 
 // withDefaults fills zero fields with defaults and validates the result.
@@ -122,6 +138,13 @@ func (o Options) withDefaults() (Options, error) {
 	if o.FlushWorkers < 0 {
 		return o, fmt.Errorf("options: FlushWorkers must be >= 0, got %d", o.FlushWorkers)
 	}
+	if o.MaxBatchDocs == 0 {
+		o.MaxBatchDocs = defaultMaxBatchDocs
+	}
+	if o.MaxBatchDocs < 0 {
+		return o, fmt.Errorf("options: MaxBatchDocs must be >= 0, got %d", o.MaxBatchDocs)
+	}
+	o.MaxBatchBytes = defaultInt64(o.MaxBatchBytes, defaultMaxBatchBytes)
 
 	for _, f := range []struct {
 		name string
@@ -131,6 +154,7 @@ func (o Options) withDefaults() (Options, error) {
 		{"DataSegmentSize", o.DataSegmentSize},
 		{"MemtableSize", o.MemtableSize},
 		{"FlushInterval", int64(o.FlushInterval)},
+		{"MaxBatchBytes", o.MaxBatchBytes},
 	} {
 		if f.v < 0 {
 			return o, fmt.Errorf("options: %s must be >= 0, got %d", f.name, f.v)

@@ -1,7 +1,7 @@
 ---
 name: mcp
 title: Using cachydb as an MCP server
-summary: stdio vs Streamable HTTP, client configuration examples (incl. Docker), health checks, per-session databases, the data-directory lock, cachydb client, and the 21 tools by task
+summary: stdio vs Streamable HTTP, listen host, tokens and TLS, client configuration examples (incl. Docker and tokens), health checks, per-session databases, the data-directory lock, cachydb client, the tools by task, and writing many documents
 ---
 <!--
 Client config formats checked on 2026-11-01 against the official docs:
@@ -20,9 +20,24 @@ cachydb speaks MCP over two transports:
   MCP messages; logs go to stderr. The server exits (status 0) when the
   client closes stdin.
 - **Streamable HTTP**: `cachydb -t http -p 7601` serves
-  `http://localhost:7601/mcp`, listening on all interfaces. Many clients
-  can connect at once; idle sessions are closed after 30 minutes. There is
-  no authentication or TLS, so keep it on a trusted network.
+  `http://localhost:7601/mcp`, listening on `127.0.0.1` (this machine
+  only; `--host 0.0.0.0` for every interface). Many clients can connect at
+  once; idle sessions are closed after 30 minutes. `--tls-cert` and
+  `--tls-key` serve HTTPS.
+
+## Tokens (`AUTH`)
+
+stdio and loopback HTTP need no token. HTTP on any other host needs one
+(`AUTH=auto`, the default), as does all HTTP with `AUTH=required`;
+`AUTH=off` never asks for one and logs a warning on a non-loopback host.
+Clients send `Authorization: Bearer <token>`; without a valid token
+`/mcp` answers 401. When a token is needed and no user exists, cachydb
+refuses to start: create the first admin with
+`cachydb utils user add NAME --admin` (server stopped), set
+`BOOTSTRAP_ADMIN_TOKEN`, or set `AUTH=off` on a trusted network only.
+With tokens, each user sees and uses only the databases it has access
+to, `whoami` shows that access, and server admins also get the user
+tools. See `cachydb docs config` and `cachydb docs access`.
 
 Use absolute paths in client configs. Replace `/path/to/cachydb` with the
 binary's location (`which cachydb`) and `/path/to/data` with the data
@@ -36,6 +51,9 @@ claude mcp add --transport stdio cachydb -- /path/to/cachydb -R /path/to/data
 
 # HTTP (start `cachydb -t http -p 7601` separately)
 claude mcp add --transport http cachydb http://localhost:7601/mcp
+
+# HTTP on a server that requires tokens
+claude mcp add --transport http cachydb https://db.example:7601/mcp --header "Authorization: Bearer <token>"
 ```
 
 Add `--scope project` to share it through the project's `.mcp.json`, or
@@ -116,9 +134,24 @@ runs the HTTP transport on port 7601 by default, as the non-root user
 65532, with its data in the `/data` volume. Configure it with environment
 variables (see `cachydb docs config`).
 
+The image listens on every interface (`HOST=0.0.0.0`), so **a container
+needs a user or `AUTH=off`**: without either it exits at start with the
+refusal message. To require tokens, give it a bootstrap admin token (see
+`cachydb docs access`):
+
 ```bash
-# HTTP server: http://localhost:7601/mcp
-docker run -d --name cachydb -p 7601:7601 -v cachydb-data:/data hovhannespalyan/cachydb
+# HTTP server with tokens; the admin's token is the value you chose
+docker run -d --name cachydb -p 7601:7601 -v cachydb-data:/data \
+  -e BOOTSTRAP_ADMIN_TOKEN="$(openssl rand -hex 32)" hovhannespalyan/cachydb
+```
+
+Use TLS (`TLS_CERT`, `TLS_KEY`) or a trusted network when clients on
+other machines connect. For local use, publish the port on localhost and
+set `AUTH=off`:
+
+```bash
+# HTTP server: http://localhost:7601/mcp, no tokens
+docker run -d --name cachydb -p 127.0.0.1:7601:7601 -v cachydb-data:/data -e AUTH=off hovhannespalyan/cachydb
 
 # Claude Code against the HTTP container
 claude mcp add --transport http cachydb http://localhost:7601/mcp
@@ -160,9 +193,12 @@ cachydb healthcheck --url http://db.internal:7601/healthz
 ```
 
 Without `--url`, it reads `PORT` and `TRANSPORT` (or `-p`, `-t`); if the
-transport is `stdio` there is nothing to probe and it exits 0. It never
-opens the database. The Docker image uses it as its `HEALTHCHECK`, so set
-`PORT` and `TRANSPORT` in a container as environment variables, not
+transport is `stdio` there is nothing to probe and it exits 0. With
+`TLS_CERT` and `TLS_KEY` (or `--tls-cert`, `--tls-key`) it probes
+`https://` and, on loopback, does not verify the certificate.
+`/healthz` never needs a token. It never opens the database. The Docker
+image uses it as its `HEALTHCHECK`, so set `PORT`, `TRANSPORT`,
+`TLS_CERT` and `TLS_KEY` in a container as environment variables, not
 flags.
 
 ## Choosing the database
@@ -171,7 +207,8 @@ Every data tool resolves its database in this order:
 
 1. the tool's `database` argument, if given;
 2. the database this session chose with `use_database`;
-3. the server default (`main`, or `-d/--db`).
+3. the user's default database (only when the server requires tokens);
+4. the server default (`main`, or `-d/--db`).
 
 The `use_database` choice belongs to one MCP session: other sessions
 (other HTTP clients) are not affected. `current_database` reports it.
@@ -206,16 +243,66 @@ retry.
 | --- | --- |
 | Databases | `list_databases`, `create_database`, `delete_database`, `use_database`, `current_database` |
 | Collections | `create_collection`, `list_collections`, `describe_collection`, `update_schema`, `rename_collection`, `copy_collection`, `delete_collection` |
-| Indexes | `create_index`, `drop_index` |
-| Writing | `insert_document`, `update_document` (`updates`, `unset`, `if`, `upsert`), `replace_document`, `delete_document` (`if`) |
-| Reading | `find_documents` (`filters`, `any`, `sort`, `fields`, `limit`, `skip`), `count_documents`, `distinct` |
+| Indexes | `create_index` (`unique`), `drop_index` |
+| Writing | `insert_document`, `update_document` (`updates`, `unset`, `inc`, `push`, `add_to_set`, `pull`, `if`, `upsert`), `replace_document`, `delete_document` (`if`) |
+| Writing many (atomic) | `insert_documents` (`documents`), `update_documents` (`query`, `updates`, `unset`, `inc`, `push`, `add_to_set`, `pull`, `limit`, `all`), `delete_documents` (`query`, `limit`, `all`) |
+| Reading | `get_document` (`id`, `fields`), `find_documents` (`filters`, `any`, `sort`, `fields`, `limit`, `skip`, `explain`; result `has_more`, `next_skip`, `plan`), `count_documents`, `distinct` |
+| Statistics | `server_stats` (`database`; per collection documents, data and index bytes, index names; server admins also get WAL size, cache hits and misses, version, uptime) |
+| Users (only when the server requires tokens) | `whoami` (everyone); `list_users`, `create_user`, `set_access`, `create_token`, `revoke_token`, `delete_user` (server admins; hidden from other users) |
 
-`cachydb docs tools` has every schema and an example call.
+`cachydb docs tools` has every schema and an example call; the user tools
+are in `cachydb docs access`.
+
+`find_documents` never returns an unbounded result: without a `limit` it
+returns at most `--default-limit` documents (100), and the JSON of its
+documents stays within `--max-result-bytes` (1 MiB), with at least one
+document. Page with `"skip": next_skip` while `has_more` is `true`; see
+`cachydb docs query`.
+
+## Writing many documents
+
+`insert_documents`, `update_documents`, and `delete_documents` are
+atomic: each call changes all of its documents or, if one fails, none
+(an `insert_documents` error names the item as `documents[i]`). One call
+takes at most 10,000 documents and 32 MiB. Over HTTP a request body is
+limited to 4 MiB, so send larger loads as several calls;
+`cachydb client import` does this for you.
+
+`update_documents` and `delete_documents` select documents with
+`query.filters` and `query.any`. An empty query, which would match every
+document, is rejected unless you pass `"all": true`. When more than
+10,000 documents match and no `limit` is given, the call fails with the
+match count and changes nothing. With a `limit`, the first matches by
+`_id` change; repeat the call to work through the rest. A repeated
+delete always makes progress, but a repeated update only does when the
+update makes documents stop matching the query (for example, update
+`{"status": "done"}` with a filter `status ne "done"`); otherwise it
+updates the same first documents again. `matched` counts the documents
+selected and `modified` / `deleted` those written; a document another
+writer changed so it no longer matches is skipped.
+
+## Errors
+
+Every tool error starts with a stable code in brackets, for example
+`[not_found]`, `[invalid_argument]`, `[permission_denied]`, or
+`[limit_exceeded]`; branch on it, not on the message. Only arguments that
+fail the input schema come back as `validating "arguments": …` without a
+code. `cachydb docs errors` lists every code and what to do.
+
+## Result text
+
+A successful result carries its data as structured content and, by
+default, the same JSON again as text content. A server started with
+`--result-text summary` (`RESULT_TEXT=summary`) sends one line of text
+instead, such as `12 documents, has_more: false`; the structured content
+is unchanged. If you only see such a line, read the structured content
+or ask for the server to run with `full`. See `cachydb docs config`.
 
 ## Self-description
 
 - `tools/list` returns typed input and output JSON Schemas, with enums for
-  query operators (including `contains`, `has`, `has_any`, `has_all`),
+  query operators (including `contains`, `has`, `has_any`, `has_all`,
+  `exists`, `starts_with`),
   sort orders, and schema field types, plus read-only, destructive, and
   idempotent annotations.
 - The `initialize` result carries short usage instructions.

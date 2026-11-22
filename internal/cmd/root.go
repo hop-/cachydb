@@ -17,7 +17,7 @@ var (
 		Short: "A lightweight document database with a built-in MCP server",
 		Long: `CachyDB is a lightweight document database with a built-in MCP (Model
 Context Protocol) server. Databases hold collections of JSON documents,
-with optional schemas and hash indexes. Every acknowledged write is
+with optional schemas and indexes. Every acknowledged write is
 fsynced to a write-ahead log first, so it survives a crash.
 
 Running:
@@ -32,7 +32,7 @@ Data:
 
 For AI agents:
   Run "cachydb docs" to list the built-in topics (overview, quickstart,
-  mcp, tools, query, schema, config, errors), for example
+  mcp, tools, query, schema, config, access, errors), for example
   "cachydb docs quickstart" or "cachydb docs tools --format json". Over
   MCP, read the resources cachydb://docs/<topic>.
 

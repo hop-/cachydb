@@ -3,7 +3,10 @@
 # - stress: the full 200-run stress loop under the race detector;
 # - e2e: the real-process kill test (build tag e2e), 100 rounds;
 # - model: the model-based test, 20 seeds x 5000 operations;
-# - fuzz: every fuzz target for 60s.
+# - fuzz: every fuzz target for 60s;
+# - scale: the 1M-document scale benchmark (pkg/db/scale_bench_test.go),
+#   reported in the log only; it fails only if the benchmark itself errors
+#   (performance is not gated).
 #
 # A failing job uploads what is needed to reproduce it (the e2e data
 # directory and server logs, the model log with its seeds, new fuzz
@@ -33,6 +36,7 @@ env:
   MODEL_SEEDS: "20"
   MODEL_OPS: "5000"
   FUZZ_TIME: "60s"
+  SCALE_DOCS: "1000000"
 
 jobs:
   stress:
@@ -133,7 +137,7 @@ jobs:
       - name: Fuzz every target
         run: |
           fail=0
-          for pkg in ./pkg/db ./pkg/db/internal/wal ./pkg/db/internal/segment ./internal/exportfmt; do
+          for pkg in ./pkg/db ./pkg/db/internal/wal ./pkg/db/internal/segment ./pkg/db/internal/idxstore ./internal/exportfmt; do
             for target in $(go test -list '^Fuzz' "$pkg" | grep '^Fuzz'); do
               echo "::group::$pkg $target"
               if ! go test -run '^$' -fuzz "^${target}\$" -fuzztime "$FUZZ_TIME" "$pkg"; then
@@ -153,3 +157,25 @@ jobs:
           path: "**/testdata/fuzz/**"
           if-no-files-found: warn
           retention-days: 14
+
+  scale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (stable)
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+
+      - name: Scale benchmark (1M documents)
+        env:
+          # The runner's temp directory is on a real disk, so fsync is real.
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          CACHYDB_SCALE_DOCS="$SCALE_DOCS" go test -run '^$' -bench 'Scale$' -benchtime 1x -timeout 55m ./pkg/db/

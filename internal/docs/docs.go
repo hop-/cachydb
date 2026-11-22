@@ -2,7 +2,8 @@
 // topics printed by `cachydb docs` and served as cachydb://docs/<topic>
 // MCP resources. The topics are markdown files with front matter, embedded
 // in the binary. The "tools" topic file only holds the front matter and an
-// introduction; internal/mcp appends the generated tool reference.
+// introduction; internal/mcp appends the generated tool reference. It also
+// appends the reference of the user tools to the "access" topic.
 package docs
 
 import (
@@ -11,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -18,10 +20,14 @@ import (
 var topicFS embed.FS
 
 // Names lists every topic in display order.
-var Names = []string{"overview", "quickstart", "mcp", "tools", "query", "schema", "config", "errors"}
+var Names = []string{"overview", "quickstart", "mcp", "tools", "query", "schema", "config", "access", "errors"}
 
 // ToolsTopic is the name of the generated topic.
 const ToolsTopic = "tools"
+
+// AccessTopic is the name of the users-and-access topic; internal/mcp
+// appends the generated reference of the user tools to it.
+const AccessTopic = "access"
 
 // Topic is one documentation topic.
 type Topic struct {
@@ -68,12 +74,7 @@ func All() ([]Topic, error) {
 }
 
 func known(name string) bool {
-	for _, n := range Names {
-		if n == name {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(Names, name)
 }
 
 // parse splits a topic file into its front matter (name, title, summary;

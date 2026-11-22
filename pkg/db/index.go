@@ -1,327 +1,517 @@
 package db
 
 import (
-	"maps"
-	"math"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
 	"slices"
-	"strconv"
+	"strings"
 
-	"github.com/hop-/cachydb/pkg/db/internal/segment"
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
 )
 
-// indexKey returns the canonical, type-tagged index key for v:
+// Secondary indexes (approach-index-and-query §3). Every index lives in
+// the collection's index file (index.db) as one bucket of entries
 //
-//	numbers  "n:" + strconv.FormatFloat(f, 'g', -1, 64)
-//	strings  "s:" + s
-//	bools    "b:t" / "b:f"
-//	null     "z:"
+//	encoded value · 0x00 0x00 · document id  ->  flags
 //
-// Objects, arrays, NaN, and any other value are not indexable (ok is
-// false). The type tag keeps the number 1 and the string "1" apart, and
-// every value that valuesEqual treats as equal maps to the same key.
-func indexKey(v any) (string, bool) {
-	if v == nil {
-		return "z:", true
-	}
-	if f, ok := toFloat(v); ok {
-		if math.IsNaN(f) {
-			return "", false
-		}
-		if f == 0 {
-			f = 0 // fold -0 into 0: they compare equal
-		}
-		return "n:" + strconv.FormatFloat(f, 'g', -1, 64), true
-	}
-	switch t := v.(type) {
-	case string:
-		return "s:" + t, true
-	case bool:
-		if t {
-			return "b:t", true
-		}
-		return "b:f", true
-	}
-	return "", false
+// maintained by the flusher in the same transaction as the key table, so
+// an index always describes exactly the documents the key table lists.
+// Changes that are not flushed yet (the memtable and flushing) are not in
+// it: readers apply the snapshot rule (document.go) and evaluate those ids
+// from the overlay alone.
+//
+// The entries of one document version on one index (indexKeysOf):
+//
+//   - field missing: one entry under the "missing" value, flags 0;
+//   - an indexable scalar (null, bool, number, string): one entry, flags
+//     0, plus FlagTruncated for a string cut at idxstore.MaxValueLen;
+//   - an array: one entry per distinct indexable element, FlagElement
+//     (plus FlagTruncated where cut);
+//   - an object, NaN, or any other value that is not indexable, and an
+//     array element that is not (an object, a nested array, NaN): no
+//     entry. The document is then counted in the index's complex counter
+//     (at most once), so readers know that the entries miss a value.
+//
+// An array value (empty ones included) also counts the document in the
+// index's arrays counter: an index may drive a sort only while no document
+// has an array, a complex value, or a truncated entry, because only then
+// does every document have exactly one entry, ordered as Find sorts.
+//
+// The truncated counter is kept by idxstore. eq uses the entries without
+// FlagElement, has those with it; every candidate is re-checked against
+// every filter, so an index only has to return a superset.
+
+// indexEntry is one entry of a document version in one index.
+type indexEntry struct {
+	enc   []byte // encoded value (idxstore.AppendValue, AppendMissing); never modified
+	flags idxstore.Flags
 }
 
-// index is a multi-value secondary index on one field: each canonical key
-// maps to the set of ids of the documents holding that value. A field
-// whose value is an array is indexed under the key of each indexable
-// element (plan 004 §2.3; objects and arrays nested in it are skipped), so
-// one document may appear under several keys. Two marker keys, which no
-// value maps to, make counts and distinct values exact without reading
-// documents: arrayMarker holds the documents whose field is an array, and
-// unindexedMarker those whose value (or an element of it) is not
-// indexable. Documents whose field is missing have no entry. An index is
-// not safe for concurrent use; the owning collection serializes access.
-type index struct {
-	name, field string
-	keys        map[string]map[string]struct{} // key -> set of ids
+// docIndexKeys is what one document version contributes to one index: its
+// entries, whether it holds a value that has no entry (complex), and
+// whether the value is an array.
+type docIndexKeys struct {
+	entries []indexEntry
+	complex bool
+	array   bool
 }
 
-// newIndex returns an empty index called name on field.
-func newIndex(name, field string) *index {
-	return &index{
-		name:  name,
-		field: field,
-		keys:  make(map[string]map[string]struct{}),
+// indexBase holds, per index name, the keys of one document version. A
+// memtable entry keeps the base of the version in the index file that it
+// replaces (see memEntry).
+type indexBase map[string]docIndexKeys
+
+// missingValue is the encoded "field is missing" value. Shared; never
+// modified.
+var missingValue = idxstore.AppendMissing(nil)
+
+// dedupLinearMax is the array length up to which indexKeysOf finds
+// duplicate elements by a linear search instead of a map.
+const dedupLinearMax = 16
+
+// indexKeysOf returns the entries doc contributes to an index on field
+// (see the top of this file). A nil doc (no version) contributes nothing.
+func indexKeysOf(doc *Document, field string) docIndexKeys {
+	if doc == nil {
+		return docIndexKeys{}
 	}
-}
-
-// add records doc under id. When replacing a document, the caller removes
-// the previous version first.
-func (ix *index) add(id string, doc *Document) {
-	for _, key := range ix.docKeys(doc) {
-		ids, ok := ix.keys[key]
+	v, ok := doc.GetPath(field)
+	if !ok {
+		return docIndexKeys{entries: []indexEntry{{enc: missingValue}}}
+	}
+	if enc, truncated, ok := idxstore.AppendValue(nil, v); ok {
+		return docIndexKeys{entries: []indexEntry{{enc: enc, flags: truncatedFlag(truncated)}}}
+	}
+	elems, ok := listValues(v)
+	if !ok {
+		return docIndexKeys{complex: true}
+	}
+	var (
+		out  = docIndexKeys{array: true}
+		seen map[string]int // enc -> position in out.entries, for long arrays
+	)
+	if len(elems) > dedupLinearMax {
+		seen = make(map[string]int, len(elems))
+	}
+	for _, el := range elems {
+		enc, truncated, ok := idxstore.AppendValue(nil, el)
 		if !ok {
-			ids = make(map[string]struct{})
-			ix.keys[key] = ids
-		}
-		ids[id] = struct{}{}
-	}
-}
-
-// remove deletes id from the entries for doc's value, leaving other
-// documents with the same value in place. doc must be the version that was
-// added.
-func (ix *index) remove(id string, doc *Document) {
-	for _, key := range ix.docKeys(doc) {
-		ids, ok := ix.keys[key]
-		if !ok {
+			out.complex = true
 			continue
 		}
-		delete(ids, id)
-		if len(ids) == 0 {
-			delete(ix.keys, key)
+		flags := idxstore.FlagElement | truncatedFlag(truncated)
+		// Two elements with the same encoding share one entry (equal
+		// values, or long strings cut to the same bytes; a cut one keeps
+		// the entry a candidate only).
+		i := -1
+		if seen != nil {
+			if j, dup := seen[string(enc)]; dup {
+				i = j
+			}
+		} else {
+			i = slices.IndexFunc(out.entries, func(e indexEntry) bool { return bytes.Equal(e.enc, enc) })
 		}
-	}
-}
-
-// lookup returns the sorted ids of the documents whose field equals v, or
-// nil if there are none. It also returns nil for a value that is not
-// indexable; callers that must tell the two apart check indexKey first and
-// fall back to a scan.
-func (ix *index) lookup(v any) []string {
-	key, ok := indexKey(v)
-	if !ok {
-		return nil
-	}
-	return sortedIDs(ix.keys[key])
-}
-
-// snapshotKeys returns the index contents as canonical key -> sorted ids,
-// the shape stored in segment.IndexSnapshot.Keys. The result shares no
-// memory with the index.
-func (ix *index) snapshotKeys() map[string][]string {
-	out := make(map[string][]string, len(ix.keys))
-	for key, ids := range ix.keys {
-		out[key] = sortedIDs(ids)
+		if i >= 0 {
+			out.entries[i].flags |= flags
+			continue
+		}
+		if seen != nil {
+			seen[string(enc)] = len(out.entries)
+		}
+		out.entries = append(out.entries, indexEntry{enc: enc, flags: flags})
 	}
 	return out
 }
 
-// indexFromSnapshot rebuilds an index from a persisted snapshot. s must
-// not be nil. Empty id lists are skipped.
-func indexFromSnapshot(s *segment.IndexSnapshot) *index {
-	ix := newIndex(s.Name, s.Field)
-	for key, ids := range s.Keys {
-		if len(ids) == 0 {
-			continue
-		}
-		set := make(map[string]struct{}, len(ids))
-		for _, id := range ids {
-			set[id] = struct{}{}
-		}
-		ix.keys[key] = set
+func truncatedFlag(truncated bool) idxstore.Flags {
+	if truncated {
+		return idxstore.FlagTruncated
 	}
-	return ix
+	return 0
 }
 
-// docKeys returns the index keys of doc's indexed field: the key of a
-// scalar value, or the keys of the indexable elements of an array (each
-// once). It returns nil when the field is missing or not indexable.
-func (ix *index) docKeys(doc *Document) []string {
-	if doc == nil {
+// indexKeysAll returns the keys of doc on every index of the collection,
+// or nil when doc is nil or there is no index. Callers hold Database.mu
+// (the index set changes only under it exclusively) or run in recovery.
+func (c *Collection) indexKeysAll(doc *Document) indexBase {
+	if doc == nil || len(c.indexes) == 0 {
 		return nil
 	}
-	v, ok := doc.GetValue(ix.field)
-	if !ok {
+	b := make(indexBase, len(c.indexes))
+	for name, def := range c.indexes {
+		b[name] = indexKeysOf(doc, def.Field)
+	}
+	return b
+}
+
+// forgetBaseLocked removes the keys of index name from the base of every
+// memtable and flushing entry, after the index was created or dropped: the
+// flush then reads the version in the index file to find the old keys
+// (applyFlush). Callers hold mu exclusively and flushMu (or run in
+// recovery), so no flush is reading the bases.
+func (c *Collection) forgetBaseLocked(name string) {
+	for _, layer := range []map[string]memEntry{c.memtable, c.flushing} {
+		for _, me := range layer {
+			delete(me.base, name) // a no-op on a nil base
+		}
+	}
+}
+
+// indexOp is one change of an index entry in a flush or build.
+type indexOp struct {
+	enc   []byte
+	id    string
+	flags idxstore.Flags
+	del   bool
+}
+
+// compareIndexOps orders ops by index key (value, then id): the order of
+// the entries in the bucket, in which bbolt takes them fastest.
+func compareIndexOps(a, b indexOp) int {
+	if c := bytes.Compare(a.enc, b.enc); c != 0 {
+		return c
+	}
+	return strings.Compare(a.id, b.id)
+}
+
+// appendIndexDiff appends to ops the changes that turn the entries old of
+// document id into the entries next: deletes of entries that go, puts of
+// entries that are new or change flags. Unchanged entries are left alone.
+func appendIndexDiff(ops []indexOp, id string, old, next []indexEntry) []indexOp {
+	for _, o := range old {
+		if !slices.ContainsFunc(next, func(n indexEntry) bool { return bytes.Equal(n.enc, o.enc) }) {
+			ops = append(ops, indexOp{enc: o.enc, id: id, del: true})
+		}
+	}
+	for _, n := range next {
+		i := slices.IndexFunc(old, func(o indexEntry) bool { return bytes.Equal(o.enc, n.enc) })
+		if i < 0 || old[i].flags != n.flags {
+			ops = append(ops, indexOp{enc: n.enc, id: id, flags: n.flags})
+		}
+	}
+	return ops
+}
+
+// applyIndexOps sorts ops by key and applies them to w.
+func applyIndexOps(w *idxstore.IndexWriter, ops []indexOp) error {
+	slices.SortFunc(ops, compareIndexOps)
+	for _, op := range ops {
+		var err error
+		if op.del {
+			err = w.Delete(op.enc, op.id)
+		} else {
+			err = w.Put(op.enc, op.id, op.flags)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// indexBuildBatch is how many index entries a build writes per index
+// transaction.
+const indexBuildBatch = 50_000
+
+// buildIndexes builds the indexes defs in the index file st from every
+// document its key table lists (approach-index-and-query §10, and the
+// rebuild of §8/§9): an existing bucket of the same name is dropped, the
+// new one is created not ready, the entries are sorted by key and written
+// in batches, and the last batch stores the complex and arrays counters and marks the
+// indexes ready. An interrupted build leaves an index that is not ready,
+// which the next Open builds again (syncIndexes).
+//
+// The caller keeps the key table and the documents still: it holds
+// flushMu and compactMu, or runs at Open before the flusher starts.
+//
+// buildIndexes never checks uniqueness (the rebuild, syncIndexes, and WAL
+// replay must not fail on data that is already committed); CreateIndex
+// uses buildIndexesChecked.
+func (c *Collection) buildIndexes(ctx context.Context, st *idxstore.Store, defs []indexDef) error {
+	return c.buildIndexesChecked(ctx, st, defs, nil, false)
+}
+
+// buildIndexesChecked is buildIndexes that, when check is set, first makes
+// sure that no two live documents share a value of a unique index of defs
+// and otherwise fails with ErrUniqueViolation (duplicateValues) before it
+// writes anything. The live documents are those of the key table whose id
+// is not in overlay, plus the live documents of overlay (the unflushed
+// changes, which the caller keeps still).
+func (c *Collection) buildIndexesChecked(ctx context.Context, st *idxstore.Store, defs []indexDef, overlay map[string]*Document, check bool) error {
+	if len(defs) == 0 {
 		return nil
 	}
-	return valueKeys(v)
-}
-
-// Marker keys (see index). Value keys always have a type tag other than
-// "a" and "u".
-const (
-	arrayMarker     = "a:"
-	unindexedMarker = "u:"
-)
-
-// valueKeys returns the index keys of a field value (see docKeys),
-// marker keys included.
-func valueKeys(v any) []string {
-	if key, ok := indexKey(v); ok {
-		return []string{key}
+	ops := make([][]indexOp, len(defs))
+	complexN := make([]int64, len(defs))
+	arraysN := make([]int64, len(defs))
+	var owners [][]uniqueOwner // per def, when checked
+	if check {
+		owners = make([][]uniqueOwner, len(defs))
 	}
-	elems, ok := listValues(v)
-	if !ok {
-		return []string{unindexedMarker}
-	}
-	keys := []string{arrayMarker}
-	unindexed := false
-	for _, e := range elems {
-		key, ok := indexKey(e)
-		switch {
-		case !ok:
-			unindexed = true
-		case !slices.Contains(keys, key):
-			keys = append(keys, key)
-		}
-	}
-	if unindexed {
-		keys = append(keys, unindexedMarker)
-	}
-	return keys
-}
-
-// isMarkerKey reports whether key is a marker key, not a value key.
-func isMarkerKey(key string) bool { return key == arrayMarker || key == unindexedMarker }
-
-// countEq returns the number of documents whose field equals the
-// indexable value v as a whole (array values excluded).
-func (ix *index) countEq(v any) int {
-	set, _ := ix.lookupSet(v)
-	return len(set) - intersectionSize(set, ix.keys[arrayMarker])
-}
-
-// countHas returns the number of documents whose field is an array with
-// an element equal to the indexable value v.
-func (ix *index) countHas(v any) int {
-	set, _ := ix.lookupSet(v)
-	return intersectionSize(set, ix.keys[arrayMarker])
-}
-
-// intersectionSize returns |a ∩ b|.
-func intersectionSize(a, b map[string]struct{}) int {
-	if len(b) < len(a) {
-		a, b = b, a
-	}
-	n := 0
-	for id := range a {
-		if _, ok := b[id]; ok {
-			n++
-		}
-	}
-	return n
-}
-
-// distinctValues returns the distinct values held in the field, array
-// elements included, decoded from the keys; false if some document holds
-// a value that is not indexable (the keys then miss it).
-func (ix *index) distinctValues() ([]any, bool) {
-	if len(ix.keys[unindexedMarker]) > 0 {
-		return nil, false
-	}
-	out := make([]any, 0, len(ix.keys))
-	for key := range ix.keys {
-		if isMarkerKey(key) {
-			continue
-		}
-		v, ok := decodeIndexKey(key)
-		if !ok {
-			return nil, false
-		}
-		out = append(out, v)
-	}
-	return out, true
-}
-
-// decodeIndexKey returns the value of a value key (see indexKey).
-func decodeIndexKey(key string) (any, bool) {
-	if len(key) < 2 || key[1] != ':' {
-		return nil, false
-	}
-	body := key[2:]
-	switch key[0] {
-	case 'z':
-		return nil, body == ""
-	case 'b':
-		switch body {
-		case "t":
-			return true, true
-		case "f":
-			return false, true
-		}
-		return nil, false
-	case 'n':
-		f, err := strconv.ParseFloat(body, 64)
-		return f, err == nil
-	case 's':
-		return body, true
-	}
-	return nil, false
-}
-
-// lookupSet returns the set of ids under the key of v (shared with the
-// index; not to be modified) and whether v is indexable.
-func (ix *index) lookupSet(v any) (map[string]struct{}, bool) {
-	key, ok := indexKey(v)
-	if !ok {
-		return nil, false
-	}
-	return ix.keys[key], true
-}
-
-// lookupAny returns the sorted ids of the documents holding any of vals
-// (as the value or an array element), and false if some value is not
-// indexable (such a value could match unindexed elements).
-func (ix *index) lookupAny(vals []any) ([]string, bool) {
-	union := make(map[string]struct{})
-	for _, v := range vals {
-		set, ok := ix.lookupSet(v)
-		if !ok {
-			return nil, false
-		}
-		for id := range set {
-			union[id] = struct{}{}
-		}
-	}
-	return sortedIDs(union), true
-}
-
-// lookupAll returns the sorted ids of the documents holding every
-// indexable value of vals, a superset of the documents holding all of
-// vals, and false if no value is indexable.
-func (ix *index) lookupAll(vals []any) ([]string, bool) {
-	var sets []map[string]struct{}
-	for _, v := range vals {
-		if set, ok := ix.lookupSet(v); ok {
-			sets = append(sets, set)
-		}
-	}
-	if len(sets) == 0 {
-		return nil, false
-	}
-	slices.SortFunc(sets, func(a, b map[string]struct{}) int { return len(a) - len(b) })
-	out := make(map[string]struct{}, len(sets[0]))
-outer:
-	for id := range sets[0] {
-		for _, set := range sets[1:] {
-			if _, ok := set[id]; !ok {
-				continue outer
+	err := st.View(func(tx *idxstore.Tx) error {
+		n := 0
+		cur := tx.KeyCursor()
+		for k, ke, ok := cur.First(); ok; k, ke, ok = cur.Next() {
+			if n++; n%findCtxCheckEvery == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			id := string(k)
+			doc, err := c.readStored(id, ke)
+			if err != nil {
+				return err
+			}
+			_, changed := overlay[id]
+			for i, def := range defs {
+				if check && def.Unique && !changed {
+					if uv, ok := uniqueValueOf(doc, def); ok {
+						owners[i] = append(owners[i], uniqueOwner{dkey: uv.dkey, v: uv.v, id: id})
+					}
+				}
+				keys := indexKeysOf(doc, def.Field)
+				if keys.complex {
+					complexN[i]++
+				}
+				if keys.array {
+					arraysN[i]++
+				}
+				for _, en := range keys.entries {
+					ops[i] = append(ops[i], indexOp{enc: en.enc, id: id, flags: en.flags})
+				}
 			}
 		}
-		out[id] = struct{}{}
+		return cur.Err()
+	})
+	if err != nil {
+		return err
 	}
-	return sortedIDs(out), true
+	for i := range owners {
+		if !defs[i].Unique {
+			continue
+		}
+		for id, doc := range overlay {
+			if uv, ok := uniqueValueOf(doc, defs[i]); ok {
+				owners[i] = append(owners[i], uniqueOwner{dkey: uv.dkey, v: uv.v, id: id})
+			}
+		}
+		if err := duplicateValues(owners[i]); err != nil {
+			return err
+		}
+		owners[i] = nil
+	}
+
+	err = st.Update(func(u *idxstore.WTx) error {
+		for _, def := range defs {
+			if err := u.DropIndex(def.Name); err != nil && !errors.Is(err, idxstore.ErrNoIndex) {
+				return err
+			}
+			if err := u.CreateIndex(def.Name); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for i := range defs {
+		slices.SortFunc(ops[i], compareIndexOps)
+	}
+	// Batches: the entries of every index in turn, then one last
+	// transaction with the counters and the ready marks.
+	for i, def := range defs {
+		for rest := ops[i]; len(rest) > 0; {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			batch := rest[:min(len(rest), indexBuildBatch)]
+			rest = rest[len(batch):]
+			err := st.Update(func(u *idxstore.WTx) error {
+				if err := u.SetFillPercent(0.9); err != nil { // ascending keys: pack the pages
+					return err
+				}
+				w, err := u.Index(def.Name)
+				if err != nil {
+					return err
+				}
+				for _, op := range batch {
+					if err := w.Put(op.enc, op.id, op.flags); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+		ops[i] = nil // release it
+	}
+	return st.Update(func(u *idxstore.WTx) error {
+		for i, def := range defs {
+			w, err := u.Index(def.Name)
+			if err != nil {
+				return err
+			}
+			if err := w.AddComplex(complexN[i]); err != nil {
+				return err
+			}
+			if err := w.AddArrays(arraysN[i]); err != nil {
+				return err
+			}
+			if err := w.SetReady(); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
-// sortedIDs returns the members of set in ascending order, or nil if the
-// set is empty.
-func sortedIDs(set map[string]struct{}) []string {
-	if len(set) == 0 {
+// syncIndexes brings the index buckets of st in line with the collection's
+// index definitions (coll.meta) at Open: a bucket without a definition is
+// dropped (a create_index that did not reach coll.meta, or a drop_index
+// that did not reach the index file), and a definition without a ready
+// bucket is built (an interrupted build), with a warning. Callers have not
+// published c yet.
+func (c *Collection) syncIndexes(ctx context.Context, st *idxstore.Store) error {
+	var stats []idxstore.IndexStats
+	if err := st.View(func(tx *idxstore.Tx) (err error) {
+		stats, err = tx.Indexes()
+		return err
+	}); err != nil {
+		return err
+	}
+	ready := make(map[string]bool, len(stats))
+	var stale []string
+	for _, s := range stats {
+		if _, ok := c.indexes[s.Name]; !ok {
+			stale = append(stale, s.Name)
+			continue
+		}
+		ready[s.Name] = s.Ready
+	}
+	logger := c.db.e.logger
+	if len(stale) > 0 {
+		logger.Info("cachydb: dropping index entries without an index definition (an interrupted create_index or drop_index)",
+			"database", c.db.name, "collection", c.name, "indexes", stale)
+		err := st.Update(func(u *idxstore.WTx) error {
+			for _, name := range stale {
+				if err := u.DropIndex(name); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	var build []indexDef
+	for _, def := range sortedIndexDefs(c.indexes) {
+		if !ready[def.Name] {
+			build = append(build, def)
+		}
+	}
+	if len(build) == 0 {
 		return nil
 	}
-	return slices.Sorted(maps.Keys(set))
+	names := make([]string, len(build))
+	for i, def := range build {
+		names[i] = def.Name
+	}
+	logger.Warn("cachydb: building indexes that are missing or incomplete in the index file",
+		"database", c.db.name, "collection", c.name, "indexes", names)
+	if err := c.buildIndexes(ctx, st, build); err != nil {
+		return fmt.Errorf("building indexes %v: %w", names, err)
+	}
+	return nil
+}
+
+// indexOnLocked returns the definition of an index on field (the one with
+// the smallest name if there are several), and false if there is none.
+// Callers hold mu or Database.mu.
+func (c *Collection) indexOnLocked(field string) (indexDef, bool) {
+	var (
+		best  indexDef
+		found bool
+	)
+	for _, def := range c.indexes {
+		if def.Field == field && (!found || def.Name < best.Name) {
+			best, found = def, true
+		}
+	}
+	return best, found
+}
+
+// indexesUnchanged reports whether every index of used still exists with
+// the same field. A reader that chose its indexes before its read
+// transaction calls it afterwards: an index dropped and re-created on
+// another field in between would have answered for the wrong field.
+func (c *Collection) indexesUnchanged(used []indexDef) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, u := range used {
+		if def, ok := c.indexes[u.Name]; !ok || def.Field != u.Field {
+			return false
+		}
+	}
+	return true
+}
+
+// valueIDs appends to dst, in ascending order, the ids of the entries of
+// value enc whose FlagElement equals element, leaving out the ids in skip
+// (the overlay, which decides for its ids).
+func valueIDs(cur *idxstore.IndexCursor, enc []byte, element bool, skip map[string]*Document, dst []string) []string {
+	for e, ok := cur.Seek(idxstore.ValuePrefix(enc)); ok && bytes.Equal(e.Value, enc); e, ok = cur.Next() {
+		if (e.Flags&idxstore.FlagElement != 0) != element {
+			continue
+		}
+		if _, in := skip[string(e.ID)]; in {
+			continue
+		}
+		dst = append(dst, string(e.ID))
+	}
+	return dst
+}
+
+// mergeSorted returns the union of the ascending, duplicate-free lists a
+// and b, ascending.
+func mergeSorted(a, b []string) []string {
+	if len(b) == 0 {
+		return a
+	}
+	if len(a) == 0 {
+		return b
+	}
+	out := make([]string, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch c := strings.Compare(a[i], b[j]); {
+		case c < 0:
+			out = append(out, a[i])
+			i++
+		case c > 0:
+			out = append(out, b[j])
+			j++
+		default:
+			out = append(out, a[i])
+			i++
+			j++
+		}
+	}
+	out = append(out, a[i:]...)
+	return append(out, b[j:]...)
+}
+
+// distinctKey returns the key under which Distinct deduplicates v: the
+// encoded value for an indexable value that was not cut, otherwise its
+// canonical JSON. Values that eq treats as equal get the same key.
+func distinctKey(v any) string {
+	if enc, truncated, ok := idxstore.AppendValue(nil, v); ok && !truncated {
+		return "v" + string(enc)
+	}
+	return "j" + canonicalJSON(v)
 }

@@ -3,7 +3,6 @@ package db
 import (
 	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -13,20 +12,28 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hop-/cachydb/pkg/db/internal/idxstore"
 	"github.com/hop-/cachydb/pkg/db/internal/segment"
 	"github.com/hop-/cachydb/pkg/db/internal/wal"
 )
 
-// Background flush (§5.4), checkpoint markers, and the low-water mark
-// (§7.1).
+// Background flush (§5.4; approach-index-and-query §4), the checkpoint,
+// and the low-water mark (§7.1).
 //
 // A flush swaps a collection's memtable into the immutable flushing
 // table, appends the changed documents and tombstones (sorted by WAL
-// offset) plus one checkpoint marker to the active data segment, fsyncs
-// once, and then repoints the keydir. Collection.mu is held only for the
-// two memory-only swaps, never during segment I/O. A failed flush keeps
-// flushing (reads still see it) and the old checkpoint, and the next
-// flush retries with flushing ∪ memtable.
+// offset) to the active data segment, fsyncs once, and then applies them
+// to the index file in one transaction: the key-table changes, the
+// secondary index entries and counters, the live count, the per-segment
+// byte accounting, the position the index now covers, and the checkpoint. Collection.mu is held only for the two
+// memory-only swaps, never during segment or index I/O. A failed flush
+// keeps flushing (reads still see it) and the old checkpoint, and the
+// next flush retries with flushing ∪ memtable.
+//
+// A crash between the segment fsync and the index commit leaves records
+// in the segment that the index file does not know. The next Open
+// truncates the segment back to the covered position (Collection.load),
+// and WAL replay restores the changes: the checkpoint did not advance.
 
 // segmentWriter is the part of *segment.Writer the flusher uses. Tests
 // wrap it (Options.testSegWriter) to inject slow or failing I/O.
@@ -68,7 +75,7 @@ func checkpointBelow(lw uint64) uint64 {
 	return lw - 1
 }
 
-// flushCheckpointLocked returns the checkpoint marker value for a flush
+// flushCheckpointLocked returns the checkpoint for a flush
 // whose flushing table was just swapped in (§7.1): one below the smallest
 // offset of this collection's records that the flush does not cover. The
 // memtable is empty at this point, so those are the inflight writes, and
@@ -201,11 +208,9 @@ func (e *Engine) kickFlush() {
 // startFlusher starts the background flusher. Called once by Open, before
 // the engine is returned, so Close cannot be waiting on bg yet.
 func (e *Engine) startFlusher() {
-	e.bg.Add(1)
-	go func() {
-		defer e.bg.Done()
+	e.bg.Go(func() {
 		e.flushLoop(e.bgCtx)
-	}()
+	})
 }
 
 // flushLoop flushes every collection each FlushInterval and, when kicked,
@@ -268,9 +273,7 @@ func (e *Engine) flushAll(ctx context.Context, onlyFull bool) error {
 			<-sem
 			break
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			defer func() { <-sem }()
 			err := c.flush()
 			if err == nil {
@@ -286,7 +289,7 @@ func (e *Engine) flushAll(ctx context.Context, onlyFull bool) error {
 			e.logger.Error("cachydb: flush failed; the changes stay in memory and the WAL and are retried",
 				"database", c.db.name, "collection", c.name, "err", err)
 			errs = append(errs, err)
-		}()
+		})
 	}
 	wg.Wait()
 	if crashed {
@@ -348,10 +351,17 @@ func (c *Collection) flush() error {
 	c.memtable, c.memMin, c.memBytes = make(map[string]memEntry), 0, 0
 	cp := c.flushCheckpointLocked()
 	flushing := c.flushing // immutable while set; only the flusher replaces it
+	// The index set cannot change before this flush ends: CreateIndex and
+	// DropIndex hold flushMu.
+	defs := sortedIndexDefs(c.indexes)
 	c.mu.Unlock()
 
-	// 2. Write the records and the checkpoint marker, one fsync.
-	entries, recs, err := flushRecords(flushing, cp)
+	// 2. Write the records, one fsync.
+	entries, recs, err := flushRecords(flushing)
+	if err != nil {
+		return fmt.Errorf("flushing collection %q: %w", c.name, err)
+	}
+	st, err := c.indexStore()
 	if err != nil {
 		return fmt.Errorf("flushing collection %q: %w", c.name, err)
 	}
@@ -376,44 +386,49 @@ func (c *Collection) flush() error {
 		return err // simulated crash: no cleanup
 	}
 
-	// 3. Repoint the keydir (memory only).
+	// 3. One index transaction (no collection lock is held): the key
+	// table, index entries, count, segment accounting, covered position,
+	// and checkpoint change together or not at all.
+	covered := idxstore.Position{Seg: w.Seg(), End: uint64(w.Size())}
+	committing := false
+	err = st.Update(func(u *idxstore.WTx) error {
+		committing = false
+		if err := c.applyFlush(u, defs, entries, locs, cp, covered); err != nil {
+			return err
+		}
+		if err := e.indexCommitHook(indexCommitFlush, false); err != nil {
+			return err // tests only: the transaction rolls back
+		}
+		committing = true
+		return nil
+	})
+	if err == nil {
+		// Tests only: a commit error after the transaction was written
+		// (committing is true), handled as a real one below.
+		err = e.indexCommitHook(indexCommitFlush, true)
+	}
+	if err != nil {
+		c.afterFailedIndexCommit(st, covered, pre, committing)
+		return fmt.Errorf("flushing collection %q: %w", c.name, c.storeErr(err))
+	}
+	if err := e.hook(hookAfterIndexCommit); err != nil {
+		return err // simulated crash: no cleanup
+	}
+
+	// 4. The changes are in the index file: drop them from the overlay
+	// (memory only), with their values pending for unique indexes.
+	// Readers that still see flushing started before this point; readers
+	// that do not start their read transaction after the commit above.
+	drops := flushedUniqueValues(flushing, defs)
 	c.mu.Lock()
-	for _, loc := range locs {
-		c.segBytes[loc.Seg] += int64(loc.Size)
-	}
-	for i, en := range entries {
-		loc := locs[i]
-		old, had := c.keydir[en.id]
-		if had && old.walOffset >= en.me.walOffset {
-			c.deadBytes[loc.Seg] += int64(loc.Size) // already superseded on disk
-			continue
-		}
-		if had {
-			c.deadBytes[old.loc.Seg] += int64(old.loc.Size)
-		}
-		if en.me.doc == nil {
-			delete(c.keydir, en.id)
-			c.deadBytes[loc.Seg] += int64(loc.Size) // tombstones are never referenced
-		} else {
-			c.keydir[en.id] = keyEntry{loc: loc, walOffset: en.me.walOffset}
-		}
-	}
-	marker := locs[len(locs)-1]
-	c.deadBytes[marker.Seg] += int64(marker.Size)
+	c.flushDropUniquePendingLocked(drops)
 	flushed := c.flushingBytes
 	c.flushing, c.flushingMin, c.flushingBytes = nil, 0, 0
-	c.checkpoint = cp
+	c.checkpoint = max(c.checkpoint, cp)
 	c.mu.Unlock()
 	e.pending.release(flushed) // wakes writers waiting on MaxPendingBytes
-	c.markerSeg = marker.Seg
 
-	for i := range recs {
-		c.activeHint = append(c.activeHint, segment.HintEntry{
-			ID: recs[i].ID, Type: recs[i].Type, WALOffset: recs[i].WALOffset, Loc: locs[i],
-		})
-	}
-
-	// 4. Roll the segment once it is full.
+	// 5. Roll the segment once it is full.
 	if w.Size() >= e.opts.DataSegmentSize {
 		c.sealActive()
 	}
@@ -422,35 +437,225 @@ func (c *Collection) flush() error {
 
 // flushRecords returns the flushing entries sorted by WAL offset and the
 // segment records to append for them: one put or tombstone per entry, in
-// the same order, then the checkpoint marker with value cp.
-func flushRecords(flushing map[string]memEntry, cp uint64) ([]flushEntry, []segment.Record, error) {
+// the same order. A put carries the entry's WAL payload as is: the same
+// JSON the document was decoded from, so nothing is encoded again.
+// (Checkpoint marker records are no longer written; the checkpoint is in
+// the index file.)
+func flushRecords(flushing map[string]memEntry) ([]flushEntry, []segment.Record, error) {
 	entries := make([]flushEntry, 0, len(flushing))
 	for id, me := range flushing {
 		entries = append(entries, flushEntry{id: id, me: me})
 	}
 	slices.SortFunc(entries, func(a, b flushEntry) int { return cmp.Compare(a.me.walOffset, b.me.walOffset) })
 
-	recs := make([]segment.Record, 0, len(entries)+1)
+	recs := make([]segment.Record, 0, len(entries))
 	for _, en := range entries {
 		if en.me.doc == nil {
 			recs = append(recs, segment.Record{Type: segment.TypeTombstone, WALOffset: en.me.walOffset, ID: en.id})
 			continue
 		}
-		data, err := json.Marshal(en.me.doc)
-		if err != nil {
-			return nil, nil, fmt.Errorf("encoding document %q: %w", en.id, err)
+		if len(en.me.payload) == 0 {
+			return nil, nil, fmt.Errorf("document %q at WAL offset %d has no encoded payload", en.id, en.me.walOffset)
 		}
-		recs = append(recs, segment.Record{Type: segment.TypePut, WALOffset: en.me.walOffset, ID: en.id, Doc: data})
+		recs = append(recs, segment.Record{Type: segment.TypePut, WALOffset: en.me.walOffset, ID: en.id, Doc: en.me.payload})
 	}
-	recs = append(recs, segment.Record{Type: segment.TypeCheckpoint, WALOffset: cp})
 	return entries, recs, nil
+}
+
+// applyFlush is the index transaction of a flush (approach-index-and-query
+// §4 step 3). entries were appended to the active segment at locs (same
+// order); defs is the collection's index set. For each entry it reads the
+// key-table entry of the id: if that one is not older (WAL replay over data
+// that is already flushed), the new record is dead on arrival; otherwise
+// the entry replaces it, or removes the id for a tombstone, and the old
+// record becomes dead. The index entries of the old version (oldIndexKeys)
+// are replaced by those of the new one, and each index's complex and
+// arrays counters follow. Then it adds the record and dead bytes to the segment accounting
+// (registering the active segment on its first flush) and stores the
+// covered position and the checkpoint. The live count and the truncated
+// counters follow the key table and the entries by themselves (idxstore).
+//
+// The ids are applied in ascending order, not WAL-offset order: an id
+// occurs once per flush, so the result is the same, and bbolt takes keys
+// in order far faster (see the idxstore package comment). For the same
+// reason each index's changes are sorted by key before they are applied.
+func (c *Collection) applyFlush(u *idxstore.WTx, defs []indexDef, entries []flushEntry, locs []segment.Location, cp uint64, covered idxstore.Position) error {
+	order := make([]int, len(entries))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortFunc(order, func(a, b int) int { return cmp.Compare(entries[a].id, entries[b].id) })
+
+	recBytes := make(map[uint32]int64, 1)
+	deadBytes := make(map[uint32]int64, 2)
+	ixOps := make([][]indexOp, len(defs))
+	complexDelta := make([]int64, len(defs))
+	arraysDelta := make([]int64, len(defs))
+	var maxOff uint64
+	for _, i := range order {
+		en, loc := entries[i], locs[i]
+		size := int64(loc.Size)
+		recBytes[loc.Seg] += size
+		maxOff = max(maxOff, en.me.walOffset)
+		old, had, err := u.Key(en.id)
+		if err != nil {
+			return err
+		}
+		if had && old.WALOffset >= en.me.walOffset {
+			deadBytes[loc.Seg] += size // already superseded on disk
+			continue
+		}
+		if len(defs) > 0 {
+			oldKeys, err := c.oldIndexKeys(en, defs, old, had)
+			if err != nil {
+				return err
+			}
+			for j, def := range defs {
+				var next docIndexKeys
+				if en.me.doc != nil {
+					next = indexKeysOf(en.me.doc, def.Field)
+				}
+				ixOps[j] = appendIndexDiff(ixOps[j], en.id, oldKeys[def.Name].entries, next.entries)
+				complexDelta[j] += boolInt(next.complex) - boolInt(oldKeys[def.Name].complex)
+				arraysDelta[j] += boolInt(next.array) - boolInt(oldKeys[def.Name].array)
+			}
+		}
+		if had {
+			deadBytes[old.Seg] += int64(old.Size)
+		}
+		if en.me.doc == nil {
+			deadBytes[loc.Seg] += size // tombstones are never referenced
+			if err := u.DeleteKey(en.id); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := u.PutKey(en.id, locationEntry(loc, en.me.walOffset)); err != nil {
+			return err
+		}
+	}
+	for j, def := range defs {
+		if len(ixOps[j]) == 0 && complexDelta[j] == 0 && arraysDelta[j] == 0 {
+			continue
+		}
+		w, err := u.Index(def.Name)
+		if err != nil {
+			return err
+		}
+		if err := applyIndexOps(w, ixOps[j]); err != nil {
+			return err
+		}
+		if err := w.AddComplex(complexDelta[j]); err != nil {
+			return err
+		}
+		if err := w.AddArrays(arraysDelta[j]); err != nil {
+			return err
+		}
+	}
+	segs := slices.Collect(maps.Keys(recBytes))
+	for seg := range deadBytes {
+		if _, ok := recBytes[seg]; !ok {
+			segs = append(segs, seg)
+		}
+	}
+	slices.Sort(segs)
+	for _, seg := range segs {
+		if err := u.AddSegment(seg, recBytes[seg], deadBytes[seg]); err != nil {
+			return err
+		}
+	}
+	if err := u.SetCovered(covered); err != nil {
+		return err
+	}
+	if err := u.RaiseMaxWALOffset(maxOff); err != nil {
+		return err
+	}
+	cur, err := u.Checkpoint()
+	if err != nil || cp <= cur {
+		return err // checkpoints only grow
+	}
+	return u.SetCheckpoint(cp)
+}
+
+// oldIndexKeys returns the index keys, per index of defs, of the version of
+// en's document that the key table holds (old, if had): the keys captured
+// on the write path (memEntry.base) when they describe that version and
+// cover every index, otherwise the keys of the version read from its data
+// segment. The second case follows an index created or dropped since the
+// capture, and a flush retried after a commit that failed late but reached
+// the file.
+func (c *Collection) oldIndexKeys(en flushEntry, defs []indexDef, old idxstore.Entry, had bool) (indexBase, error) {
+	if !had {
+		return nil, nil // no version in the index file, so no entries
+	}
+	if en.me.baseOff == old.WALOffset {
+		complete := true
+		for _, def := range defs {
+			if _, ok := en.me.base[def.Name]; !ok {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			return en.me.base, nil
+		}
+	}
+	doc, err := c.readStored(en.id, old)
+	if err != nil {
+		return nil, fmt.Errorf("reading the replaced version of %q for its index keys: %w", en.id, err)
+	}
+	keys := make(indexBase, len(defs))
+	for _, def := range defs {
+		keys[def.Name] = indexKeysOf(doc, def.Field)
+	}
+	return keys, nil
+}
+
+func boolInt(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// afterFailedIndexCommit cleans up the active segment after the index
+// transaction of a flush failed; the flush wrote the records between pre
+// and covered.End. Callers hold flushMu.
+//
+// When the transaction never reached its commit (committing is false), or
+// the index file still shows an older covered position, nothing in the
+// index file references those records: the segment is truncated back, as
+// after a failed append. A commit that failed late is different: bbolt may
+// already have written the transaction, so that the file shows it although
+// it was not made durable. Then the key table may point at the records and
+// they must stay; the retried flush appends them again, finds the entries
+// in place (same WAL offsets), and counts its own copies as dead.
+func (c *Collection) afterFailedIndexCommit(st *idxstore.Store, covered idxstore.Position, pre int64, committing bool) {
+	if committing {
+		var now idxstore.Position
+		err := st.View(func(tx *idxstore.Tx) (err error) {
+			now, err = tx.Covered()
+			return err
+		})
+		if err != nil || now == covered {
+			if w := c.active; w != nil {
+				c.active = nil
+				_ = w.Close() // the flush already failed; the next one reopens the segment
+			}
+			c.db.e.logger.Warn("cachydb: the index transaction of a flush failed at commit; keeping its records in the data segment",
+				"file", segment.DataPath(c.dir, c.activeSeg), "err", err)
+			return
+		}
+	}
+	c.abandonActive(pre)
 }
 
 // ensureActive opens the active data segment if it is not open: a new
 // segment (id nextSeg, so it is newer than every existing segment,
 // compaction outputs included) for a collection without segments or after
-// a sealed one, or the current one again after a failed flush. Callers
-// hold flushMu.
+// a sealed one, or the current one again after a failed flush or a
+// restart. A new segment is registered in the index file by the first
+// flush that writes to it. Callers hold flushMu.
 func (c *Collection) ensureActive() error {
 	if c.active != nil {
 		return nil
@@ -460,7 +665,6 @@ func (c *Collection) ensureActive() error {
 		err error
 	)
 	if c.activeSeg == 0 || c.activeSealed {
-		c.activeHint = nil
 		w, err = c.createSegment(c.nextSeg)
 	} else {
 		w, err = c.openActiveSegment(c.activeSeg)
@@ -472,36 +676,23 @@ func (c *Collection) ensureActive() error {
 	c.activeSeg, c.activeSealed = seg, false
 	c.nextSeg = max(c.nextSeg, seg+1)
 	c.active = c.db.e.wrapSegmentWriter(w)
-	c.mu.Lock()
-	if _, ok := c.segBytes[seg]; !ok {
-		var n int64
-		for _, h := range c.activeHint {
-			n += int64(h.Loc.Size)
-		}
-		c.segBytes[seg] = n
-	}
-	c.mu.Unlock()
 	return nil
 }
 
-// createSegment creates data segment seg. If the file already exists (an
-// earlier attempt failed after creating it), it is opened for append and
-// its records are scanned into activeHint.
+// createSegment creates data segment seg, a new id. If the file already
+// exists, an earlier attempt failed after creating it: segment ids are
+// never reused and the index file has never referenced this one, so the
+// leftover is removed and the segment created again.
 func (c *Collection) createSegment(seg uint32) (*segment.Writer, error) {
 	w, err := segment.Create(c.dir, seg)
 	if !errors.Is(err, fs.ErrExist) {
 		return w, err
 	}
-	if w, err = c.openActiveSegment(seg); err != nil {
-		return nil, err
+	path := segment.DataPath(c.dir, seg)
+	if err := os.Remove(path); err != nil {
+		return nil, fmt.Errorf("removing leftover data segment %s: %w", path, err)
 	}
-	hint, err := scanHint(c.dir, seg)
-	if err != nil {
-		_ = w.Close() // already failing; the scan error is reported
-		return nil, err
-	}
-	c.activeHint = hint
-	return w, nil
+	return segment.Create(c.dir, seg)
 }
 
 // openActiveSegment opens existing segment seg for append, truncating a
@@ -518,16 +709,6 @@ func (c *Collection) openActiveSegment(seg uint32) (*segment.Writer, error) {
 	return w, nil
 }
 
-// scanHint returns the hint entries of every record in segment seg.
-func scanHint(dir string, seg uint32) ([]segment.HintEntry, error) {
-	var hint []segment.HintEntry
-	_, err := segment.Scan(dir, seg, func(r segment.Record, loc segment.Location) error {
-		hint = append(hint, segment.HintEntry{ID: r.ID, Type: r.Type, WALOffset: r.WALOffset, Loc: loc})
-		return nil
-	})
-	return hint, err
-}
-
 func (e *Engine) wrapSegmentWriter(w *segment.Writer) segmentWriter {
 	if e.opts.testSegWriter != nil {
 		return e.opts.testSegWriter(w)
@@ -535,11 +716,11 @@ func (e *Engine) wrapSegmentWriter(w *segment.Writer) segmentWriter {
 	return w
 }
 
-// abandonActive handles a failed append or fsync of the active segment:
-// it closes the writer (whose error is sticky) and truncates the file back
-// to pre, the size before the failed flush, so no record or checkpoint
-// marker of the failed attempt can surface later. The next flush reopens
-// the segment. Callers hold flushMu.
+// abandonActive handles a failed append or fsync of the active segment (or
+// an index transaction that changed nothing): it closes the writer (whose
+// error is sticky) and truncates the file back to pre, the size before the
+// failed flush, so no record of the failed attempt can surface later. The
+// next flush reopens the segment. Callers hold flushMu.
 func (c *Collection) abandonActive(pre int64) {
 	w := c.active
 	c.active = nil
@@ -567,73 +748,31 @@ func truncateFile(path string, size int64) (err error) {
 	return f.Sync()
 }
 
-// sealActive seals the full active segment (§4.1): it closes it (fsync),
-// writes its hint file and the collection's index snapshots, and opens the
-// next segment. The segment's data is already durable, so failures here
-// are logged, not returned: a missing hint or snapshot is rebuilt on open,
-// and a failed segment creation is retried by the next flush. Callers hold
-// flushMu.
+// sealActive seals the full active segment (§4.1): it closes it (fsync)
+// and opens the next segment. The segment's data is already durable and
+// indexed, so failures here are logged, not returned: a failed segment
+// creation is retried by the next flush. Callers hold flushMu.
 func (c *Collection) sealActive() {
 	e := c.db.e
 	w, seg := c.active, c.activeSeg
-	end := w.Size()
 	c.active, c.activeSealed = nil, true
 	if err := w.Close(); err != nil {
 		e.logger.Warn("cachydb: closing sealed data segment", "file", segment.DataPath(c.dir, seg), "err", err)
 	}
-	if err := segment.WriteHint(c.dir, seg, c.activeHint); err != nil {
-		e.logger.Warn("cachydb: writing hint file; the segment will be scanned on open",
-			"file", segment.DataPath(c.dir, seg), "err", err)
-	}
-	c.activeHint = nil
-	c.writeIndexSnapshots(seg, uint64(end))
 	if err := c.ensureActive(); err != nil {
 		e.logger.Warn("cachydb: creating next data segment; retried by the next flush",
 			"database", c.db.name, "collection", c.name, "err", err)
 	}
 }
 
-// writeIndexSnapshots writes a snapshot of every index of the collection
-// (§8), covering the data segments up to (seg, pos) and WAL offset
-// checkpoint. The indexes may also reflect newer changes still in the
-// memtable; those are in the WAL above the checkpoint, and replaying them
-// over the snapshot is idempotent. Failures are logged: a missing snapshot
-// means a rebuild on open. Callers hold flushMu.
-func (c *Collection) writeIndexSnapshots(seg uint32, pos uint64) {
-	c.mu.RLock()
-	snaps := make([]*segment.IndexSnapshot, 0, len(c.indexes))
-	for _, ix := range c.indexes {
-		snaps = append(snaps, &segment.IndexSnapshot{
-			Name:      ix.name,
-			Field:     ix.field,
-			CoversSeg: seg,
-			CoversPos: pos,
-			CoversWAL: c.checkpoint,
-			Keys:      ix.snapshotKeys(),
-		})
-	}
-	c.mu.RUnlock()
-	for _, s := range snaps {
-		if err := segment.WriteIndexSnapshot(c.dir, s); err != nil {
-			c.db.e.logger.Warn("cachydb: writing index snapshot; the index will be rebuilt on open",
-				"collection", c.name, "index", s.Name, "err", err)
-		}
-	}
-}
-
-// shutdown runs after the final flush on Close: if everything was flushed
-// it writes the index snapshots (§8), then closes the active segment.
+// shutdown runs after the final flush on Close: it closes the active
+// segment. The index file is closed with the segment readers
+// (closeReaders).
 func (c *Collection) shutdown() error {
 	c.flushMu.Lock()
 	defer c.flushMu.Unlock()
-	c.mu.RLock()
-	clean := !c.dropped && len(c.memtable) == 0 && c.flushing == nil
-	c.mu.RUnlock()
 	if c.active == nil {
 		return nil
-	}
-	if clean {
-		c.writeIndexSnapshots(c.activeSeg, uint64(c.active.Size()))
 	}
 	err := c.active.Close()
 	c.active = nil
