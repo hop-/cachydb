@@ -1,7 +1,7 @@
 ---
 name: mcp
 title: Using cachydb as an MCP server
-summary: stdio vs Streamable HTTP, listen host, tokens and TLS, client configuration examples (incl. Docker and tokens), health checks, per-session databases, the data-directory lock, cachydb client, and the tools by task
+summary: stdio vs Streamable HTTP, listen host, tokens and TLS, client configuration examples (incl. Docker and tokens), health checks, per-session databases, the data-directory lock, cachydb client, the tools by task, and writing many documents
 ---
 <!--
 Client config formats checked on 2026-11-01 against the official docs:
@@ -245,7 +245,8 @@ retry.
 | Collections | `create_collection`, `list_collections`, `describe_collection`, `update_schema`, `rename_collection`, `copy_collection`, `delete_collection` |
 | Indexes | `create_index`, `drop_index` |
 | Writing | `insert_document`, `update_document` (`updates`, `unset`, `if`, `upsert`), `replace_document`, `delete_document` (`if`) |
-| Reading | `find_documents` (`filters`, `any`, `sort`, `fields`, `limit`, `skip`; result `has_more`, `next_skip`), `count_documents`, `distinct` |
+| Writing many (atomic) | `insert_documents` (`documents`), `update_documents` (`query`, `updates`, `unset`, `limit`, `all`), `delete_documents` (`query`, `limit`, `all`) |
+| Reading | `get_document` (`id`, `fields`), `find_documents` (`filters`, `any`, `sort`, `fields`, `limit`, `skip`; result `has_more`, `next_skip`), `count_documents`, `distinct` |
 | Users (only when the server requires tokens) | `whoami` (everyone); `list_users`, `create_user`, `set_access`, `create_token`, `revoke_token`, `delete_user` (server admins; hidden from other users) |
 
 `cachydb docs tools` has every schema and an example call; the user tools
@@ -256,6 +257,28 @@ returns at most `--default-limit` documents (100), and the JSON of its
 documents stays within `--max-result-bytes` (1 MiB), with at least one
 document. Page with `"skip": next_skip` while `has_more` is `true`; see
 `cachydb docs query`.
+
+## Writing many documents
+
+`insert_documents`, `update_documents`, and `delete_documents` are
+atomic: each call changes all of its documents or, if one fails, none
+(an `insert_documents` error names the item as `documents[i]`). One call
+takes at most 10,000 documents and 32 MiB. Over HTTP a request body is
+limited to 4 MiB, so send larger loads as several calls;
+`cachydb client import` does this for you.
+
+`update_documents` and `delete_documents` select documents with
+`query.filters` and `query.any`. An empty query, which would match every
+document, is rejected unless you pass `"all": true`. When more than
+10,000 documents match and no `limit` is given, the call fails with the
+match count and changes nothing. With a `limit`, the first matches by
+`_id` change; repeat the call to work through the rest. A repeated
+delete always makes progress, but a repeated update only does when the
+update makes documents stop matching the query (for example, update
+`{"status": "done"}` with a filter `status ne "done"`); otherwise it
+updates the same first documents again. `matched` counts the documents
+selected and `modified` / `deleted` those written; a document another
+writer changed so it no longer matches is skipped.
 
 ## Self-description
 

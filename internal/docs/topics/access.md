@@ -16,7 +16,7 @@ requirement every client has full access and none of this applies.
 | Level | Allows |
 | --- | --- |
 | `read` | `list_collections`, `describe_collection`, `find_documents`, `count_documents`, `distinct` |
-| `write` | `read` plus `insert_document`, `update_document`, `replace_document`, `delete_document` |
+| `write` | `read` plus `insert_document`, `insert_documents`, `update_document`, `update_documents`, `replace_document`, `delete_document`, `delete_documents` |
 | `admin` | `write` plus `create_collection`, `update_schema`, `rename_collection`, `delete_collection`, `create_index`, `drop_index` |
 | server admin | everything: every database, `create_database`, `delete_database`, and the user tools below |
 

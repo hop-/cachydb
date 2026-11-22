@@ -151,6 +151,11 @@ func TestToolAnnotationsAndOutputSchemas(t *testing.T) {
 		"copy_collection":     {},
 		"delete_collection":   {destructive: true, idempotent: true},
 		"drop_index":          {destructive: true, idempotent: true},
+		// plan 013 (approach-agent-interface §3)
+		"get_document":     {readOnly: true, idempotent: true},
+		"insert_documents": {},
+		"update_documents": {},
+		"delete_documents": {destructive: true, idempotent: true},
 	}
 	tools := listTools(t, connect(t, newTestServer(t)))
 	if len(tools) != len(want) {
@@ -238,11 +243,11 @@ func TestToolExamplesAreValid(t *testing.T) {
 	}
 	order := []string{
 		"list_databases", "create_database", "use_database", "current_database",
-		"create_collection", "list_collections", "insert_document", "find_documents",
-		"count_documents", "distinct", "update_document", "replace_document",
-		"create_index", "describe_collection", "update_schema", "copy_collection",
-		"rename_collection", "delete_collection", "drop_index", "delete_document",
-		"delete_database",
+		"create_collection", "list_collections", "insert_document", "insert_documents",
+		"get_document", "find_documents", "count_documents", "distinct", "update_document",
+		"update_documents", "replace_document", "create_index", "describe_collection",
+		"update_schema", "copy_collection", "rename_collection", "delete_collection",
+		"drop_index", "delete_documents", "delete_document", "delete_database",
 	}
 	if len(order) != len(examples) {
 		t.Fatalf("order lists %d tools, %d have examples", len(order), len(examples))

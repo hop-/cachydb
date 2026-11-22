@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -730,10 +731,20 @@ func (s *Server) insertDocumentTool(ctx context.Context, req *mcp.CallToolReques
 		return nil, InsertDocumentOutput{}, err
 	}
 
-	// A string "_id" in the document is the client-chosen document ID; the
-	// engine takes it as Document.ID, not as a data field.
-	doc := &db.Document{Data: make(map[string]any, len(in.Document))}
-	for k, v := range in.Document {
+	id, err := coll.Insert(ctx, toDBDocument(in.Document))
+	if err != nil {
+		return nil, InsertDocumentOutput{}, toolError("insert document", err)
+	}
+	return nil, InsertDocumentOutput{Success: true, ID: id, Message: fmt.Sprintf("Document inserted with ID: %s", id)}, nil
+}
+
+// toDBDocument converts an inserted document argument. A string "_id" is
+// the client-chosen document ID; the engine takes it as Document.ID, not
+// as a data field. Any other "_id" stays in the data, where the engine
+// rejects it.
+func toDBDocument(in map[string]any) *db.Document {
+	doc := &db.Document{Data: make(map[string]any, len(in))}
+	for k, v := range in {
 		if k == "_id" {
 			if id, ok := v.(string); ok {
 				doc.ID = id
@@ -742,12 +753,116 @@ func (s *Server) insertDocumentTool(ctx context.Context, req *mcp.CallToolReques
 		}
 		doc.Data[k] = v
 	}
+	return doc
+}
 
-	id, err := coll.Insert(ctx, doc)
+// insertDocumentsTool inserts every document in one atomic batch. A
+// failing document is named by its position in the documents argument.
+func (s *Server) insertDocumentsTool(ctx context.Context, req *mcp.CallToolRequest, in InsertDocumentsInput) (*mcp.CallToolResult, InsertDocumentsOutput, error) {
+	coll, err := s.getCollection(in.Database, in.Collection, "insert documents")
 	if err != nil {
-		return nil, InsertDocumentOutput{}, toolError("insert document", err)
+		return nil, InsertDocumentsOutput{}, err
 	}
-	return nil, InsertDocumentOutput{Success: true, ID: id, Message: fmt.Sprintf("Document inserted with ID: %s", id)}, nil
+	ops := make([]db.WriteOp, len(in.Documents))
+	for i, d := range in.Documents {
+		ops[i] = db.WriteOp{Kind: db.OpInsert, Document: toDBDocument(d)}
+	}
+	res, err := coll.Batch(ctx, ops)
+	if err != nil {
+		if bie, ok := errors.AsType[*db.BatchItemError](err); ok {
+			err = fmt.Errorf("documents[%d]: %w", bie.Index, bie.Err)
+		}
+		return nil, InsertDocumentsOutput{}, toolError("insert documents", err)
+	}
+	return nil, InsertDocumentsOutput{Success: true, IDs: nonNil(res.IDs), Inserted: len(res.IDs)}, nil
+}
+
+// getDocumentTool returns one document by id. Without fields it reads
+// the document directly; with fields it runs an _id lookup with that
+// projection, so fields mean what they mean in find_documents.
+func (s *Server) getDocumentTool(ctx context.Context, req *mcp.CallToolRequest, in GetDocumentInput) (*mcp.CallToolResult, GetDocumentOutput, error) {
+	coll, err := s.getCollection(in.Database, in.Collection, "get document")
+	if err != nil {
+		return nil, GetDocumentOutput{}, err
+	}
+	var doc *db.Document
+	if len(in.Fields) == 0 {
+		doc, err = coll.Get(ctx, in.ID)
+	} else {
+		var docs []*db.Document
+		docs, err = coll.Find(ctx, &db.Query{
+			Filters: []db.QueryFilter{{Field: "_id", Operator: "eq", Value: in.ID}},
+			Fields:  in.Fields,
+		})
+		switch {
+		case err != nil:
+		case len(docs) == 0:
+			err = fmt.Errorf("document %q in collection %q: %w", in.ID, in.Collection, db.ErrNotFound)
+		default:
+			doc = docs[0]
+		}
+	}
+	if err != nil {
+		return nil, GetDocumentOutput{}, toolError("get document", err)
+	}
+	return nil, GetDocumentOutput{Success: true, Document: docMap(doc)}, nil
+}
+
+// emptyMatch reports whether q matches every document: no filters, and
+// no OR groups or an empty group (which every document matches).
+func emptyMatch(q *MatchQuery) bool {
+	if q == nil {
+		return true
+	}
+	if len(q.Filters) > 0 {
+		return false
+	}
+	return len(q.Any) == 0 || slices.ContainsFunc(q.Any, func(g []Filter) bool { return len(g) == 0 })
+}
+
+// checkBatchQuery rejects an empty query without all, and a negative
+// limit; action names the tool in the error.
+func checkBatchQuery(action string, q *MatchQuery, all bool, limit int) error {
+	if limit < 0 {
+		return fmt.Errorf("%s: limit must not be negative, got %d", action, limit)
+	}
+	if !all && emptyMatch(q) {
+		return fmt.Errorf("%s: the query is empty and would match every document; give query.filters or query.any, or set \"all\": true", action)
+	}
+	return nil
+}
+
+func (s *Server) updateDocumentsTool(ctx context.Context, req *mcp.CallToolRequest, in UpdateDocumentsInput) (*mcp.CallToolResult, UpdateDocumentsOutput, error) {
+	if err := checkBatchQuery("update documents", in.Query, in.All, in.Limit); err != nil {
+		return nil, UpdateDocumentsOutput{}, err
+	}
+	if in.Updates == nil && len(in.Unset) == 0 {
+		return nil, UpdateDocumentsOutput{}, errors.New("update documents: give updates, unset, or both")
+	}
+	coll, err := s.getCollection(in.Database, in.Collection, "update documents")
+	if err != nil {
+		return nil, UpdateDocumentsOutput{}, err
+	}
+	matched, modified, err := coll.UpdateMany(ctx, toDBMatchQuery(in.Query), db.UpdateSpec{Set: in.Updates, Unset: in.Unset}, in.Limit)
+	if err != nil {
+		return nil, UpdateDocumentsOutput{}, toolError("update documents", err)
+	}
+	return nil, UpdateDocumentsOutput{Success: true, Matched: matched, Modified: modified}, nil
+}
+
+func (s *Server) deleteDocumentsTool(ctx context.Context, req *mcp.CallToolRequest, in DeleteDocumentsInput) (*mcp.CallToolResult, DeleteDocumentsOutput, error) {
+	if err := checkBatchQuery("delete documents", in.Query, in.All, in.Limit); err != nil {
+		return nil, DeleteDocumentsOutput{}, err
+	}
+	coll, err := s.getCollection(in.Database, in.Collection, "delete documents")
+	if err != nil {
+		return nil, DeleteDocumentsOutput{}, err
+	}
+	matched, deleted, err := coll.DeleteMany(ctx, toDBMatchQuery(in.Query), in.Limit)
+	if err != nil {
+		return nil, DeleteDocumentsOutput{}, toolError("delete documents", err)
+	}
+	return nil, DeleteDocumentsOutput{Success: true, Matched: matched, Deleted: deleted}, nil
 }
 
 // toDBFilters converts filters to engine filters.

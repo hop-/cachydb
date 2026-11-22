@@ -77,6 +77,10 @@ func (in *CopyCollectionInput) databaseArg() *string     { return &in.Database }
 func (in *DeleteCollectionInput) databaseArg() *string   { return &in.Database }
 func (in *DropIndexInput) databaseArg() *string          { return &in.Database }
 func (in *CreateIndexInput) databaseArg() *string        { return &in.Database }
+func (in *GetDocumentInput) databaseArg() *string        { return &in.Database }
+func (in *InsertDocumentsInput) databaseArg() *string    { return &in.Database }
+func (in *UpdateDocumentsInput) databaseArg() *string    { return &in.Database }
+func (in *DeleteDocumentsInput) databaseArg() *string    { return &in.Database }
 
 // extraAccess of copy_collection: the copy is created in the target
 // database (the source database when target_database is empty), which

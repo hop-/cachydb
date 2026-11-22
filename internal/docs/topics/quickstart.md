@@ -49,6 +49,14 @@ insert_document {"collection": "products", "document": {"_id": "p1", "name": "Pe
 insert_document {"collection": "products", "document": {"name": "Book", "price": 12}}
 ```
 
+Insert many at once with `insert_documents`: all of them, or none if
+one fails. Read one by id with `get_document`:
+
+```json
+insert_documents {"collection": "products", "documents": [{"_id": "p2", "name": "Ink", "price": 4}, {"name": "Pad", "price": 6}]}
+get_document {"collection": "products", "id": "p2"}
+```
+
 Query. Filters go inside `query.filters`; results are sorted by `_id`
 unless `sort` is given, and `fields` limits what comes back:
 
@@ -78,6 +86,14 @@ update_document {"collection": "products", "id": "p1", "updates": {"price": 3, "
 update_document {"collection": "products", "id": "p1", "updates": {"price": 4}, "if": [{"field": "price", "operator": "eq", "value": 3}]}
 update_document {"collection": "products", "id": "p9", "updates": {"name": "Ink"}, "upsert": true}
 delete_document {"collection": "products", "id": "p1"}
+```
+
+Change or delete every match in one atomic call. An empty query is
+rejected unless you pass `"all": true`:
+
+```json
+update_documents {"collection": "products", "query": {"filters": [{"field": "price", "operator": "gt", "value": 5}]}, "updates": {"sale": true}}
+delete_documents {"collection": "products", "query": {"filters": [{"field": "sale", "operator": "eq", "value": true}]}}
 ```
 
 Speed up equality and tag (`has`) lookups with an index; inspect the

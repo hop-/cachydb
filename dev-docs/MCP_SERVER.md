@@ -88,8 +88,8 @@ Every tool has an access level (`internal/mcp/access.go`), passed to
 | Access | Tools |
 | --- | --- |
 | none | `list_databases` (lists only databases the principal can read), `current_database`, `use_database` (the target must be readable; checked before existence) |
-| read | `list_collections`, `describe_collection`, `find_documents`, `count_documents`, `distinct`; `copy_collection` on its source |
-| write | `insert_document`, `update_document`, `replace_document`, `delete_document` |
+| read | `list_collections`, `describe_collection`, `find_documents`, `get_document`, `count_documents`, `distinct`; `copy_collection` on its source |
+| write | `insert_document`, `insert_documents`, `update_document`, `update_documents`, `replace_document`, `delete_document`, `delete_documents` |
 | admin | `create_collection`, `update_schema`, `rename_collection`, `delete_collection`, `create_index`, `drop_index`; `copy_collection` on its target (`target_database`, else the source database) |
 | server | `create_database`, `delete_database` (which then calls `Store.ForgetDatabase` whenever the server has a store, also with auth off), and the six admin user tools |
 | none (registered only with tokens) | `whoami` |
@@ -125,7 +125,7 @@ none) and the admin tools `list_users`, `create_user`, `set_access`,
 `create_token`, `revoke_token`, `delete_user` (access server, marked
 `adminOnly`). `registerTools` validates them always but registers them
 only when `Config.TokensRequired`, so a server with authentication off
-lists exactly the 21 tools it always did. With tokens required, the
+lists exactly the 25 tools every server registers (the 21 from before plan 013 plus the 4 document tools of stage 5). With tokens required, the
 receiving middleware `filterToolsList` sets `cacheScope: "private"` on
 every `tools/list` result (the list differs per user) and removes the
 admin tools unless the request's principal (`principalOf`, the same
@@ -212,7 +212,7 @@ transport has no health endpoint.
 
 1. `app.Builder.Build` opens the engine (`db.Open`: lock, recovery).
 2. `NewServer(ctx, engine, defaultDBName, transport, httpAddr, version)`
-   creates the default database if missing, registers the 21 tools (28
+   creates the default database if missing, registers the 25 tools (32
    with tokens required: plus `whoami` and the six admin tools) and the
    9 docs resources, and sets the server instructions and the
    implementation version (the build version, from `cmd.getVersion`).
@@ -238,7 +238,7 @@ resolves its database in this order (`Server.databaseName`, applied by
    principal is the implicit full-access one, which has none);
 4. the server default (`main`).
 
-## Tools (21, plus the user tools)
+## Tools (25, plus the user tools)
 
 Tools are defined once in `internal/mcp/tools.go` (`toolSpecs`): name,
 description, annotations, typed input and output structs, and an example
@@ -257,10 +257,10 @@ Annotations (all tools also set `openWorldHint: false` and a title):
 
 | Tool(s) | readOnly | destructive | idempotent |
 |---------|----------|-------------|------------|
-| `list_databases`, `list_collections`, `find_documents`, `current_database`, `count_documents`, `distinct`, `describe_collection` | true | — | true |
+| `list_databases`, `list_collections`, `find_documents`, `get_document`, `current_database`, `count_documents`, `distinct`, `describe_collection` | true | — | true |
 | `create_database`, `use_database`, `replace_document`, `update_schema` | false | false | true |
-| `create_collection`, `insert_document`, `create_index`, `update_document`, `rename_collection`, `copy_collection` | false | false | false |
-| `delete_document`, `delete_database`, `delete_collection`, `drop_index` | false | true | true |
+| `create_collection`, `insert_document`, `insert_documents`, `create_index`, `update_document`, `update_documents`, `rename_collection`, `copy_collection` | false | false | false |
+| `delete_document`, `delete_documents`, `delete_database`, `delete_collection`, `drop_index` | false | true | true |
 
 | Tool | Arguments | Result fields |
 |------|-----------|---------------|
@@ -277,18 +277,22 @@ Annotations (all tools also set `openWorldHint: false` and a title):
 | `copy_collection` | `collection`, `new_name`, `target_database`?, `database`? | `message`, `copied` |
 | `delete_collection` | `collection`, `database`? | `message` (`ErrNotFound` if missing) |
 | `insert_document` | `collection`, `document`, `database`? | `id`, `message` |
+| `insert_documents` | `collection`, `documents` (array), `database`? | `ids` (in order), `inserted` |
+| `get_document` | `collection`, `id`, `fields`?, `database`? | `document` (flat, with `_id`) |
 | `find_documents` | `collection`, `query`?, `database`? | `count`, `documents`, `has_more`, `next_skip` (when `has_more`) |
 | `count_documents` | `collection`, `query`? (`filters`, `any`), `database`? | `count` |
 | `distinct` | `collection`, `field`, `query`? (`filters`, `any`), `database`? | `values` |
 | `update_document` | `collection`, `id`, `updates`?, `unset`?, `if`?, `upsert`?, `database`? | `message`, `upserted` |
+| `update_documents` | `collection`, `query`? (`filters`, `any`), `updates`?, `unset`?, `limit`?, `all`?, `database`? | `matched`, `modified` |
 | `replace_document` | `collection`, `id`, `document`, `if`?, `database`? | `message` |
 | `delete_document` | `collection`, `id`, `if`?, `database`? | `message` |
+| `delete_documents` | `collection`, `query`? (`filters`, `any`), `limit`?, `all`?, `database`? | `matched`, `deleted` |
 | `create_index` | `collection`, `index_name`, `field_name`, `database`? | `message` |
 | `drop_index` | `collection`, `index_name`, `database`? | `message` (`ErrNotFound` if missing) |
 
 `?` = optional. Handlers are thin: each resolves the database (see
 above) and calls one engine method (`UpdateWith`, `Replace`,
-`DeleteWith`, `CountDocuments`, `Distinct`, `Schema`/`Indexes`/`Count`,
+`DeleteWith`, `Get`, `Batch`, `UpdateMany`, `DeleteMany`, `CountDocuments`, `Distinct`, `Schema`/`Indexes`/`Count`,
 `UpdateSchema`, `RenameCollection`, `CopyCollection`, `DropCollection`,
 `DropIndex`).
 
@@ -378,6 +382,44 @@ stored document must match, checked under the document lock just before
 the commit; a mismatch (or a missing document) fails with
 `condition failed: document <id> no longer matches if; re-read it and
 retry` and writes nothing.
+
+### `get_document`
+
+Without `fields`, `Collection.Get`; with `fields`, a `Find` on
+`_id eq id` with that projection (so fields, including nested paths,
+mean what they mean in `find_documents`). A missing id is `ErrNotFound`
+(`document "<id>" in collection "<c>": not found`).
+
+### `insert_documents`, `update_documents`, `delete_documents`
+
+Plan 013 §3, on the stage-3 engine calls:
+
+- `insert_documents` builds one `db.OpInsert` per document (string `_id`
+  handling shared with `insert_document`, `toDBDocument`) and calls
+  `Collection.Batch`: one WAL record, all or nothing; `$now` resolves to
+  one time for the call. A `*db.BatchItemError` becomes
+  `insert documents: documents[<i>]: <item error>` (an existing id, an id
+  repeated in the call, a schema or unique-index failure). An empty
+  `documents` array inserts nothing (`ids: []`, `inserted: 0`). The
+  engine's `MaxBatchDocs` (10,000) and `MaxBatchBytes` (32 MiB) apply;
+  over HTTP the SDK's request body limit (`DefaultMaxRequestBodyBytes`,
+  4 MiB) is lower, so larger loads are several calls.
+- `update_documents` and `delete_documents` call `UpdateMany` and
+  `DeleteMany`. Before that, `checkBatchQuery` rejects a negative `limit`
+  and an empty query without `all: true` (no `query`, or no filters and
+  no OR groups, or an empty OR group, which matches every document).
+  More than `MaxBatchDocs` matches without a `limit` (or with a larger
+  one) fail with the engine's `ErrBatchTooLarge` message, which states
+  the match count, and write nothing. A document that stops matching
+  between the snapshot and its write is skipped, so `modified`/`deleted`
+  can be lower than `matched`. `update_documents` needs `updates` or
+  `unset` (like `update_document`) and has no `upsert`. Repeating a
+  limited update only makes progress when the update makes documents
+  stop matching the query (the tool description says so); a limited
+  delete always does.
+
+`cachydb client import` writes through `insert_documents` (see
+[CLI.md](CLI.md)).
 
 ### `create_index`, `drop_index`
 

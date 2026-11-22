@@ -313,11 +313,15 @@ func TestAccessTableEveryTool(t *testing.T) {
 		{tool: "find_documents", registered: auth.LevelRead, need: auth.LevelRead, args: in(nil)},
 		{tool: "count_documents", registered: auth.LevelRead, need: auth.LevelRead, args: in(nil)},
 		{tool: "distinct", registered: auth.LevelRead, need: auth.LevelRead, args: in(map[string]any{"field": "x"})},
+		{tool: "get_document", registered: auth.LevelRead, need: auth.LevelRead, args: in(map[string]any{"id": "d1"})},
 
 		{tool: "insert_document", registered: auth.LevelWrite, need: auth.LevelWrite, args: in(map[string]any{"document": map[string]any{"_id": "d2", "x": 2}})},
 		{tool: "update_document", registered: auth.LevelWrite, need: auth.LevelWrite, args: in(map[string]any{"id": "d1", "updates": map[string]any{"x": 5}})},
 		{tool: "replace_document", registered: auth.LevelWrite, need: auth.LevelWrite, args: in(map[string]any{"id": "d1", "document": map[string]any{"x": 6}})},
 		{tool: "delete_document", registered: auth.LevelWrite, need: auth.LevelWrite, args: in(map[string]any{"id": "d1"})},
+		{tool: "insert_documents", registered: auth.LevelWrite, need: auth.LevelWrite, args: in(map[string]any{"documents": []any{map[string]any{"_id": "d2", "x": 2}}})},
+		{tool: "update_documents", registered: auth.LevelWrite, need: auth.LevelWrite, args: in(map[string]any{"query": map[string]any{"filters": []any{map[string]any{"field": "x", "operator": "eq", "value": 1}}}, "updates": map[string]any{"x": 5}})},
+		{tool: "delete_documents", registered: auth.LevelWrite, need: auth.LevelWrite, args: in(map[string]any{"query": map[string]any{"filters": []any{map[string]any{"field": "x", "operator": "eq", "value": 1}}}})},
 
 		{tool: "create_collection", registered: auth.LevelAdmin, need: auth.LevelAdmin, args: map[string]any{"database": accessDB, "name": "fresh"}},
 		{tool: "update_schema", registered: auth.LevelAdmin, need: auth.LevelAdmin, args: in(map[string]any{"schema": map[string]any{"fields": map[string]any{"x": map[string]any{"type": "number"}}}})},
@@ -360,7 +364,7 @@ func TestAccessTableEveryTool(t *testing.T) {
 	}
 	slices.Sort(listed)
 	slices.Sort(tabled)
-	if len(listed) != 28 || !slices.Equal(listed, tabled) || !slices.Equal(slices.Sorted(maps.Keys(specs)), tabled) {
+	if len(listed) != 32 || !slices.Equal(listed, tabled) || !slices.Equal(slices.Sorted(maps.Keys(specs)), tabled) {
 		t.Fatalf("access table rows %v\nregistered tools %v\nspecs %v\n(add a row for every new tool)", tabled, listed, slices.Sorted(maps.Keys(specs)))
 	}
 
@@ -741,18 +745,18 @@ func TestAuthOffDeleteDatabaseForgetsGrants(t *testing.T) {
 	}
 }
 
-// TestAuthOffToolsListExactly21: with authentication off (stdio, and
-// loopback HTTP with an auth store present) tools/list is exactly the 21
+// TestAuthOffToolsListExactly25: with authentication off (stdio, and
+// loopback HTTP with an auth store present) tools/list is exactly the 25
 // tools every server registers: no whoami, no admin tools, and the list
 // is not marked private.
-func TestAuthOffToolsListExactly21(t *testing.T) {
-	want := make([]string, 0, 21)
+func TestAuthOffToolsListExactly25(t *testing.T) {
+	want := make([]string, 0, 25)
 	for _, tool := range ToolDefinitions() {
 		want = append(want, tool.Name)
 	}
 	slices.Sort(want)
-	if len(want) != 21 {
-		t.Fatalf("ToolDefinitions has %d tools, want 21", len(want))
+	if len(want) != 25 {
+		t.Fatalf("ToolDefinitions has %d tools, want 25", len(want))
 	}
 	check := func(t *testing.T, cs *mcp.ClientSession) {
 		t.Helper()
@@ -788,8 +792,8 @@ func TestAuthOffToolsListExactly21(t *testing.T) {
 	})
 }
 
-// TestAuthToolsListPerPrincipal: with tokens, a server admin lists 28
-// tools and any other user 22 (the admin tools hidden), both marked
+// TestAuthToolsListPerPrincipal: with tokens, a server admin lists 32
+// tools and any other user 26 (the admin tools hidden), both marked
 // private; the hidden tools are still refused when called.
 func TestAuthToolsListPerPrincipal(t *testing.T) {
 	env := newAuthEnv(t)
@@ -801,7 +805,7 @@ func TestAuthToolsListPerPrincipal(t *testing.T) {
 		user   string
 		n      int
 		admins bool
-	}{{"root", 28, true}, {"alice", 22, false}} {
+	}{{"root", 32, true}, {"alice", 26, false}} {
 		t.Run(tt.user, func(t *testing.T) {
 			res, err := env.as(t, tt.user).ListTools(context.Background(), nil)
 			if err != nil {
@@ -827,14 +831,14 @@ func TestAuthToolsListPerPrincipal(t *testing.T) {
 			}
 		})
 	}
-	// Promotion applies at once: the same session now sees 28.
+	// Promotion applies at once: the same session now sees 32.
 	alice := env.as(t, "alice")
-	if n := len(listTools(t, alice)); n != 22 {
+	if n := len(listTools(t, alice)); n != 26 {
 		t.Fatalf("before promotion: %d tools", n)
 	}
 	env.setAccess(t, "alice", true, nil)
-	if n := len(listTools(t, alice)); n != 28 {
-		t.Fatalf("after promotion: %d tools, want 28", n)
+	if n := len(listTools(t, alice)); n != 32 {
+		t.Fatalf("after promotion: %d tools, want 32", n)
 	}
 }
 
@@ -864,8 +868,8 @@ func TestAuthWhoami(t *testing.T) {
 	if u, _ := out["user"].(string); !strings.Contains(u, "no token") || out["server_admin"] != true {
 		t.Fatalf("implicit whoami = %v", out)
 	}
-	if n := len(listTools(t, cs)); n != 28 {
-		t.Fatalf("implicit principal lists %d tools, want 28", n)
+	if n := len(listTools(t, cs)); n != 32 {
+		t.Fatalf("implicit principal lists %d tools, want 32", n)
 	}
 }
 

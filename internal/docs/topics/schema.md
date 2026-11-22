@@ -46,9 +46,11 @@ create_collection {
   the top-level key `"meta.author"`, not the nested field. Queries and
   indexes can still use nested paths (see the query topic); a schema can
   require the parent object (`"meta": {"type": "object"}`).
-- Validation runs on every `insert_document` and `replace_document`, and
-  on the **result** of every `update_document` (after `updates` and
-  `unset`; unsetting a required field fails) and upsert.
+- Validation runs on every `insert_document`, `insert_documents`, and
+  `replace_document`, and on the **result** of every `update_document`
+  and `update_documents` (after `updates` and `unset`; unsetting a
+  required field fails) and upsert. In a batch call one failing document
+  fails the whole call.
 - `{"$now": true}` values are replaced by the server time (a string)
   before validation, so a `date` field accepts them.
 - A failed validation returns an error containing "schema validation

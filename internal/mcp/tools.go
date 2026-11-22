@@ -141,6 +141,37 @@ type DeleteDocumentInput struct {
 	If         []Filter `json:"if,omitempty" jsonschema:"Condition: the stored document must match all of these filters, or nothing is deleted"`
 }
 
+type GetDocumentInput struct {
+	Database   string   `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
+	Collection string   `json:"collection" jsonschema:"Collection name"`
+	ID         string   `json:"id" jsonschema:"Document _id"`
+	Fields     []string `json:"fields,omitempty" jsonschema:"Fields to return (projection); _id is always returned; omit for the whole document"`
+}
+
+type InsertDocumentsInput struct {
+	Database   string           `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
+	Collection string           `json:"collection" jsonschema:"Collection name"`
+	Documents  []map[string]any `json:"documents" jsonschema:"The documents as JSON objects, inserted in order. A string _id sets a document's id; without one a UUID is generated. {\"$now\": true} is the server's current time (one time for the whole call)"`
+}
+
+type UpdateDocumentsInput struct {
+	Database   string         `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
+	Collection string         `json:"collection" jsonschema:"Collection name"`
+	Query      *MatchQuery    `json:"query,omitempty" jsonschema:"Filters and OR groups selecting the documents to update; an empty or omitted query is rejected unless all is true"`
+	Updates    map[string]any `json:"updates,omitempty" jsonschema:"Top-level fields to set in every matching document (replaced or added); _id cannot be changed. {\"$now\": true} is the server's current time"`
+	Unset      []string       `json:"unset,omitempty" jsonschema:"Top-level fields to remove (after updates); at least one of updates and unset is required"`
+	Limit      int            `json:"limit,omitempty" jsonschema:"Update at most this many matching documents, the first by _id; 0 or omitted means no limit (then more matches than the batch limit fail)"`
+	All        bool           `json:"all,omitempty" jsonschema:"Set to true to allow an empty query, which matches every document"`
+}
+
+type DeleteDocumentsInput struct {
+	Database   string      `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
+	Collection string      `json:"collection" jsonschema:"Collection name"`
+	Query      *MatchQuery `json:"query,omitempty" jsonschema:"Filters and OR groups selecting the documents to delete; an empty or omitted query is rejected unless all is true"`
+	Limit      int         `json:"limit,omitempty" jsonschema:"Delete at most this many matching documents, the first by _id; 0 or omitted means no limit (then more matches than the batch limit fail)"`
+	All        bool        `json:"all,omitempty" jsonschema:"Set to true to allow an empty query, which matches every document"`
+}
+
 type CountDocumentsInput struct {
 	Database   string      `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string      `json:"collection" jsonschema:"Collection name"`
@@ -238,6 +269,29 @@ type FindDocumentsOutput struct {
 	Documents []map[string]any `json:"documents" jsonschema:"Matching documents in sort order (by default by _id), each a flat object with its _id"`
 	HasMore   bool             `json:"has_more" jsonschema:"True if more documents match after these (the limit, the default limit, or the result byte cap ended the page)"`
 	NextSkip  int              `json:"next_skip,omitempty" jsonschema:"Set when has_more is true: repeat the call with query.skip set to this value for the next page"`
+}
+
+type GetDocumentOutput struct {
+	Success  bool           `json:"success" jsonschema:"Always true on success"`
+	Document map[string]any `json:"document" jsonschema:"The document as a flat object with its _id (only the fields asked for, plus _id, when fields is set)"`
+}
+
+type InsertDocumentsOutput struct {
+	Success  bool     `json:"success" jsonschema:"Always true on success"`
+	IDs      []string `json:"ids" jsonschema:"The _id of each document (given or generated), in the order of documents"`
+	Inserted int      `json:"inserted" jsonschema:"Number of documents inserted"`
+}
+
+type UpdateDocumentsOutput struct {
+	Success  bool `json:"success" jsonschema:"Always true on success"`
+	Matched  int  `json:"matched" jsonschema:"Number of documents that matched the query (at most limit)"`
+	Modified int  `json:"modified" jsonschema:"Number of documents updated; lower than matched when a document stopped matching before the write"`
+}
+
+type DeleteDocumentsOutput struct {
+	Success bool `json:"success" jsonschema:"Always true on success"`
+	Matched int  `json:"matched" jsonschema:"Number of documents that matched the query (at most limit)"`
+	Deleted int  `json:"deleted" jsonschema:"Number of documents deleted; lower than matched when a document stopped matching before the write"`
 }
 
 type UpdateDocumentOutput struct {
@@ -422,6 +476,21 @@ func toolSpecs() []toolSpec {
 			func(s *Server) mcp.ToolHandlerFor[InsertDocumentInput, InsertDocumentOutput] {
 				return s.insertDocumentTool
 			}),
+		newSpec("insert_documents",
+			"Insert many JSON documents into a collection in one atomic call: all are inserted, or none if any fails (an existing or repeated id, or a schema error; the error names the item as documents[i]). A string _id and {\"$now\": true} work as in insert_document, and the ids come back in order. At most 10,000 documents and 32 MiB per call; over HTTP a request is limited to 4 MiB, so send larger loads as several calls.",
+			writing("Insert documents", false, false), accessWrite,
+			map[string]any{"collection": "products", "documents": []any{
+				map[string]any{"_id": "p2", "name": "Ink", "price": 4},
+				map[string]any{"name": "Pad", "price": 6},
+			}},
+			func(s *Server) mcp.ToolHandlerFor[InsertDocumentsInput, InsertDocumentsOutput] {
+				return s.insertDocumentsTool
+			}),
+		newSpec("get_document",
+			"Return one document by _id as a flat object with its _id, optionally only the listed fields. Fails with not found if no document has that id.",
+			readOnly("Get document"), accessRead,
+			map[string]any{"collection": "products", "id": "p1", "fields": []any{"name", "price"}},
+			func(s *Server) mcp.ToolHandlerFor[GetDocumentInput, GetDocumentOutput] { return s.getDocumentTool }),
 		newSpec("find_documents",
 			"Find the documents of a collection matching every filter in query.filters (and, if given, at least one group of query.any), with optional sort, projection (fields), skip, and limit; sorted by _id by default. Returns at most the default limit (100) and 1 MiB unless configured; when has_more is true, call again with query.skip = next_skip. Operators include contains (case-insensitive substring) and has / has_any / has_all (array elements). Comparison is type-aware and a document missing the field matches no operator, not even ne. See resource cachydb://docs/query.",
 			readOnly("Find documents"), accessRead,
@@ -455,6 +524,15 @@ func toolSpecs() []toolSpec {
 			func(s *Server) mcp.ToolHandlerFor[UpdateDocumentInput, UpdateDocumentOutput] {
 				return s.updateDocumentTool
 			}),
+		newSpec("update_documents",
+			"Set fields (updates) and remove fields (unset) in every document matching query.filters and query.any, atomically: all matching documents change or none do. An empty query is rejected unless all is true, and more than 10,000 matches without a limit fail with the match count and change nothing. With limit only the first matches by _id change; repeating the call makes progress only if the update makes documents stop matching the query.",
+			writing("Update documents", false, false), accessWrite,
+			map[string]any{"collection": "products", "query": map[string]any{
+				"filters": []any{map[string]any{"field": "price", "operator": "gt", "value": 5}},
+			}, "updates": map[string]any{"sale": true}},
+			func(s *Server) mcp.ToolHandlerFor[UpdateDocumentsInput, UpdateDocumentsOutput] {
+				return s.updateDocumentsTool
+			}),
 		newSpec("replace_document",
 			"Replace a whole existing document atomically (fields not in the new document are removed). The result must satisfy the schema; with if, the stored document must match those filters.",
 			writing("Replace document", false, true), accessWrite,
@@ -467,6 +545,15 @@ func toolSpecs() []toolSpec {
 			writing("Delete document", true, true), accessWrite,
 			map[string]any{"collection": "products", "id": "p1"},
 			func(s *Server) mcp.ToolHandlerFor[DeleteDocumentInput, MessageOutput] { return s.deleteDocumentTool }),
+		newSpec("delete_documents",
+			"Delete every document matching query.filters and query.any, atomically: all of them or none. An empty query is rejected unless all is true, and more than 10,000 matches without a limit fail with the match count and delete nothing (pass a limit and repeat the call). This cannot be undone.",
+			writing("Delete documents", true, true), accessWrite,
+			map[string]any{"collection": "products", "query": map[string]any{
+				"filters": []any{map[string]any{"field": "price", "operator": "gt", "value": 5}},
+			}, "limit": 100},
+			func(s *Server) mcp.ToolHandlerFor[DeleteDocumentsInput, DeleteDocumentsOutput] {
+				return s.deleteDocumentsTool
+			}),
 		newSpec("describe_collection",
 			"Describe a collection: its schema (or null), its indexes, and its document count.",
 			readOnly("Describe collection"), accessRead,

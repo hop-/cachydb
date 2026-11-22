@@ -33,7 +33,7 @@ Detailed docs live in `dev-docs/`. **Read before modifying code.**
 | [`dev-docs/PROJECT.md`](dev-docs/PROJECT.md) | **Main doc**: overview, architecture, directory structure, data flow, compatibility |
 | [`dev-docs/DATABASE_ENGINE.md`](dev-docs/DATABASE_ENGINE.md) | `pkg/db` public API, options, errors, documents, schemas, query and index semantics, migrations |
 | [`dev-docs/STORAGE.md`](dev-docs/STORAGE.md) | On-disk layout and formats, WAL, data segments, `index.db`, flush and checkpoints, recovery, format upgrade, compaction, lock order, test hooks |
-| [`dev-docs/MCP_SERVER.md`](dev-docs/MCP_SERVER.md) | The 21 MCP tools and the user tools, auth modes and the bootstrap token, tool access, typed schemas and annotations, instructions and docs resources, transports, per-session `use_database`, errors |
+| [`dev-docs/MCP_SERVER.md`](dev-docs/MCP_SERVER.md) | The 25 MCP tools and the user tools, auth modes and the bootstrap token, tool access, typed schemas and annotations, instructions and docs resources, transports, per-session `use_database`, errors |
 | [`dev-docs/CLI.md`](dev-docs/CLI.md) | Commands (incl. `docs`, `version --json`, `healthcheck`, `client`, `utils export/import/find/get/verify`), flags, environment variables, known issues |
 | [`dev-docs/DEVELOPMENT.md`](dev-docs/DEVELOPMENT.md) | Rules, patterns, testing, benchmarks (incl. the recorded 1M/10M scale runs), releasing (Docker image), known limitations |
 

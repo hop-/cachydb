@@ -20,6 +20,7 @@ A lightweight document-based database with Model Context Protocol (MCP) support,
 - **Indexing**: Multi-value hash indexes on any top-level field (duplicate values supported; array fields indexed per element)
 - **Query operations**: Type-aware filters (eq, ne, gt, gte, lt, lte, in), case-insensitive `contains`, array matching (`has`, `has_any`, `has_all`), OR groups, sort by any field, projection, deterministic skip/limit, `count_documents`, `distinct`
 - **Safe writes**: Conditional writes (`if`, compare-and-set), `unset`, upsert, atomic `replace_document`, and `{"$now": true}` server timestamps
+- **Batch writes**: `insert_documents`, `update_documents`, and `delete_documents` change many documents in one atomic call (all or none); `get_document` reads one by id
 - **Schema evolution**: Every violation reported at once; `describe_collection`, `update_schema`, `rename_collection`, `copy_collection`, `delete_collection`, `drop_index`
 - **Export and client**: JSON Lines export/import (`cachydb utils export|import`), offline `utils find|get`, an offline integrity check (`utils verify`, which can also rebuild index files), and `cachydb client` to call any tool of a running HTTP server from the shell
 - **MCP integration**: Built-in MCP server supporting stdio and Streamable HTTP transports, with `use_database` per session
@@ -429,6 +430,15 @@ Insert a document into a collection.
 
 If `_id` is not provided, a UUID is generated. A provided `_id` must be a string. Integer values are stored as JSON numbers (Go library callers get them back as `float64`). A value `{"$now": true}`, at any depth, is replaced by the server time (RFC 3339 UTC); it also works as a filter value.
 
+#### insert_documents / get_document
+
+`insert_documents` inserts many documents in one atomic call: all of them, or none if any fails (the error names the item as `documents[i]`). `_id` and `$now` work as in `insert_document`; the result has `ids` (in order) and `inserted`. At most 10,000 documents and 32 MiB per call, and over HTTP a request is limited to 4 MiB, so send larger loads as several calls. `get_document` returns one document by `_id`, optionally only some `fields`.
+
+```json
+{"collection": "users", "documents": [{"_id": "u2", "name": "Ann"}, {"name": "Bo"}]}
+{"collection": "users", "id": "u2", "fields": ["name"]}
+```
+
 #### find_documents
 
 Query documents in a collection.
@@ -512,6 +522,15 @@ Delete a document by ID, optionally only `if` it matches filters.
   "collection": "users",
   "id": "550e8400-e29b-41d4-a716-446655440000"
 }
+```
+
+#### update_documents / delete_documents
+
+Update (`updates`, `unset`) or delete every document matching `query` (`filters`, `any`), atomically: all matching documents change, or none. The result has `matched` and `modified` (or `deleted`). An empty query is rejected unless `"all": true`. More than 10,000 matches without a `limit` fail with the match count and change nothing; with `limit`, the first matches by `_id` change, and repeating the call makes progress only when the change makes documents stop matching (always for a delete).
+
+```json
+{"collection": "users", "query": {"filters": [{"field": "age", "operator": "lt", "value": 18}]}, "updates": {"minor": true}}
+{"collection": "users", "query": {"filters": [{"field": "status", "operator": "eq", "value": "deleted"}]}, "limit": 1000}
 ```
 
 ### Index Management

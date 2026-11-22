@@ -4,7 +4,7 @@ A lightweight document database with a built-in
 [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server,
 written in Go. Databases hold collections of JSON documents, with optional
 schemas and hash indexes. Every acknowledged write is fsynced to a
-write-ahead log first, so it survives a crash. AI agents use it through 21
+write-ahead log first, so it survives a crash. AI agents use it through 25
 MCP tools (create collections, insert, find, update, delete, index), with
 users, tokens, and per-database access when it serves other machines.
 

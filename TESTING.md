@@ -20,7 +20,7 @@ The suite covers:
   - compaction, the metadata checkpoint, and the query and index
     semantics;
   - conditional writes and schema operations (update, rename, copy).
-- **The MCP server:** all 21 tools, per-session `use_database`, an
+- **The MCP server:** all 25 tools, per-session `use_database`, an
   end-to-end tool flow, and the docs resources.
 - **The CLI:** `docs`, `healthcheck`, `utils` (including export/import
   round trips, and `verify` on healthy and damaged directories), and
@@ -273,7 +273,7 @@ This will:
 
 - Start an interactive web UI
 - Connect to your server
-- Let you see all 21 tools
+- Let you see all 25 tools
 - Call tools with arguments
 - View responses in real-time
 

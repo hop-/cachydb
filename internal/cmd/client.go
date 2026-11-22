@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -149,7 +151,11 @@ rules and --on-conflict modes as "cachydb utils import".`,
 		cmd.SilenceUsage = true
 		return withInputFile(importInput, cmd.InOrStdin(), func(r io.Reader) error {
 			return withClient(cmd.Context(), clientURL(), func(cs *mcp.ClientSession) error {
-				st, err := exportfmt.Import(cmd.Context(), r, clientStore{cs: cs}, mode)
+				t, err := importTarget(cmd.Context(), cs)
+				if err != nil {
+					return err
+				}
+				st, err := exportfmt.Import(cmd.Context(), r, t, mode)
 				if err != nil {
 					return err
 				}
@@ -369,8 +375,8 @@ type clientStore struct {
 }
 
 var (
-	_ exportfmt.Source = clientStore{}
-	_ exportfmt.Target = clientStore{}
+	_ exportfmt.Source      = clientStore{}
+	_ exportfmt.BatchTarget = clientStore{}
 )
 
 func (c clientStore) Databases(ctx context.Context) ([]string, error) {
@@ -509,6 +515,137 @@ func (c clientStore) InsertDocument(ctx context.Context, database, collection st
 		return errors.Join(exportfmt.ErrDocumentExists, err)
 	}
 	return err
+}
+
+// importTarget returns the import target for the server of cs: the
+// clientStore, which writes documents in batches with insert_documents,
+// or, for a server without that tool (older than plan 013), the
+// clientStore as a plain Target that inserts one document per call.
+func importTarget(ctx context.Context, cs *mcp.ClientSession) (exportfmt.Target, error) {
+	for tool, err := range cs.Tools(ctx, nil) {
+		if err != nil {
+			return nil, fmt.Errorf("listing tools: %w", err)
+		}
+		if tool.Name == "insert_documents" {
+			return clientStore{cs: cs}, nil
+		}
+	}
+	return struct{ exportfmt.Target }{clientStore{cs: cs}}, nil
+}
+
+// clientBatchBytes bounds the JSON size of the documents of one
+// insert_documents call from client import, below the 4 MiB request body
+// limit of the server's HTTP transport (the SDK's
+// DefaultMaxRequestBodyBytes) with room for the rest of the request.
+const clientBatchBytes = 3 << 20
+
+// itemIndexRE finds the failing item that insert_documents names in its
+// error ("documents[3]: ...").
+var itemIndexRE = regexp.MustCompile(`documents\[(\d+)\]`)
+
+// InsertDocuments implements exportfmt.BatchTarget with insert_documents,
+// one call per run of documents. Documents whose JSON exceeds
+// clientBatchBytes fail with db.ErrBatchTooLarge before any call, so
+// Import splits them (and sends a single such document through
+// InsertDocument). In Skip and Replace mode one find_documents lookup
+// first tells which _ids exist; the missing documents are inserted in
+// one atomic call, and in Replace mode the existing ones are then
+// replaced one replace_document call each (there is no batch replace
+// tool), so a failing replace leaves the inserts and earlier replaces
+// applied.
+func (c clientStore) InsertDocuments(ctx context.Context, database, collection string, docs []map[string]any, mode exportfmt.OnConflict) (exportfmt.Stats, error) {
+	data, err := json.Marshal(docs)
+	if err != nil {
+		return exportfmt.Stats{}, fmt.Errorf("encoding documents: %w", err)
+	}
+	if len(data) > clientBatchBytes {
+		return exportfmt.Stats{}, fmt.Errorf("%w: %d bytes of documents, the client sends at most %d per call",
+			db.ErrBatchTooLarge, len(data), clientBatchBytes)
+	}
+	var exists map[string]bool
+	if mode != exportfmt.Fail {
+		if exists, err = c.existingIDs(ctx, database, collection, docs); err != nil {
+			return exportfmt.Stats{}, err
+		}
+	}
+	var (
+		st       exportfmt.Stats
+		inserts  []map[string]any
+		pos      []int // insert → position in docs
+		replaces []int // positions in docs
+	)
+	for i, d := range docs {
+		id, _ := d["_id"].(string)
+		switch {
+		case !exists[id]:
+			inserts = append(inserts, d)
+			pos = append(pos, i)
+		case mode == exportfmt.Skip:
+			st.Skipped++
+		default:
+			replaces = append(replaces, i)
+		}
+	}
+	if len(inserts) > 0 {
+		var out mcpserver.InsertDocumentsOutput
+		err := callInto(ctx, c.cs, "insert_documents", map[string]any{
+			"database": database, "collection": collection, "documents": inserts,
+		}, &out)
+		if err != nil {
+			if strings.Contains(err.Error(), db.ErrExists.Error()) {
+				err = errors.Join(exportfmt.ErrDocumentExists, err)
+			}
+			if m := itemIndexRE.FindStringSubmatch(err.Error()); m != nil {
+				if i, convErr := strconv.Atoi(m[1]); convErr == nil && i < len(pos) {
+					return exportfmt.Stats{}, &db.BatchItemError{Index: pos[i], Err: err}
+				}
+			}
+			return exportfmt.Stats{}, err
+		}
+		st.Inserted = len(inserts)
+	}
+	for _, i := range replaces {
+		if err := c.ReplaceDocument(ctx, database, collection, docs[i]); err != nil {
+			return exportfmt.Stats{}, &db.BatchItemError{Index: i, Err: err}
+		}
+		st.Replaced++
+	}
+	return st, nil
+}
+
+// existingIDs returns which _ids of docs exist in the collection, with
+// one find_documents call (more if the result byte cap splits it).
+func (c clientStore) existingIDs(ctx context.Context, database, collection string, docs []map[string]any) (map[string]bool, error) {
+	ids := make([]any, len(docs))
+	for i, d := range docs {
+		ids[i] = d["_id"]
+	}
+	exists := make(map[string]bool)
+	for skip := 0; ; {
+		var out mcpserver.FindDocumentsOutput
+		err := callInto(ctx, c.cs, "find_documents", map[string]any{
+			"database": database, "collection": collection,
+			"query": map[string]any{
+				"filters": []any{map[string]any{"field": "_id", "operator": "in", "value": ids}},
+				"fields":  []any{"_id"}, "limit": len(ids), "skip": skip,
+			},
+		}, &out)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range out.Documents {
+			if id, ok := d["_id"].(string); ok {
+				exists[id] = true
+			}
+		}
+		if !out.HasMore {
+			return exists, nil
+		}
+		if out.NextSkip <= skip {
+			return nil, fmt.Errorf("find_documents on %s.%s: has_more without a next_skip after %d", database, collection, skip)
+		}
+		skip = out.NextSkip
+	}
 }
 
 func (c clientStore) ReplaceDocument(ctx context.Context, database, collection string, doc map[string]any) error {

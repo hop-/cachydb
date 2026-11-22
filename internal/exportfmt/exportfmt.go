@@ -221,8 +221,9 @@ type Target interface {
 
 // BatchTarget is a Target that can also write many documents of one
 // collection at once. Import uses it, when the target implements it, for
-// each run of document lines of one collection: the engine adapter does
-// (one atomic batch, one WAL fsync); the MCP client adapter does not yet.
+// each run of document lines of one collection: the engine adapter (one
+// atomic batch, one WAL fsync) and the MCP client adapter
+// (insert_documents) do.
 type BatchTarget interface {
 	Target
 	// InsertDocuments writes docs (flat objects with distinct _ids) to one
