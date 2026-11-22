@@ -1044,7 +1044,12 @@ func (s *Server) findDocumentsTool(ctx context.Context, req *mcp.CallToolRequest
 	}
 	res := FindDocumentsOutput{Success: true, Count: len(out), Documents: out, HasMore: hasMore}
 	if hasMore {
-		res.NextSkip = max(q.Skip, 0) + len(out)
+		// Saturated: a skip near math.MaxInt must not wrap (has_more
+		// implies it cannot, but the sum is guarded anyway).
+		res.NextSkip = math.MaxInt
+		if skip := max(q.Skip, 0); skip <= math.MaxInt-len(out) {
+			res.NextSkip = skip + len(out)
+		}
 	}
 	if in.Explain {
 		// plan.Returned counts the look-ahead document too; report what

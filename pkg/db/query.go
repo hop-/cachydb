@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -165,7 +166,7 @@ func (c *Collection) streamQuery(ctx context.Context, cq *compiledQuery, emit fu
 // limit leaves nothing after them.
 func (cq *compiledQuery) resumeAfter(n int) *compiledQuery {
 	next := *cq
-	next.skip += n
+	next.skip = addSat(next.skip, n)
 	if cq.limit > 0 {
 		next.limit -= n
 		if next.limit <= 0 {
@@ -173,6 +174,15 @@ func (cq *compiledQuery) resumeAfter(n int) *compiledQuery {
 		}
 	}
 	return &next
+}
+
+// addSat returns a+b for non-negative a and b, saturated at math.MaxInt
+// instead of overflowing (a skip may be as large as math.MaxInt).
+func addSat(a, b int) int {
+	if a > math.MaxInt-b {
+		return math.MaxInt
+	}
+	return a + b
 }
 
 // find is FindWithPlan that reports only the number of candidates
@@ -308,6 +318,15 @@ func (c *Collection) findOnce(ctx context.Context, cq *compiledQuery, useIndexes
 	opt, err := c.choosePlan(s, cq, true)
 	if err != nil {
 		return QueryPlan{}, err
+	}
+	// The read transaction is open, so its snapshot is fixed: an index
+	// dropped and re-created on another field after this point cannot
+	// change what this walk reads. Check here, before anything is
+	// emitted, for a change between capturing the index definitions and
+	// starting the transaction; a streaming caller must never receive
+	// results from a run planned on the wrong field.
+	if !c.indexesUnchanged(opt.used) {
+		return QueryPlan{}, errQueryRetry
 	}
 	plan := QueryPlan{Driver: opt.driver, Index: strings.Join(opt.index, ",")}
 	counted := func(doc *Document) bool {
@@ -481,7 +500,7 @@ func (c *Collection) findBySortWalk(ctx context.Context, s *querySnap, cq *compi
 func (c *Collection) findByHeap(ctx context.Context, s *querySnap, cq *compiledQuery, opt *planOption, emit func(*Document) bool) (int, error) {
 	keep := 0
 	if cq.limit > 0 {
-		keep = cq.skip + cq.limit
+		keep = addSat(cq.skip, cq.limit) // a huge skip keeps every match
 	}
 	h := &sortHeap{keys: cq.sort}
 	examined, err := c.eachCandidate(ctx, s, opt, func(doc *Document) bool {

@@ -206,10 +206,10 @@ func (b *Builder) Build(ctx context.Context) (_ *App, err error) {
 		return nil, err
 	}
 	if b.defaultLimit < 0 {
-		return nil, fmt.Errorf("DEFAULT_LIMIT (--default-limit): %d must be greater than 0", b.defaultLimit)
+		return nil, fmt.Errorf("DEFAULT_LIMIT (--default-limit): %d must not be negative", b.defaultLimit)
 	}
 	if b.maxResultBytes < 0 {
-		return nil, fmt.Errorf("MAX_RESULT_BYTES (--max-result-bytes): %d must be greater than 0", b.maxResultBytes)
+		return nil, fmt.Errorf("MAX_RESULT_BYTES (--max-result-bytes): %d must not be negative", b.maxResultBytes)
 	}
 	if b.resultText != "" {
 		if err := mcpserver.ValidateResultText(b.resultText); err != nil {

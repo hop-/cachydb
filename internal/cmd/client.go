@@ -337,9 +337,31 @@ func callTool(ctx context.Context, cs *mcp.ClientSession, tool string, args map[
 		return nil, fmt.Errorf("calling %s: %w", tool, err)
 	}
 	if res.IsError {
-		return nil, fmt.Errorf("%w: %s: %s", errToolFailed, tool, resultText(res))
+		return nil, &toolCallError{tool: tool, text: resultText(res)}
 	}
 	return res, nil
+}
+
+// toolCallError is a tool error result: errToolFailed with the tool's
+// name and message, kept apart so its error code can be read.
+type toolCallError struct{ tool, text string }
+
+func (e *toolCallError) Error() string {
+	return fmt.Sprintf("%v: %s: %s", errToolFailed, e.tool, e.text)
+}
+
+func (e *toolCallError) Unwrap() error { return errToolFailed }
+
+// isAlreadyExists reports whether err is a tool error for an existing
+// item: by its [already_exists] code, or, from a server older than the
+// error codes, by the db.ErrExists text.
+func isAlreadyExists(err error) bool {
+	if tf, ok := errors.AsType[*toolCallError](err); ok {
+		if code, known := mcpserver.ErrorCodeOf(tf.text); known {
+			return code == mcpserver.CodeAlreadyExists
+		}
+	}
+	return strings.Contains(err.Error(), db.ErrExists.Error())
 }
 
 // resultText joins the text content of a tool result.
@@ -518,7 +540,7 @@ func (c clientStore) DropIndex(ctx context.Context, database, collection, name s
 
 func (c clientStore) InsertDocument(ctx context.Context, database, collection string, doc map[string]any) error {
 	_, err := callTool(ctx, c.cs, "insert_document", map[string]any{"database": database, "collection": collection, "document": doc})
-	if err != nil && strings.Contains(err.Error(), db.ErrExists.Error()) {
+	if err != nil && isAlreadyExists(err) {
 		return errors.Join(exportfmt.ErrDocumentExists, err)
 	}
 	return err
@@ -546,9 +568,10 @@ func importTarget(ctx context.Context, cs *mcp.ClientSession) (exportfmt.Target,
 // DefaultMaxRequestBodyBytes) with room for the rest of the request.
 const clientBatchBytes = 3 << 20
 
-// itemIndexRE finds the failing item that insert_documents names in its
-// error ("documents[3]: ...").
-var itemIndexRE = regexp.MustCompile(`documents\[(\d+)\]`)
+// itemIndexRE finds the failing item that insert_documents names at the
+// start of its error text, after the code if any
+// ("[already_exists] insert documents: documents[3]: ...").
+var itemIndexRE = regexp.MustCompile(`^(?:\[[a-z_]+\] )?insert documents: documents\[(\d+)\]:`)
 
 // InsertDocuments implements exportfmt.BatchTarget with insert_documents,
 // one call per run of documents. Documents whose JSON exceeds
@@ -599,11 +622,15 @@ func (c clientStore) InsertDocuments(ctx context.Context, database, collection s
 			"database": database, "collection": collection, "documents": inserts,
 		}, &out)
 		if err != nil {
-			if strings.Contains(err.Error(), db.ErrExists.Error()) {
+			var item []string
+			if tf, ok := errors.AsType[*toolCallError](err); ok {
+				item = itemIndexRE.FindStringSubmatch(tf.text)
+			}
+			if isAlreadyExists(err) {
 				err = errors.Join(exportfmt.ErrDocumentExists, err)
 			}
-			if m := itemIndexRE.FindStringSubmatch(err.Error()); m != nil {
-				if i, convErr := strconv.Atoi(m[1]); convErr == nil && i < len(pos) {
+			if item != nil {
+				if i, convErr := strconv.Atoi(item[1]); convErr == nil && i < len(pos) {
 					return exportfmt.Stats{}, &db.BatchItemError{Index: pos[i], Err: err}
 				}
 			}
