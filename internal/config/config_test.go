@@ -183,7 +183,8 @@ func TestInitServerSettings(t *testing.T) {
 
 // envKeys are the environment variables Init reads.
 var envKeys = []string{"PORT", "ROOT_DIR", "DB_NAME", "TRANSPORT", "WAL_RETENTION_AGE", "WAL_RETENTION_SIZE", "CACHE_SIZE",
-	"HOST", "AUTH", "TLS_CERT", "TLS_KEY", "BOOTSTRAP_ADMIN_TOKEN", "BOOTSTRAP_ADMIN_TOKEN_FILE"}
+	"HOST", "AUTH", "TLS_CERT", "TLS_KEY", "BOOTSTRAP_ADMIN_TOKEN", "BOOTSTRAP_ADMIN_TOKEN_FILE",
+	"DEFAULT_LIMIT", "MAX_RESULT_BYTES", "RESULT_TEXT"}
 
 // setEnv gives the test exactly env out of envKeys (the others are unset)
 // and reloads the configuration from the real environment afterwards.
@@ -395,4 +396,75 @@ func TestInitAuthEnv(t *testing.T) {
 			t.Fatalf("empty values: host %q auth %q", c.Host, c.Auth)
 		}
 	})
+}
+
+// TestInitResultSettings: DEFAULT_LIMIT, MAX_RESULT_BYTES, and RESULT_TEXT
+// (approach-agent-interface §2, §8) default to 100, 1 MiB, and full; a
+// value that is not positive, or an unknown mode, is an error naming the
+// variable, and the setting keeps its default.
+func TestInitResultSettings(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		env       map[string]string
+		limit     int
+		maxBytes  ByteSize
+		text      string
+		wantNames []string
+	}{
+		{name: "defaults", limit: 100, maxBytes: MiB, text: "full"},
+		{name: "from env", env: map[string]string{"DEFAULT_LIMIT": "25", "MAX_RESULT_BYTES": "64KiB", "RESULT_TEXT": "summary"}, limit: 25, maxBytes: 64 * KiB, text: "summary"},
+		{name: "plain byte count", env: map[string]string{"MAX_RESULT_BYTES": "5000"}, limit: 100, maxBytes: 5000, text: "full"},
+		{name: "empty means unset", env: map[string]string{"DEFAULT_LIMIT": "", "MAX_RESULT_BYTES": "", "RESULT_TEXT": ""}, limit: 100, maxBytes: MiB, text: "full"},
+		{name: "zero limit", env: map[string]string{"DEFAULT_LIMIT": "0"}, limit: 100, maxBytes: MiB, text: "full", wantNames: []string{"DEFAULT_LIMIT"}},
+		{name: "negative limit", env: map[string]string{"DEFAULT_LIMIT": "-5"}, limit: 100, maxBytes: MiB, text: "full", wantNames: []string{"DEFAULT_LIMIT"}},
+		{name: "limit not a number", env: map[string]string{"DEFAULT_LIMIT": "many"}, limit: 100, maxBytes: MiB, text: "full", wantNames: []string{"DEFAULT_LIMIT"}},
+		{name: "zero bytes", env: map[string]string{"MAX_RESULT_BYTES": "0"}, limit: 100, maxBytes: MiB, text: "full", wantNames: []string{"MAX_RESULT_BYTES"}},
+		{name: "negative bytes", env: map[string]string{"MAX_RESULT_BYTES": "-1KiB"}, limit: 100, maxBytes: MiB, text: "full", wantNames: []string{"MAX_RESULT_BYTES"}},
+		{name: "unknown mode", env: map[string]string{"RESULT_TEXT": "brief"}, limit: 100, maxBytes: MiB, text: "full", wantNames: []string{"RESULT_TEXT"}},
+		{name: "mode is case-sensitive", env: map[string]string{"RESULT_TEXT": "Summary", "DEFAULT_LIMIT": "7"}, limit: 7, maxBytes: MiB, text: "full", wantNames: []string{"RESULT_TEXT"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			setEnv(t, tt.env)
+			err := Init()
+			c := GetConfig()
+			if c.DefaultLimit != tt.limit || c.MaxResultBytes != tt.maxBytes || c.ResultText != tt.text {
+				t.Errorf("DefaultLimit %d, MaxResultBytes %v, ResultText %q; want %d, %v, %q", c.DefaultLimit, c.MaxResultBytes, c.ResultText, tt.limit, tt.maxBytes, tt.text)
+			}
+			if len(tt.wantNames) == 0 {
+				if err != nil {
+					t.Fatalf("Init(): %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("Init() succeeded, want an error")
+			}
+			for _, name := range tt.wantNames {
+				if !strings.Contains(err.Error(), name) {
+					t.Errorf("error %q does not name %s", err, name)
+				}
+			}
+		})
+	}
+}
+
+func TestParsePositive(t *testing.T) {
+	for s, want := range map[string]int{"1": 1, "100": 100, "0": 0, "-1": 0, "x": 0, "": 0} {
+		got, err := ParsePositiveInt(s)
+		if (err == nil) != (want > 0) || got != want {
+			t.Errorf("ParsePositiveInt(%q) = %d, %v", s, got, err)
+		}
+	}
+	for s, want := range map[string]ByteSize{"1": 1, "2MiB": 2 * MiB, "0": 0, "0KiB": 0, "-3": 0, "lots": 0} {
+		got, err := ParsePositiveByteSize(s)
+		if (err == nil) != (want > 0) || got != want {
+			t.Errorf("ParsePositiveByteSize(%q) = %v, %v", s, got, err)
+		}
+	}
+	for s, ok := range map[string]bool{"full": true, "summary": true, "": false, "FULL": false, "none": false} {
+		got, err := ParseResultText(s)
+		if (err == nil) != ok || (ok && got != s) {
+			t.Errorf("ParseResultText(%q) = %q, %v", s, got, err)
+		}
+	}
 }

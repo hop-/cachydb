@@ -284,3 +284,38 @@ func TestAuthBootstrapToken(t *testing.T) {
 		})
 	}
 }
+
+// TestBuilderRejectsBadResultSettings: a negative find_documents bound or
+// an unknown result text mode fail before the engine opens; zero keeps
+// the server default.
+func TestBuilderRejectsBadResultSettings(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		b    *Builder
+		want string
+	}{
+		{"negative default limit", NewBuilder().WithResultLimits(-1, 0), "DEFAULT_LIMIT"},
+		{"negative byte cap", NewBuilder().WithResultLimits(0, -1), "MAX_RESULT_BYTES"},
+		{"unknown result text", NewBuilder().WithResultText("brief"), "RESULT_TEXT"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "data")
+			_, err := tt.b.WithRootDir(dir).WithLogger(testLogger(&syncBuffer{})).Build(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Build = %v, want an error naming %s", err, tt.want)
+			}
+			if _, serr := os.Stat(dir); !errors.Is(serr, os.ErrNotExist) {
+				t.Fatalf("Build opened the engine before rejecting the settings (%v)", serr)
+			}
+		})
+	}
+	for _, b := range []*Builder{NewBuilder().WithResultLimits(0, 0).WithResultText(""), NewBuilder().WithResultLimits(5, 4096).WithResultText("summary")} {
+		a, err := b.WithRootDir(t.TempDir()).WithDBName("main").WithLogger(testLogger(&syncBuffer{})).Build(context.Background())
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		if err := a.Stop(context.Background()); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	}
+}
