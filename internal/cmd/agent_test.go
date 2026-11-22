@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -442,8 +443,8 @@ func TestImportKeepCLI(t *testing.T) {
 	t.Run("utils import", func(t *testing.T) {
 		dump, dst := keepFixture(t)
 		code, _, errOut := runCLI(t, ctx, "utils", "import", "-R", dst, "-i", dump, "--on-conflict", "skip")
-		if code != 1 || !strings.Contains(errOut, "keep") {
-			t.Errorf("skip over a different schema: exit %d, %q; want 1 with a hint naming keep", code, errOut)
+		if code != 1 || !strings.Contains(errOut, "keep") || !strings.Contains(errOut, "overwrites") {
+			t.Errorf("skip over a different schema: exit %d, %q; want 1 with a hint naming keep and warning that replace overwrites", code, errOut)
 		}
 		code, _, errOut = runCLI(t, ctx, "utils", "import", "-R", dst, "-i", dump, "--on-conflict", "keep")
 		if code != 0 {
@@ -474,4 +475,200 @@ func TestImportKeepCLI(t *testing.T) {
 		stop()
 		checkKeepResult(t, dst)
 	})
+}
+
+// midRunFixture writes an export of kb with collection a (x1..x3) and
+// collection notes (d00..d19, one insert_documents run), and returns it
+// with a fresh target directory where kb/notes already holds d04, the
+// fifth document of that run, with other data.
+//
+// Line numbers in the file: 1 header, 2 kb, 3 collection a, 4-6 x1..x3,
+// 7 collection notes, 8-27 d00..d19; d04 is line 12.
+func midRunFixture(t *testing.T) (dump string, newTarget func() string) {
+	t.Helper()
+	ctx := context.Background()
+	src := t.TempDir()
+	e := openEngine(t, src)
+	d, err := e.CreateDatabase(ctx, "kb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a", "notes"} {
+		if err := d.CreateCollection(ctx, name, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, _ := d.Collection("a")
+	for i := 1; i <= 3; i++ {
+		if _, err := a.Insert(ctx, &db.Document{ID: fmt.Sprintf("x%d", i), Data: map[string]any{"v": i}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	notes, _ := d.Collection("notes")
+	for i := range 20 {
+		if _, err := notes.Insert(ctx, &db.Document{ID: fmt.Sprintf("d%02d", i), Data: map[string]any{"i": i}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	closeEngine(t, e)
+	var buf bytes.Buffer
+	if err := exportOffline(ctx, &buf, db.Options{Dir: src}, exportfmt.Scope{}); err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Split(strings.TrimSpace(buf.String()), "\n"); len(lines) != 27 || !strings.Contains(lines[11], `"d04"`) {
+		t.Fatalf("fixture export has %d lines, line 12 = %q; want 27 with d04 at line 12", len(lines), lines[min(11, len(lines)-1)])
+	}
+	dump = filepath.Join(t.TempDir(), "kb.jsonl")
+	if err := os.WriteFile(dump, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newTarget = func() string {
+		dst := t.TempDir()
+		e := openEngine(t, dst)
+		defer closeEngine(t, e)
+		d, err := e.CreateDatabase(ctx, "kb")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := d.CreateCollection(ctx, "notes", nil); err != nil {
+			t.Fatal(err)
+		}
+		c, _ := d.Collection("notes")
+		if _, err := c.Insert(ctx, &db.Document{ID: "d04", Data: map[string]any{"local": true}}); err != nil {
+			t.Fatal(err)
+		}
+		return dst
+	}
+	return dump, newTarget
+}
+
+// importErrLine returns the "import line ..." part of an import's
+// stderr, the error that names the failing line.
+func importErrLine(t *testing.T, stderr string) string {
+	t.Helper()
+	for l := range strings.SplitSeq(stderr, "\n") {
+		if _, rest, ok := strings.Cut(l, "import line "); ok {
+			return "import line " + rest
+		}
+	}
+	t.Fatalf("no import line error in %q", stderr)
+	return ""
+}
+
+// TestClientImportConflictMidRun (AC-22, F-038): in Fail mode, a document
+// that exists at position k > 0 of one insert_documents run is named by
+// client import exactly as utils import names it (same line, same _id,
+// same applied count), and nothing of that run is written. This ties the
+// server's "insert documents: documents[i]:" text to the client's
+// itemIndexRE: if either drifts, client import blames the run's first
+// line instead.
+func TestClientImportConflictMidRun(t *testing.T) {
+	ctx := context.Background()
+	dump, newTarget := midRunFixture(t)
+
+	// The client batch target itself reports the run position.
+	t.Run("batch item index", func(t *testing.T) {
+		dst := newTarget()
+		url, stop := liveServer(t, dst)
+		defer stop()
+		docs := make([]map[string]any, 20)
+		for i := range docs {
+			docs[i] = map[string]any{"_id": fmt.Sprintf("d%02d", i), "i": float64(i)}
+		}
+		err := clientDo(t, url, func(cs *mcp.ClientSession) error {
+			_, err := clientStore{cs: cs}.InsertDocuments(ctx, "kb", "notes", docs, exportfmt.Fail)
+			return err
+		})
+		bie, ok := errors.AsType[*db.BatchItemError](err)
+		if !ok || bie.Index != 4 {
+			t.Fatalf("InsertDocuments error = %v (%T); want a *db.BatchItemError with Index 4", err, err)
+		}
+		if !errors.Is(err, exportfmt.ErrDocumentExists) {
+			t.Errorf("InsertDocuments error %v does not wrap ErrDocumentExists", err)
+		}
+		// The offline target reports the same position for the same run.
+		stop()
+		e := openEngine(t, dst)
+		defer closeEngine(t, e)
+		_, offErr := exportfmt.Engine{E: e}.InsertDocuments(ctx, "kb", "notes", docs, exportfmt.Fail)
+		if obie, ok := errors.AsType[*db.BatchItemError](offErr); !ok || obie.Index != bie.Index {
+			t.Errorf("offline InsertDocuments error = %v; want a *db.BatchItemError with Index %d", offErr, bie.Index)
+		}
+	})
+
+	t.Run("same error as utils import", func(t *testing.T) {
+		offDst := newTarget()
+		code, _, offErr := runCLI(t, ctx, "utils", "import", "-R", offDst, "-i", dump)
+		if code != 1 {
+			t.Fatalf("utils import: exit %d, %s", code, offErr)
+		}
+		want := importErrLine(t, offErr)
+		if !strings.HasPrefix(want, "import line 12 ") || !strings.Contains(want, `document "d04" in kb/notes already exists`) {
+			t.Fatalf("utils import error = %q; want line 12 naming d04", want)
+		}
+		// AC-28: the hint names keep and warns that replace overwrites.
+		if !strings.Contains(want, "keep") || !strings.Contains(want, "replace overwrites") {
+			t.Errorf("conflict hint %q does not name keep and warn that replace overwrites", want)
+		}
+
+		cliDst := newTarget()
+		url, stop := liveServer(t, cliDst)
+		code, _, cliErr := runCLI(t, ctx, "client", "import", "--url", url, "-i", dump)
+		stop()
+		if code != 1 {
+			t.Fatalf("client import: exit %d, %s", code, cliErr)
+		}
+		if got := importErrLine(t, cliErr); got != want {
+			t.Errorf("client import error:\n got  %q\n want %q (utils import)", got, want)
+		}
+
+		// Both targets: collection a and its documents landed, the notes run
+		// did not (d04 keeps its own data, no other d.. document).
+		for name, dir := range map[string]string{"utils": offDst, "client": cliDst} {
+			e := openEngine(t, dir)
+			d, err := e.Database("kb")
+			if err != nil {
+				t.Fatal(err)
+			}
+			a, err := d.Collection("a")
+			if err != nil || a.Count() != 3 {
+				t.Errorf("%s: collection a: %v, want 3 documents", name, err)
+			}
+			notes, _ := d.Collection("notes")
+			d04, err := notes.Get(ctx, "d04")
+			if notes.Count() != 1 || err != nil || d04.Data["local"] != true {
+				t.Errorf("%s: notes has %d documents, d04 = %+v, %v; want only the existing d04", name, notes.Count(), d04, err)
+			}
+			closeEngine(t, e)
+		}
+	})
+}
+
+// TestIsAlreadyExists (AC-22): a conflict is told by the tool's
+// [already_exists] code, or, from a server without codes, by the
+// db.ErrExists text; another code is never a conflict, even when its text
+// says "already exists"; an error that is not a tool error is not one.
+func TestIsAlreadyExists(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"coded already_exists", &toolCallError{tool: "insert_document", text: `[already_exists] insert document: document "d1" already exists`}, true},
+		{"coded, wrapped", fmt.Errorf("import: %w", &toolCallError{tool: "insert_documents", text: `[already_exists] insert documents: documents[3]: already exists`}), true},
+		{"un-coded text (older server)", &toolCallError{tool: "insert_document", text: `insert document: document "d1" already exists`}, true},
+		{"unique_violation mentioning already exists", &toolCallError{tool: "insert_documents", text: `[unique_violation] insert documents: documents[2]: unique index violation: value already exists in by_code`}, false},
+		{"unique_violation", &toolCallError{tool: "insert_document", text: `[unique_violation] insert document: unique index violation`}, false},
+		{"coded not_found", &toolCallError{tool: "insert_document", text: `[not_found] insert document: collection "x" not found`}, false},
+		{"un-coded other text", &toolCallError{tool: "insert_document", text: `insert document: invalid document`}, false},
+		{"plain non-tool error", errors.New("calling insert_document: connection refused"), false},
+		{"plain non-tool error with the ErrExists text", fmt.Errorf("calling insert_document: %w", db.ErrExists), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isAlreadyExists(tt.err); got != tt.want {
+				t.Errorf("isAlreadyExists(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
 }

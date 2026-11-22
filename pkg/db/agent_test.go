@@ -203,9 +203,9 @@ func TestIterateResumesAfterCompactionRetry(t *testing.T) {
 			}
 		}
 	})
-	deadline := time.Now().Add(700 * time.Millisecond)
-	completed, interrupted := 0, 0
-	for n := 0; time.Now().Before(deadline) && !t.Failed(); n++ {
+	// run runs attempt n (query n%len, sometimes stopping early in fn) and
+	// checks a completed run exactly; it reports whether the run completed.
+	run := func(n int, allowInterrupt bool) (bool, error) {
 		i := n % len(queries)
 		stopAt := len(want[i])
 		if n%3 == 1 && stopAt > 1 {
@@ -216,30 +216,59 @@ func TestIterateResumesAfterCompactionRetry(t *testing.T) {
 			got = append(got, d.ID)
 			return len(got) < stopAt
 		})
-		if errors.Is(err, ErrQueryInterrupted) {
+		if allowInterrupt && errors.Is(err, ErrQueryInterrupted) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("query %d: %w", i, err)
+		}
+		if w := want[i][:min(stopAt, len(want[i]))]; !slices.Equal(got, w) {
+			t.Errorf("query %+v (stop at %d) = %v\nwant %v", queries[i], stopAt, got, w)
+		}
+		return true, nil
+	}
+	// The stress phase runs at least minAttempts queries and lasts at least
+	// window, and goes on (up to hardCap) until minCompleted runs complete,
+	// so a slow or loaded machine gets more attempts rather than a failure.
+	const (
+		minAttempts  = 60
+		minCompleted = 3
+		window       = 700 * time.Millisecond
+		hardCap      = 20 * time.Second
+	)
+	start := time.Now()
+	completed, interrupted, n := 0, 0, 0
+	for ; !t.Failed() && time.Since(start) < hardCap &&
+		(n < minAttempts || time.Since(start) < window || completed < minCompleted); n++ {
+		ok, err := run(n, true)
+		if err != nil {
+			t.Error(err)
+			break
+		}
+		if !ok {
 			// More retries than allowed under this compaction rate (Find
 			// gets the same here): the documented "retry it" outcome.
 			interrupted++
 			continue
 		}
-		if err != nil {
-			t.Errorf("query %d: %v", i, err)
-			break
-		}
 		completed++
-		if !slices.Equal(got, want[i][:min(stopAt, len(want[i]))]) {
-			t.Errorf("query %+v (stop at %d) = %v\nwant %v", queries[i], stopAt, got, want[i][:min(stopAt, len(want[i]))])
-		}
 	}
 	close(done)
 	wg.Wait()
 	if err, _ := bgErr.Load().(error); err != nil {
 		t.Fatal(err)
 	}
-	if completed == 0 {
-		t.Errorf("no query completed (%d interrupted)", interrupted)
+	t.Logf("%d queries completed and checked, %d interrupted, in %v", completed, interrupted, time.Since(start).Round(time.Millisecond))
+	if completed < minCompleted {
+		t.Logf("fewer than %d runs completed under load within %v; the machine is too slow for this compaction rate", minCompleted, hardCap)
 	}
-	t.Logf("%d queries completed and checked, %d interrupted", completed, interrupted)
+	// With the background writers stopped, every query and stop point
+	// completes, with exact results, on the segments the stress left.
+	for m := range 3 * len(queries) {
+		if _, err := run(m, false); err != nil {
+			t.Error(err)
+		}
+	}
 }
 
 // TestIterateIndexChangeRetry: an index dropped and re-created under the

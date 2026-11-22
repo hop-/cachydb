@@ -576,8 +576,10 @@ type countOutput struct {
 }
 
 // verify checks the restarted server against every writer's
-// acknowledged state, then resolves in-flight writes to what landed.
-func verify(t *testing.T, ctx context.Context, url string, ws []*writerState) {
+// acknowledged state, then resolves in-flight writes to what landed. It
+// returns how many in-flight batch calls it checked for atomicity and how
+// many of those landed.
+func verify(t *testing.T, ctx context.Context, url string, ws []*writerState) (batches, batchesLanded int) {
 	t.Helper()
 	c, err := connect(ctx, url)
 	if err != nil {
@@ -689,6 +691,10 @@ func verify(t *testing.T, ctx context.Context, url string, ws []*writerState) {
 		if slices.Contains(l, true) && slices.Contains(l, false) {
 			t.Errorf("BATCH NOT ATOMIC: %s: of its in-flight writes, some landed and some did not: %v", batch, l)
 		}
+		batches++
+		if slices.Contains(l, true) {
+			batchesLanded++
+		}
 	}
 	for id := range stored {
 		known := false
@@ -701,6 +707,7 @@ func verify(t *testing.T, ctx context.Context, url string, ws []*writerState) {
 			t.Errorf("document %s is stored but was never written", id)
 		}
 	}
+	return batches, batchesLanded
 }
 
 // ---- the test ----
@@ -768,6 +775,7 @@ func TestKillRecovery(t *testing.T) {
 	}()
 
 	cleanStops, kills, replayedAfterKill := 0, 0, 0
+	inFlightBatches, inFlightBatchesLanded := 0, 0 // batch calls cut by a stop, checked by verify
 	prevClean := false
 	for round := 1; round <= rounds && !t.Failed(); round++ {
 		if round > 1 {
@@ -779,7 +787,9 @@ func TestKillRecovery(t *testing.T) {
 			if !prevClean && replayed {
 				replayedAfterKill++
 			}
-			verify(t, ctx, srv.url, ws)
+			b, bl := verify(t, ctx, srv.url, ws)
+			inFlightBatches += b
+			inFlightBatchesLanded += bl
 			if t.Failed() {
 				break
 			}
@@ -826,7 +836,9 @@ func TestKillRecovery(t *testing.T) {
 	// Final restart and check, then a clean stop.
 	if !t.Failed() {
 		srv = startServer(t, bin, dir, logs, rounds+1, freePort(t))
-		verify(t, ctx, srv.url, ws)
+		b, bl := verify(t, ctx, srv.url, ws)
+		inFlightBatches += b
+		inFlightBatchesLanded += bl
 		srv.stop(t, syscall.SIGTERM)
 		if srv.waitErr != nil {
 			t.Errorf("final clean stop exited with %v", srv.waitErr)
@@ -849,4 +861,14 @@ func TestKillRecovery(t *testing.T) {
 		fmt.Fprintf(&b, " w%d=%v", w.id, w.counter)
 	}
 	t.Logf("counters:%s", b.String())
+	t.Logf("%d in-flight batch calls checked for atomicity (%d landed, %d did not)",
+		inFlightBatches, inFlightBatchesLanded, inFlightBatches-inFlightBatchesLanded)
+	// F-050: the run exercised every batch write tool.
+	if !t.Failed() {
+		for _, op := range []string{"insert_documents", "update_documents", "delete_documents"} {
+			if total[op] == 0 {
+				t.Errorf("no %s call was acknowledged over %d rounds; the batch writes were not exercised", op, rounds)
+			}
+		}
+	}
 }
