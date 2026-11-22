@@ -72,8 +72,8 @@ are rejected before the tool runs, with a message starting
 | `BOOTSTRAP_ADMIN_TOKEN and BOOTSTRAP_ADMIN_TOKEN_FILE are both set` | Both settings are given | Keep one |
 | `invalid authentication mode` / `TLS needs both a certificate and a key` | `AUTH` is not `auto`, `required`, or `off`, or only one of `TLS_CERT` and `TLS_KEY` is set | Fix the setting named in the message |
 | `tool error: …` | `cachydb client call` ran a tool that failed (exit status 1) | Read the tool's message after the prefix |
-| `already exists (use --on-conflict skip or replace)` | `utils import` / `client import` found an existing `_id`; the message says how many lines were applied | Rerun with `--on-conflict skip` or `replace` |
-| `exists with a different schema` / `different index set` | An import target collection differs from the file | Use `--on-conflict replace`, or import into another directory |
+| `already exists (use --on-conflict skip or keep to keep it; replace overwrites it ...)` | `utils import` / `client import` found an existing `_id`; the message says how many lines were applied | Rerun with `--on-conflict skip` or `keep` to keep existing documents; `replace` overwrites them with the file's copies |
+| `exists with a different schema` / `different index set` | An import target collection differs from the file | `--on-conflict keep` leaves existing collections and documents as they are (seeding); `replace` updates the schema and indexes but also overwrites existing documents; or import into another directory |
 | `unsupported export format version` | The file was written by a newer cachydb | Upgrade cachydb |
 | `WAL corrupt` / `idxstore: index file …` / `segment: corrupt` | A file of the data directory is damaged, so the server does not start or a read fails | Stop the server and run `cachydb utils verify -R <dir>` (see below) |
 | `verify found problems` | `cachydb utils verify` found damage; its stdout lists one line per problem | See "When the server does not start" below |

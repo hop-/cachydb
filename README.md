@@ -17,7 +17,7 @@ A lightweight document-based database with Model Context Protocol (MCP) support,
 - **Document-based storage**: Store JSON documents in collections
 - **Multiple databases**: Create and manage multiple databases within a single instance
 - **Schema validation**: Define and enforce schemas for your collections
-- **Indexing**: Multi-value hash indexes on any top-level field (duplicate values supported; array fields indexed per element)
+- **Indexing**: Indexes on any field or dotted path, stored on disk (duplicate values supported, or `unique`; array fields indexed per element); they serve equality, `in`, ranges, `starts_with`, `exists`, array matching, and sorts
 - **Query operations**: Type-aware filters (eq, ne, gt, gte, lt, lte, in), case-insensitive `contains`, array matching (`has`, `has_any`, `has_all`), `exists`, `starts_with`, nested paths, OR groups, sort by any field, projection, deterministic skip/limit, query plans (`explain`), `count_documents`, `distinct`
 - **Safe writes**: Conditional writes (`if`, compare-and-set), `unset`, in-place operators (`inc`, `push`, `add_to_set`, `pull`), unique indexes, upsert, atomic `replace_document`, and `{"$now": true}` server timestamps
 - **Batch writes**: `insert_documents`, `update_documents`, and `delete_documents` change many documents in one atomic call (all or none); `get_document` reads one by id
@@ -36,7 +36,7 @@ A lightweight document-based database with Model Context Protocol (MCP) support,
 - **Collections**: Multiple collections within each database
 - **Documents**: JSON documents with a string `_id` (generated UUID if not provided)
 - **Schemas**: Optional field definitions with type validation
-- **Indexes**: Multi-value hash indexes on any top-level field (`_id` lookups are always fast)
+- **Indexes**: Indexes on any field or dotted path, optionally unique (`_id` lookups are always fast)
 
 Names of databases, collections, and indexes must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.
 
@@ -130,6 +130,7 @@ CLI flags (override environment variables, which override the defaults):
       --cache-size           Document cache size, e.g. 64MiB (0 = cache disabled)
       --default-limit        Documents find_documents returns without a limit (default 100)
       --max-result-bytes     Cap on the JSON size of one find_documents result (default 1MiB)
+      --result-text          Text content of tool results: full (default; the JSON) or summary (one line)
 ```
 
 Environment variables:
@@ -147,6 +148,7 @@ Environment variables:
 - `CACHE_SIZE`: Document cache size (default: `64MiB`, `0` = disabled)
 - `DEFAULT_LIMIT`: Documents `find_documents` returns at most when a call gives no `limit` (default: `100`); results report `has_more` and `next_skip` for paging
 - `MAX_RESULT_BYTES`: Cap on the JSON size of the documents one `find_documents` call returns; at least one document is returned (default: `1MiB`)
+- `RESULT_TEXT`: Text content of successful tool results: `full` (the result JSON, the same as the structured content) or `summary` (one line such as `12 documents, has_more: false`; the data is then only in the structured content, so use it only with a client that gives its model the structured content) (default: `full`)
 
 Sizes accept `B`, `KiB`, `MiB`, `GiB`, `TiB` (powers of 1024) and `KB`, `MB`, `GB`, `TB` (powers of 1000). Retention never deletes WAL that has not yet been written to the data segments.
 
@@ -160,6 +162,7 @@ Only one process can use a data directory at a time: the server holds an exclusi
 # Offline (no server running on the directory)
 cachydb utils export -d kb -o kb.jsonl                 # JSON Lines: header, databases, collections, documents
 cachydb utils import -i kb.jsonl --on-conflict skip -R /new/data
+cachydb utils import -i seed.jsonl --on-conflict keep  # seed: create only what is missing; safe to re-run
 cachydb utils find -d kb -c notes --query '{"filters":[{"field":"tags","operator":"has","value":"wal"}]}'
 cachydb utils get -d kb -c notes --id wal-design
 cachydb utils verify --deep                            # integrity check of the data directory; exit 1 on damage
@@ -173,7 +176,7 @@ cachydb client export -d kb -o kb.jsonl
 cachydb client import -i kb.jsonl
 ```
 
-`client call` works for every tool, so scripts and agents without MCP support can use cachydb too. See `cachydb docs config` for the export format and flags.
+`--on-conflict` decides what happens to existing data: `fail` (default) stops at an existing `_id`, `skip` keeps existing documents, `replace` overwrites them with the file's copies and updates differing schemas and indexes, and `keep` creates only what is missing and leaves existing collections (schema, indexes, documents) as they are. `client call` works for every tool, so scripts and agents without MCP support can use cachydb too. See `cachydb docs config` for the export format and flags.
 
 Logs go to stderr; in stdio mode stdout carries only MCP messages. SIGINT/SIGTERM, or the client closing stdin, shut the server down gracefully (final flush, exit status 0). Errors exit with status 1.
 
@@ -778,5 +781,7 @@ Built with:
 - **Official MCP Go SDK** - [`github.com/modelcontextprotocol/go-sdk`](https://github.com/modelcontextprotocol/go-sdk)
 - Type-safe tool handlers with automatic JSON schema generation
 - **zstd compression** - [`github.com/klauspost/compress`](https://github.com/klauspost/compress)
+- **bbolt** - [`go.etcd.io/bbolt`](https://github.com/etcd-io/bbolt), the B+tree file `index.db` that holds each collection's key table and indexes
+- **Cobra** - [`github.com/spf13/cobra`](https://github.com/spf13/cobra), the command line
 - **stdio transport** — for local MCP clients
 - **Streamable HTTP transport** — MCP spec 2025-03-26+, SSE-based, suitable for networked deployments

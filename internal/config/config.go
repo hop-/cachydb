@@ -56,6 +56,9 @@ type Config struct {
 	// MaxResultBytes caps the JSON size of the documents one
 	// find_documents call returns (env MAX_RESULT_BYTES); positive.
 	MaxResultBytes ByteSize
+	// ResultText is the text content of successful tool results, "full"
+	// (the JSON) or "summary" (one line) (env RESULT_TEXT).
+	ResultText string
 }
 
 // defaults returns the configuration of an empty environment. RootDir is
@@ -73,6 +76,7 @@ func defaults() Config {
 		CacheSize:        64 * MiB,
 		DefaultLimit:     100,
 		MaxResultBytes:   MiB,
+		ResultText:       "full",
 	}
 }
 
@@ -108,6 +112,7 @@ func Init() error {
 		fromEnv("CACHE_SIZE", &cfg.CacheSize, ParseByteSize),
 		fromEnv("DEFAULT_LIMIT", &cfg.DefaultLimit, ParsePositiveInt),
 		fromEnv("MAX_RESULT_BYTES", &cfg.MaxResultBytes, ParsePositiveByteSize),
+		fromEnv("RESULT_TEXT", &cfg.ResultText, ParseResultText),
 	)
 	if err != nil {
 		err = fmt.Errorf("loading configuration from the environment: %w", err)
@@ -165,6 +170,16 @@ func ParsePositiveByteSize(s string) (ByteSize, error) {
 		return 0, fmt.Errorf("invalid size %q: must be greater than 0", s)
 	}
 	return n, nil
+}
+
+// ParseResultText accepts the result text modes "full" and "summary".
+func ParseResultText(s string) (string, error) {
+	switch s {
+	case "full", "summary":
+		return s, nil
+	default:
+		return "", fmt.Errorf("invalid result text mode %q: use full or summary", s)
+	}
 }
 
 // asIs is the parser of a string setting.

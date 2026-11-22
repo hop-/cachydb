@@ -1,7 +1,7 @@
 ---
 name: config
 title: Configuration
-summary: Every flag and environment variable, defaults, precedence (flag > env > default), listen host, AUTH, find_documents result limits, BOOTSTRAP_ADMIN_TOKEN and TLS, value formats, cachydb client (CACHYDB_URL, CACHYDB_TOKEN), utils user, and the export format
+summary: Every flag and environment variable, defaults, precedence (flag > env > default), listen host, AUTH, find_documents result limits, RESULT_TEXT, BOOTSTRAP_ADMIN_TOKEN and TLS, value formats, cachydb client (CACHYDB_URL, CACHYDB_TOKEN), utils user, and the export format
 ---
 # Configuration
 
@@ -24,6 +24,7 @@ environment variable, which wins over the default.**
 | | `BOOTSTRAP_ADMIN_TOKEN_FILE` | none | A file holding the bootstrap token (for Docker secrets); not together with `BOOTSTRAP_ADMIN_TOKEN` |
 | `--default-limit` | `DEFAULT_LIMIT` | `100` | Documents `find_documents` returns at most when a call gives no `limit` (or `0`); must be greater than 0 |
 | `--max-result-bytes` | `MAX_RESULT_BYTES` | `1MiB` | Cap on the JSON size of the documents one `find_documents` call returns, whatever its `limit`; at least one document is always returned; must be greater than 0 |
+| `--result-text` | `RESULT_TEXT` | `full` | Text content of successful tool results: `full` (the result JSON, the same as the structured content) or `summary` (one line such as `12 documents, has_more: false`); any other value is an error |
 
 ### When clients need a token
 
@@ -50,6 +51,16 @@ call returns; its `has_more` and `next_skip` say how to get the rest (see
 `cachydb docs query`). `cachydb utils find` and `cachydb client export`
 are not bounded by them.
 
+Every successful tool result carries the result twice: as structured
+content and as text content. With `--result-text full` (the default) the
+text is the same JSON. With `summary` it is one line (counts, ids,
+`has_more`, `next_skip`; a new token in full), and the data is only in
+the structured content. That saves tokens with a client that passes both
+parts to its model, but a client that shows its model only the text sees
+the summary line and none of the data, so use `summary` only with a
+client known to read the structured content. Errors are unchanged in
+both modes.
+
 ## Engine tuning (server and `cachydb utils`)
 
 | Flag | Env var | Default | Meaning |
@@ -69,7 +80,7 @@ instead.
 | Command | Flags | Output |
 | --- | --- | --- |
 | `utils export` | `-d` database, `-c` collection (needs `-d`), `-o` file (default stdout) | The export format below |
-| `utils import` | `-i` file (`-` = stdin), `--on-conflict fail\|skip\|replace` (default `fail`) | A summary on stderr |
+| `utils import` | `-i` file (`-` = stdin), `--on-conflict fail\|skip\|replace\|keep` (default `fail`) | A summary on stderr |
 | `utils find` | `-d`, `-c` (required), `--query` JSON (the `find_documents` `query`), `--format jsonl\|json` (default `jsonl`) | Documents |
 | `utils get` | `-d`, `-c`, `--id` (required) | One document; exit 1 if not found |
 | `utils user add NAME` | `--admin`, `--default-database DB` | The first token, once, alone on stdout |
@@ -80,9 +91,15 @@ instead.
 
 `--on-conflict`: `fail` stops at the first existing `_id` (and reports how
 many lines were applied); `skip` keeps existing documents; `replace`
-replaces them, and also updates a differing collection schema (checked
-against the documents) and adds missing indexes. With `fail` or `skip`, an
-existing collection whose schema or index set differs is an error.
+overwrites them with the file's copies, and also updates a differing
+collection schema (checked against the documents) and adds missing
+indexes. With `fail` or `skip`, an existing collection whose schema or
+index set differs is an error. `keep` is for seeding and is safe to run
+again: it creates missing databases, collections (with the file's schema
+and indexes), and documents, and leaves everything that exists as it is,
+including an existing collection's schema and indexes when they differ
+from the file (exit status 0). A missing document that an existing
+collection's schema rejects is still an error.
 
 ## Client (`cachydb client`)
 

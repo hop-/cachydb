@@ -137,7 +137,7 @@ jobs:
       - name: Fuzz every target
         run: |
           fail=0
-          for pkg in ./pkg/db ./pkg/db/internal/wal ./pkg/db/internal/segment ./internal/exportfmt; do
+          for pkg in ./pkg/db ./pkg/db/internal/wal ./pkg/db/internal/segment ./pkg/db/internal/idxstore ./internal/exportfmt; do
             for target in $(go test -list '^Fuzz' "$pkg" | grep '^Fuzz'); do
               echo "::group::$pkg $target"
               if ! go test -run '^$' -fuzz "^${target}\$" -fuzztime "$FUZZ_TIME" "$pkg"; then

@@ -74,18 +74,21 @@ cachydb/
 ├── internal/
 │   ├── app/                 # Builder (options → Engine, auth store, bootstrap token, MCP server), App Start/Stop
 │   ├── auth/                # users, tokens, grants (Store over _system), levels, auth modes (Decide), bootstrap admin
-│   ├── cmd/                 # cobra commands: root/app, docs, version, healthcheck, utils list/migrate/export/import/find/get/verify/user, client, flags
-│   ├── exportfmt/           # JSONL export format, Export/Import over Source/Target (engine adapter)
+│   ├── cmd/                 # cobra commands: root/app, docs, version, healthcheck, utils list/migrate/export/import/find/get/stats/verify/user, client, flags
+│   ├── exportfmt/           # JSONL export format, Export/Import over Source/Target (engine adapter), --on-conflict fail/skip/replace/keep
 │   ├── config/              # environment settings, ByteSize parser, Windows root dir name
 │   ├── docs/                # embedded agent docs topics (cachydb docs, MCP resources)
 │   └── mcp/                 # server.go: handlers, sessions, transports; access.go: tool access;
 │                            # tools.go: tool definitions; users.go: whoami and admin tools;
-│                            # listen.go: ListenConfig; docs.go: instructions, resources
+│                            # listen.go: ListenConfig; docs.go: instructions, resources;
+│                            # errors.go: [code] error prefixes; summary.go: one-line result text
 ├── pkg/db/
 │   ├── engine.go            # Engine, Open/Close, database create/drop
 │   ├── database.go          # Database, collection create/drop/rename/copy
 │   ├── collection.go        # Collection state, CreateIndex/DropIndex, Schema/Indexes, UpdateSchema
 │   ├── document.go          # write path (UpdateWith, Replace, DeleteWith, conditions), read path
+│   ├── batch.go update.go   # Collection.Batch (WAL op 11), UpdateMany/DeleteMany; update operators (inc, push, ...)
+│   ├── stats.go verify.go   # Engine/Database/Collection Stats; offline Verify and RebuildIndex
 │   ├── query.go plan.go     # Find (OR groups, sort, projection), CountDocuments, Distinct; snapshots, plans
 │   ├── unique.go            # unique indexes (striped value locks, pending values)
 │   ├── flush.go             # parallel flusher, index transaction, checkpoint, low-water mark

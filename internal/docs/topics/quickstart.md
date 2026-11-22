@@ -101,12 +101,13 @@ delete_documents {"collection": "products", "query": {"filters": [{"field": "sal
 
 Speed up lookups, ranges, and sorts on a field with an index (`unique`
 also rejects a second document with the same value); inspect the
-collection:
+collection and the sizes of what you can read:
 
 ```json
 create_index {"collection": "products", "index_name": "by_name", "field_name": "name"}
 create_index {"collection": "products", "index_name": "by_sku", "field_name": "sku", "unique": true}
 describe_collection {"collection": "products"}
+server_stats {}
 ```
 
 ## 3. Inspect from the command line
@@ -124,6 +125,7 @@ With the server stopped (utility commands take the data-directory lock):
 cachydb utils list -c -R /path/to/data   # databases, collections, document counts
 cachydb utils find -d shop -c products -R /path/to/data
 cachydb utils export -o backup.jsonl -R /path/to/data
+cachydb utils import -i seed.jsonl --on-conflict keep -R /path/to/data   # seed: create only what is missing
 ```
 
 ## Next

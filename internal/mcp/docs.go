@@ -134,15 +134,15 @@ func Instructions() string {
 	b.WriteString(`cachydb is a document database: databases hold collections, collections hold JSON documents with a string _id.
 
 Workflow:
-1. list_databases; use_database (this session) or pass "database"; else your default, then the server default (current_database).
+1. list_databases; use_database (this session) or pass "database"; else your default, then the server default.
 2. create_collection, optionally with a schema; describe_collection shows schema, indexes, count.
-3. insert_document {"collection", "document"}; _id optional (UUID).
-4. find_documents {"query": {"filters": [{"field": "age", "operator": "gte", "value": 18}], "any": [[...], [...]], "sort": [{"field": "age", "order": "desc"}], "fields": ["name"], "limit": 10}}. No limit: at most 100 docs and 1 MiB by default; if has_more, repeat with "skip": next_skip. Operators: eq ne gt gte lt lte in, contains (case-insensitive substring), has has_any has_all (array elements; indexed), exists, starts_with. Filters AND; "any" groups OR. A missing field matches only exists, not even ne. count_documents and distinct take the same filters.
-5. update_document: "updates" set fields, "unset" removes them, inc/push/add_to_set/pull change them in place, "upsert" creates; replace_document swaps a whole document. "if": [filters] on update/replace/delete writes only if the stored document still matches (compare-and-set; on "condition failed" re-read and retry).
-6. {"$now": true} as a value is the server time (RFC 3339 UTC).
-7. update_schema (checks every document), rename_collection, copy_collection, delete_collection, create_index, drop_index.
+3. insert_document {"collection", "document"} (_id optional); insert_documents takes many.
+4. find_documents {"query": {"filters": [{"field": "age", "operator": "gte", "value": 18}], "any": [[...]], "sort": [{"field": "age", "order": "desc"}], "fields": ["name"], "limit": 10}}. No limit: 100 docs, 1 MiB by default; if has_more, repeat with "skip": next_skip. "explain": true adds the plan. get_document {"collection", "id"} reads one. Operators: eq ne gt gte lt lte in, contains (case-insensitive), starts_with, has has_any has_all (array elements), exists. Fields may be paths (a.b). Filters AND; "any" groups OR. A missing field matches only exists.
+5. update_document: "updates" set, "unset" removes, inc/push/add_to_set/pull change in place, "upsert" creates; replace_document swaps the document. "if": [filters] writes only if the document still matches (on condition_failed re-read and retry). update_documents and delete_documents take a query; each batch call is atomic.
+6. {"$now": true} as a value is the server time.
+7. update_schema, rename_collection, copy_collection, delete_collection, create_index (unique optional), drop_index; server_stats shows sizes.
 
-Results sort by _id unless "sort" is given. Numbers are JSON numbers. Every successful write is durable. With tokens, access is per database (whoami shows yours; "permission denied" names what is missing).
+Errors start with a code such as [not_found] or [permission_denied]. With tokens, access is per database (whoami). Results sort by _id unless "sort" is given. Every successful write is durable.
 
 `)
 	b.WriteString(`Full documentation (read as resources):

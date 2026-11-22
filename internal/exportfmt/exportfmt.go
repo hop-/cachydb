@@ -183,15 +183,30 @@ const (
 	// (validated against the existing documents), and adds missing
 	// indexes.
 	Replace OnConflict = "replace"
+	// Keep seeds: it creates missing databases, collections (with the
+	// file's schema and indexes), and documents, and leaves everything
+	// that exists as it is: an existing collection keeps its schema and
+	// indexes even when they differ from the file, and existing documents
+	// are kept (FR-23).
+	Keep OnConflict = "keep"
 )
 
 // ParseOnConflict parses a conflict mode name.
 func ParseOnConflict(s string) (OnConflict, error) {
 	switch m := OnConflict(s); m {
-	case Fail, Skip, Replace:
+	case Fail, Skip, Replace, Keep:
 		return m, nil
 	}
-	return "", fmt.Errorf("invalid --on-conflict %q: use fail, skip, or replace", s)
+	return "", fmt.Errorf("invalid --on-conflict %q: use fail, skip, replace, or keep", s)
+}
+
+// documentMode is the mode Import applies to documents: Keep keeps an
+// existing document as Skip does.
+func (m OnConflict) documentMode() OnConflict {
+	if m == Keep {
+		return Skip
+	}
+	return m
 }
 
 // ErrDocumentExists is returned by Target.InsertDocument for an existing
@@ -254,7 +269,7 @@ type Stats struct {
 	Collections int // collection lines
 	Inserted    int // documents inserted
 	Replaced    int // documents replaced (Replace mode)
-	Skipped     int // existing documents kept (Skip mode)
+	Skipped     int // existing documents kept (Skip and Keep mode)
 }
 
 // Import reads an export from r and applies it to t: it creates missing
@@ -276,7 +291,7 @@ func Import(ctx context.Context, r io.Reader, t Target, mode OnConflict) (Stats,
 		return st, fmt.Errorf("import line %d (%d lines applied): %w", line, st.Lines, err)
 	}
 	bt, _ := t.(BatchTarget)
-	run := docRun{t: bt, mode: mode, st: &st}
+	run := docRun{t: bt, mode: mode.documentMode(), st: &st}
 	// fail reports err at the current line once the pending document
 	// lines before it are applied, as they would be without batching.
 	fail := func(err error) (Stats, error) {
@@ -321,7 +336,7 @@ func Import(ctx context.Context, r io.Reader, t Target, mode OnConflict) (Stats,
 		case TypeCollection:
 			err = importCollection(ctx, raw, t, mode, &st)
 		case TypeDocument:
-			err = importDocument(ctx, raw, t, mode, &st)
+			err = importDocument(ctx, raw, t, mode.documentMode(), &st)
 		default:
 			err = fmt.Errorf("unknown line type %q", kind.Type)
 		}
@@ -378,6 +393,11 @@ func importCollection(ctx context.Context, raw []byte, t Target, mode OnConflict
 	if err != nil {
 		return fmt.Errorf("%s: %w", where, err)
 	}
+	if exists && mode == Keep {
+		// Seeding leaves an existing collection's definition alone.
+		st.Collections++
+		return nil
+	}
 	if !exists {
 		if err := t.CreateCollection(ctx, l.Database, l.Name, l.Schema); err != nil {
 			return fmt.Errorf("%s: %w", where, err)
@@ -385,7 +405,7 @@ func importCollection(ctx context.Context, raw []byte, t Target, mode OnConflict
 		indexes = nil
 	} else if !sameSchema(schema, l.Schema) {
 		if mode != Replace {
-			return fmt.Errorf("%s exists with a different schema (use --on-conflict replace to update it)", where)
+			return fmt.Errorf("%s exists with a different schema (%s)", where, conflictHint)
 		}
 		if err := t.UpdateSchema(ctx, l.Database, l.Name, l.Schema); err != nil {
 			return fmt.Errorf("%s: updating the schema: %w", where, err)
@@ -400,7 +420,7 @@ func importCollection(ctx context.Context, raw []byte, t Target, mode OnConflict
 		want[ix.Name] = ix
 	}
 	if exists && mode != Replace && !maps.Equal(have, want) {
-		return fmt.Errorf("%s exists with a different index set (use --on-conflict replace to add the missing indexes)", where)
+		return fmt.Errorf("%s exists with a different index set (%s)", where, conflictHint)
 	}
 	for _, ix := range l.Indexes {
 		cur, ok := have[ix.Name]
@@ -419,6 +439,10 @@ func importCollection(ctx context.Context, raw []byte, t Target, mode OnConflict
 	st.Collections++
 	return nil
 }
+
+// conflictHint is the hint of a collection that differs from the file.
+const conflictHint = "use --on-conflict keep to leave existing collections and documents as they are; " +
+	"--on-conflict replace updates the schema and indexes but also overwrites existing documents with the file's copies"
 
 // sameSchema reports whether two schemas are equal (nil = none).
 func sameSchema(a, b *db.Schema) bool {
@@ -483,7 +507,7 @@ func docWhere(id, database, collection string) string {
 
 // existsErr is the error of an existing document in Fail mode.
 func existsErr(where string) error {
-	return fmt.Errorf("%s already exists (use --on-conflict skip or replace)", where)
+	return fmt.Errorf("%s already exists (use --on-conflict skip or keep to keep it; replace overwrites it with the file's copy)", where)
 }
 
 // docRun holds the pending document lines of one collection for a

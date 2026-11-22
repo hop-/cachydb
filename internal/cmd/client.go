@@ -138,7 +138,8 @@ var clientImportCmd = &cobra.Command{
 	Long: `Import a JSON Lines export through the running server, with the same
 rules and --on-conflict modes as "cachydb utils import".`,
 	Example: `  cachydb client import -i kb.jsonl
-  cachydb client import -i kb.jsonl --on-conflict replace`,
+  cachydb client import -i kb.jsonl --on-conflict replace
+  cachydb client import -i seed.jsonl --on-conflict keep`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		mode, err := exportfmt.ParseOnConflict(importOnConflict)
@@ -180,7 +181,7 @@ func init() {
 	clientExportCmd.Flags().StringVarP(&exportCollection, "collection", "c", "", "export only this collection (requires -d)")
 	clientExportCmd.Flags().StringVarP(&exportOutput, "output", "o", "", "write to this file instead of stdout")
 	clientImportCmd.Flags().StringVarP(&importInput, "input", "i", "", "file to import (- for stdin)")
-	clientImportCmd.Flags().StringVar(&importOnConflict, "on-conflict", string(exportfmt.Fail), "existing _id: fail, skip, or replace")
+	clientImportCmd.Flags().StringVar(&importOnConflict, "on-conflict", string(exportfmt.Fail), onConflictUsage)
 	clientCmd.AddCommand(clientToolsCmd, clientCallCmd, clientExportCmd, clientImportCmd)
 	rootCmd.AddCommand(clientCmd)
 }

@@ -41,6 +41,30 @@ const (
 	DefaultMaxResultBytes = 1 << 20 // 1 MiB
 )
 
+// Result text modes (approach-agent-interface §8, FR-20): what the text
+// content of a successful tool result holds. The structured content is
+// always complete.
+const (
+	// ResultTextFull: the text content is the structured content's JSON
+	// (the SDK's fallback; the default, unchanged since v0.0.6).
+	ResultTextFull = "full"
+	// ResultTextSummary: the text content is one summary line, such as
+	// "12 documents, has_more: false".
+	ResultTextSummary = "summary"
+)
+
+// ResultTextModes lists the valid result text modes.
+var ResultTextModes = []string{ResultTextFull, ResultTextSummary}
+
+// ValidateResultText reports an error for a result text mode other than
+// full or summary.
+func ValidateResultText(mode string) error {
+	if !slices.Contains(ResultTextModes, mode) {
+		return fmt.Errorf("invalid result text mode %q: use full or summary", mode)
+	}
+	return nil
+}
+
 // Server is the CachyDB MCP server. Its tool handlers only call methods of
 // the *db.Engine it was given; the engine is owned by the caller, which
 // must close it after Close returns.
@@ -58,6 +82,9 @@ type Server struct {
 	// maxResultBytes caps the JSON size of its documents.
 	defaultLimit   int
 	maxResultBytes int64
+	// summaryText: successful tool results carry a one-line summary as
+	// text content instead of the JSON (ResultTextSummary).
+	summaryText bool
 	// tokensRequired means every /mcp request must carry the token of a
 	// user in users; /healthz never needs one.
 	tokensRequired bool
@@ -128,6 +155,10 @@ type Config struct {
 	// returns, whatever the limit (at least one document is returned); 0
 	// means DefaultMaxResultBytes.
 	MaxResultBytes int64
+	// ResultText is the text content of successful tool results:
+	// ResultTextFull (the JSON; "" means full) or ResultTextSummary (one
+	// line). The structured content is complete in both.
+	ResultText string
 }
 
 // NewServer creates a server without TLS or tokens: New with the given
@@ -168,6 +199,12 @@ func New(ctx context.Context, engine *db.Engine, cfg Config) (*Server, error) {
 	if cfg.DefaultLimit < 0 || cfg.MaxResultBytes < 0 {
 		return nil, fmt.Errorf("creating MCP server: the default limit (%d) and the result byte cap (%d) must not be negative", cfg.DefaultLimit, cfg.MaxResultBytes)
 	}
+	if cfg.ResultText == "" {
+		cfg.ResultText = ResultTextFull
+	}
+	if err := ValidateResultText(cfg.ResultText); err != nil {
+		return nil, fmt.Errorf("creating MCP server: %w", err)
+	}
 	if cfg.DefaultLimit == 0 {
 		cfg.DefaultLimit = DefaultFindLimit
 	}
@@ -193,6 +230,7 @@ func New(ctx context.Context, engine *db.Engine, cfg Config) (*Server, error) {
 		started:        time.Now(),
 		defaultLimit:   cfg.DefaultLimit,
 		maxResultBytes: cfg.MaxResultBytes,
+		summaryText:    cfg.ResultText == ResultTextSummary,
 		tokensRequired: cfg.TokensRequired,
 		users:          cfg.Users,
 		logger:         logger,

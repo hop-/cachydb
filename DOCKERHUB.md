@@ -3,8 +3,8 @@
 A lightweight document database with a built-in
 [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server,
 written in Go. Databases hold collections of JSON documents, with optional
-schemas and hash indexes. Every acknowledged write is fsynced to a
-write-ahead log first, so it survives a crash. AI agents use it through 25
+schemas and indexes. Every acknowledged write is fsynced to a
+write-ahead log first, so it survives a crash. AI agents use it through 26
 MCP tools (create collections, insert, find, update, delete, index), with
 users, tokens, and per-database access when it serves other machines.
 
@@ -97,6 +97,7 @@ Configure the container with environment variables:
 | `CACHE_SIZE` | `64MiB` | Document cache size; `0` disables the cache |
 | `DEFAULT_LIMIT` | `100` | Documents `find_documents` returns at most when a call gives no `limit` |
 | `MAX_RESULT_BYTES` | `1MiB` | Cap on the JSON size of the documents one `find_documents` call returns (at least one is returned) |
+| `RESULT_TEXT` | `full` | Text content of tool results: `full` (the result JSON) or `summary` (one line; the data only in structured content, for clients that give it to the model) |
 
 ```bash
 docker run -d -p 127.0.0.1:8080:8080 -v cachydb-data:/data \
@@ -194,6 +195,25 @@ The service inherits the image's healthcheck. Other services in the same
 Compose project reach it at `http://cachydb:7601/mcp`, without a token
 while `AUTH` is `off`; without that line the container needs a user (see
 Quick start).
+
+## Seeding a database
+
+To load initial data on every start without touching what agents have
+changed since, import a seed file with `--on-conflict keep`, for example
+from a one-shot Compose service that runs after the server is healthy:
+
+```bash
+docker run --rm --network host -v "$PWD/seed.jsonl:/seed.jsonl:ro" \
+  hovhannespalyan/cachydb client import -i /seed.jsonl --on-conflict keep
+```
+
+`keep` creates missing databases, collections (with the file's schema and
+indexes), and documents, and leaves everything that exists as it is, even
+a collection whose schema or indexes have changed; re-running it exits 0.
+`skip` keeps existing documents but fails on a collection that differs
+from the file, and `replace` overwrites existing documents with the
+file's copies. Set `CACHYDB_URL` (default `http://127.0.0.1:7601/mcp`)
+and, when the server requires tokens, `CACHYDB_TOKEN`.
 
 ## MCP client configuration
 

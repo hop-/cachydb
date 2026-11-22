@@ -457,7 +457,9 @@ func writing(title string, destructive, idempotent bool) *mcp.ToolAnnotations {
 
 // newSpec builds a toolSpec for a typed handler that needs access acc.
 // The registered handler is wrapped: Server.authorizeCall resolves the
-// principal and the database and checks acc before the handler runs.
+// principal and the database and checks acc before the handler runs, and
+// in ResultTextSummary mode a successful result's text content is the
+// output's one-line summary (summaryOf).
 func newSpec[In, Out any](
 	name, description string,
 	annotations *mcp.ToolAnnotations,
@@ -485,7 +487,14 @@ func newSpec[In, Out any](
 					var zero Out
 					return nil, zero, err
 				}
-				return h(ctx, req, in)
+				res, out, err := h(ctx, req, in)
+				if err == nil && res == nil && s.summaryText {
+					// The SDK keeps a Content the handler set and still
+					// fills StructuredContent from out (go-sdk v1.8.0
+					// toolForErr), so only the text changes.
+					res = &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: summaryOf(out)}}}
+				}
+				return res, out, err
 			})
 		},
 	}

@@ -19,6 +19,9 @@ engine's job (see [STORAGE.md](STORAGE.md)). Overview:
 | Data directory | `-R` / `--root` flag, or `ROOT_DIR` env var | `~/.cachydb` |
 | Default database | `-d` / `--db` flag, or `DB_NAME` env var | `main` |
 | Bootstrap admin token | `BOOTSTRAP_ADMIN_TOKEN` or `BOOTSTRAP_ADMIN_TOKEN_FILE` env var (no flag) | none |
+| `find_documents` default limit | `--default-limit` flag, or `DEFAULT_LIMIT` env var (> 0) | `100` |
+| `find_documents` result byte cap | `--max-result-bytes` flag, or `MAX_RESULT_BYTES` env var (> 0) | `1MiB` |
+| Result text | `--result-text` flag, or `RESULT_TEXT` env var: `full` or `summary` (anything else is a start-up error) | `full` |
 
 Precedence: flag > environment variable > default.
 
@@ -252,7 +255,9 @@ and `jsonschema` tags; `Operator`, `FieldType`, and `SortOrder` map to
 string enums (`Operators`, `FieldTypes`, `SortOrders`). The SDK validates
 arguments against the input schema, returns the typed output as structured
 content and as JSON text content, and validates it against the output
-schema. Every successful result has `"success": true`. Plan 004 added nine
+schema. With `--result-text summary` (`Config.ResultText` =
+`ResultTextSummary`) the text content of a successful result is one line
+instead (see [Result text](#result-text)). Every successful result has `"success": true`. Plan 004 added nine
 tools and optional parameters; every change is additive (existing calls
 and outputs are unchanged, outputs only gained keys).
 
@@ -477,6 +482,31 @@ for a server admin or the implicit principal (auth off): `version`,
 segment files), and `cache` (`bytes`, `max_bytes`, `entries`, `hits`,
 `misses`; the counters of `pkg/db/internal/cache`, since `Open`).
 `cachydb utils stats` prints the same offline (see [CLI.md](CLI.md)).
+
+### Result text
+
+`Config.ResultText` (`--result-text`/`RESULT_TEXT`, FR-20) chooses the
+text content of a successful tool result; the structured content is the
+same in both modes, and error results are unchanged.
+
+- `full` (default, `ResultTextFull`): the SDK's own fallback. The typed
+  handler returns a nil `*mcp.CallToolResult`, and go-sdk v1.8.0
+  (`toolForErr` in `mcp/server.go`) marshals the output into
+  `StructuredContent` and, because `Content` is nil, adds one
+  `TextContent` with the same JSON. Results are byte-for-byte as before.
+- `summary` (`ResultTextSummary`): `newSpec` wraps every handler; on
+  success it returns a result whose `Content` is one `TextContent` with
+  `summaryOf(out)`. The SDK keeps a non-nil `Content` when the output
+  marshals to a JSON object (all outputs are structs) and still fills
+  `StructuredContent` from the output. Each output type has a
+  `summary()` method in `internal/mcp/summary.go`: counts, names, and
+  ids only (`12 documents, has_more: true, next_skip: 12`), never
+  document data, except that `create_user` and `create_token` keep the
+  new token, which is shown only once.
+
+The default stays `full` because which part each client gives its model
+was not verified for every client. Use `summary` only with a client that
+gives its model the structured content.
 
 ## Self-description
 

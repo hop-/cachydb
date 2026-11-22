@@ -19,12 +19,15 @@ engine (`github.com/hop-/cachydb/pkg/db`) directly.
 - A collection may have an optional **schema** (field types and required
   fields), checked on every write and changeable with `update_schema`.
   See `cachydb docs schema`.
-- A collection may have **hash indexes** on top-level fields; array
-  fields are indexed per element. `eq`, `has`, `has_any`, and `has_all`
-  filters use them. See `cachydb docs query`.
+- A collection may have **indexes** (optionally unique) on fields or
+  dotted paths; array fields are indexed per element. Equality, `in`,
+  ranges, `starts_with`, `exists`, array matching, and sorts use them;
+  `explain` shows the plan. See `cachydb docs query`.
 - Queries support AND filters, OR groups (`any`), substring search
-  (`contains`), array-element matching, sorting by any field, projection,
-  `count_documents`, and `distinct`.
+  (`contains`), array-element matching, nested paths (`meta.author`),
+  sorting by any field, projection, `count_documents`, and `distinct`.
+  `find_documents` returns at most 100 documents by default and pages
+  with `has_more` / `next_skip`.
 - Names of databases, collections, and indexes must match
   `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.
 - The server has a default database (`main` unless `-d/--db` says

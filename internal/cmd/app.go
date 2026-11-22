@@ -109,6 +109,12 @@ func setAllFlagsToCmd(cmd *cobra.Command) {
 		"max-result-bytes",
 		"cap on the JSON size of the documents one find_documents call returns, e.g. 1MiB; at least one document is returned (env MAX_RESULT_BYTES)",
 	)
+	cmd.Flags().StringVar(
+		&generalResultText,
+		"result-text",
+		c.ResultText,
+		"text content of tool results: full (the JSON, as in structured content) or summary (one line; the data only in structured content) (env RESULT_TEXT)",
+	)
 	setEngineFlags(cmd.Flags())
 }
 
@@ -146,6 +152,9 @@ func runApp(cmd *cobra.Command, _ []string) error {
 	if err := validateResultLimits(generalDefaultLimit, generalMaxResultBytes); err != nil {
 		return err
 	}
+	if err := mcpserver.ValidateResultText(generalResultText); err != nil {
+		return fmt.Errorf("--result-text: %w", err)
+	}
 	ctx := cmd.Context()
 	c := config.GetConfig()
 	bootstrap, err := app.BootstrapToken(c.BootstrapAdminToken, c.BootstrapAdminTokenFile)
@@ -165,6 +174,7 @@ func runApp(cmd *cobra.Command, _ []string) error {
 		WithAuth(generalAuth).
 		WithBootstrapAdminToken(bootstrap).
 		WithResultLimits(generalDefaultLimit, int64(generalMaxResultBytes)).
+		WithResultText(generalResultText).
 		WithVersion(getVersion()).
 		Build(ctx)
 	if err != nil {

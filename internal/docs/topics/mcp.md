@@ -289,10 +289,20 @@ Every tool error starts with a stable code in brackets, for example
 fail the input schema come back as `validating "arguments": …` without a
 code. `cachydb docs errors` lists every code and what to do.
 
+## Result text
+
+A successful result carries its data as structured content and, by
+default, the same JSON again as text content. A server started with
+`--result-text summary` (`RESULT_TEXT=summary`) sends one line of text
+instead, such as `12 documents, has_more: false`; the structured content
+is unchanged. If you only see such a line, read the structured content
+or ask for the server to run with `full`. See `cachydb docs config`.
+
 ## Self-description
 
 - `tools/list` returns typed input and output JSON Schemas, with enums for
-  query operators (including `contains`, `has`, `has_any`, `has_all`),
+  query operators (including `contains`, `has`, `has_any`, `has_all`,
+  `exists`, `starts_with`),
   sort orders, and schema field types, plus read-only, destructive, and
   idempotent annotations.
 - The `initialize` result carries short usage instructions.

@@ -200,7 +200,7 @@ Heavy layers, opt-in (all run nightly in CI; details and commands in
 
 | Layer | Where | Run | Knobs |
 | --- | --- | --- | --- |
-| Fuzzing | `fuzz_test.go` in `pkg/db`, `pkg/db/internal/{wal,segment}`, `internal/exportfmt` (9 targets) | `go test -run '^$' -fuzz '^FuzzX$' -fuzztime 30s ./<pkg>` | `-fuzztime`; crashers go to `testdata/fuzz/<Target>/` and are committed |
+| Fuzzing | `fuzz_test.go` in `pkg/db`, `pkg/db/internal/{wal,segment,idxstore}`, `internal/exportfmt` (13 targets) | `go test -run '^$' -fuzz '^FuzzX$' -fuzztime 30s ./<pkg>` | `-fuzztime`; crashers go to `testdata/fuzz/<Target>/` and are committed |
 | Model test | `pkg/db/model_test.go` (`TestModel`) | `go test -run TestModel ./pkg/db/` (2 seeds × 300 ops by default) | `CACHYDB_MODEL_SEEDS`, `CACHYDB_MODEL_OPS`, `CACHYDB_MODEL_SEED` (reproduce) |
 | Upgrade fixtures | `pkg/db/testdata/compat/<version>/`, `pkg/db/compat_test.go`, generator `test/compat/gen` | part of `go test ./...` | none; one fixture per release |
 | Kill test | `test/e2e/kill_test.go` (build tag `e2e`) | `TMPDIR=$HOME/.cache/cachydb-e2e go test -tags e2e -run TestKill ./test/e2e/` (real disk) | `CACHYDB_E2E_ROUNDS` (default 10), `CACHYDB_E2E_ARTIFACTS` |
@@ -547,6 +547,7 @@ tag). Keep `DOCKERHUB.md` under 25,000 bytes (Docker Hub's limit).
 | `github.com/klauspost/compress` | v1.20.4 | zstd for data segments |
 | `go.etcd.io/bbolt` | v1.5.0 | B+tree file `index.db` (key table and indexes); imported only by `pkg/db/internal/idxstore`, pulls in only `golang.org/x/sys` |
 | `github.com/spf13/cobra` | v1.10.2 | CLI framework |
+| `github.com/spf13/pflag` | v1.1.0 | Flag sets and custom flag values (`config.ByteSize` implements `pflag.Value`); cobra's flag package |
 
 Document ids come from the standard `uuid` package (UUID v7) and the
 environment configuration from `os.Getenv`; neither needs a module.
@@ -612,3 +613,13 @@ environment configuration from `os.Getenv`; neither needs a module.
     when the WAL no longer holds the changes). A fix in `Open` (check that
     the collection's checkpoint + 1 is still in the WAL before deleting or
     truncating, otherwise rebuild) is an open follow-up.
+14. Tool results carry their data twice by default (structured content
+    and the same JSON as text, `--result-text full`). `summary` sends a
+    one-line text instead, so a client that shows its model only the text
+    content loses the data; which part each client uses is not verified
+    for every client.
+15. `import --on-conflict replace` through `cachydb client` replaces
+    existing documents one `replace_document` call each, so a failing
+    replace leaves the run's inserts and earlier replaces applied.
+    `--on-conflict keep` still fails on a missing document that an
+    existing collection's (newer) schema rejects.

@@ -20,7 +20,7 @@ The suite covers:
   - compaction, the metadata checkpoint, and the query and index
     semantics;
   - conditional writes and schema operations (update, rename, copy).
-- **The MCP server:** all 25 tools, per-session `use_database`, an
+- **The MCP server:** all 26 tools (33 with tokens: `whoami` and the user tools), per-session `use_database`, an
   end-to-end tool flow, and the docs resources.
 - **The CLI:** `docs`, `healthcheck`, `utils` (including export/import
   round trips, and `verify` on healthy and damaged directories), and
@@ -91,9 +91,10 @@ decoder of disk or input data:
 
 | Package | Targets |
 | --- | --- |
-| `pkg/db/internal/wal` | `FuzzWALRecordDecode`, `FuzzWALSegmentRead` |
+| `pkg/db/internal/wal` | `FuzzWALRecordDecode`, `FuzzWALSegmentRead`, `FuzzBatchPayload` |
 | `pkg/db/internal/segment` | `FuzzSegmentRecordDecode`, `FuzzSegmentScan` |
-| `pkg/db` | `FuzzMetaRead`, `FuzzDecodeDocument`, `FuzzCompare`, `FuzzMatchFilter` |
+| `pkg/db/internal/idxstore` | `FuzzIndexKey`, `FuzzIndexKeyDecode` |
+| `pkg/db` | `FuzzMetaRead`, `FuzzDecodeDocument`, `FuzzCompare`, `FuzzMatchFilter`, `FuzzFieldPath` |
 | `internal/exportfmt` | `FuzzImportJSONL` |
 
 They check that garbage never panics and is rejected with the right
@@ -273,7 +274,7 @@ This will:
 
 - Start an interactive web UI
 - Connect to your server
-- Let you see all 25 tools
+- Let you see all 26 tools
 - Call tools with arguments
 - View responses in real-time
 

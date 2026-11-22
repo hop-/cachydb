@@ -33,6 +33,7 @@ cachydb app [flags]
 | `--cache-size` | | `64MiB` (or `CACHE_SIZE`) | Document cache size; `0` = cache disabled |
 | `--default-limit` | | `100` (or `DEFAULT_LIMIT`) | Documents `find_documents` returns at most when a call gives no `limit`; must be > 0 (server only) |
 | `--max-result-bytes` | | `1MiB` (or `MAX_RESULT_BYTES`) | Cap on the JSON size of one `find_documents` result's documents, at least one document returned; must be > 0 (server only) |
+| `--result-text` | | `full` (or `RESULT_TEXT`) | Text content of successful tool results: `full` (the JSON) or `summary` (one line; data only in structured content); any other value fails (server only) |
 
 The server takes the data-directory lock; a second server (or a `utils`
 command) on the same directory fails with *"data directory is in use by
@@ -236,7 +237,7 @@ step. Downgrades fail. No migrations are registered in this build.
 
 ```
 cachydb utils export [-d DB [-c COLL]] [-o FILE]
-cachydb utils import -i FILE|- [--on-conflict fail|skip|replace]
+cachydb utils import -i FILE|- [--on-conflict fail|skip|replace|keep]
 ```
 
 JSON Lines in the format of `internal/exportfmt` (header with `version`
@@ -247,11 +248,18 @@ unique ones as unique: the export's index lines carry `unique`, and
 `client export`/`client import` read and pass it through
 `describe_collection` and `create_index`);
 `fail` (default) stops at the first existing `_id` and reports how many
-lines were applied, `skip` keeps existing documents, `replace` replaces
-them and also updates a differing schema (via `UpdateSchema`) and adds
-missing indexes (an index of the same name whose field or uniqueness
-differs is dropped and re-created). With `fail`/`skip` a collection whose
-schema or index set (names, fields, and uniqueness) differs is an error. Offline import writes the document lines of a
+lines were applied, `skip` keeps existing documents, `replace` overwrites
+them with the file's copies and also updates a differing schema (via
+`UpdateSchema`) and adds missing indexes (an index of the same name whose
+field or uniqueness differs is dropped and re-created). With `fail`/`skip`
+a collection whose schema or index set (names, fields, and uniqueness)
+differs is an error, and its hint names `keep` and warns that `replace`
+overwrites documents. `keep` (seeding, FR-23; `exportfmt.Keep`) creates
+only what is missing: an existing collection's line is accepted without
+comparing its schema and indexes, which stay as they are, and
+documents use `skip` semantics (`OnConflict.documentMode`), so existing
+ones are kept and missing ones inserted; re-running a seed exits 0. A
+missing document that the existing schema rejects still fails. Offline import writes the document lines of a
 collection in atomic batches of up to 1,000 documents or 4 MiB of lines
 (`exportfmt.BatchTarget`, one WAL fsync each); a batch that fails is
 applied not at all, so the reported count of applied lines leaves out
@@ -386,6 +394,7 @@ status 1 and an error that names the variable.
 | `CACHE_SIZE` | `64MiB` | `--cache-size` |
 | `DEFAULT_LIMIT` | `100` | `--default-limit` (server only) |
 | `MAX_RESULT_BYTES` | `1MiB` | `--max-result-bytes` (server only) |
+| `RESULT_TEXT` | `full` | `--result-text` (server only) |
 | `CACHYDB_URL` | `http://127.0.0.1:7601/mcp` | `cachydb client --url` (read by `client` only) |
 | `CACHYDB_TOKEN` | none | `cachydb client --token` (read by `client` only) |
 | `BOOTSTRAP_ADMIN_TOKEN` | none | none (a secret; env only) |

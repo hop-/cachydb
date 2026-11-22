@@ -28,4 +28,5 @@ var (
 	generalCacheSize        config.ByteSize
 	generalDefaultLimit     int
 	generalMaxResultBytes   config.ByteSize
+	generalResultText       string
 )

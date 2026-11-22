@@ -32,8 +32,9 @@ type Builder struct {
 	cacheSizeSet     bool
 	cacheSize        int64
 
-	defaultLimit   int   // find_documents default limit; 0 = the server default
-	maxResultBytes int64 // find_documents result byte cap; 0 = the server default
+	defaultLimit   int    // find_documents default limit; 0 = the server default
+	maxResultBytes int64  // find_documents result byte cap; 0 = the server default
+	resultText     string // tool result text content mode; "" = full
 }
 
 func NewBuilder() *Builder {
@@ -151,6 +152,14 @@ func (b *Builder) WithResultLimits(defaultLimit int, maxResultBytes int64) *Buil
 	return b
 }
 
+// WithResultText sets the text content of successful tool results:
+// mcpserver.ResultTextFull (the JSON; also "") or ResultTextSummary (one
+// line). Build rejects any other value.
+func (b *Builder) WithResultText(mode string) *Builder {
+	b.resultText = mode
+	return b
+}
+
 // EngineOptions returns the db.Options the builder opens the engine with.
 func (b *Builder) EngineOptions() db.Options {
 	logger := b.logger
@@ -202,6 +211,11 @@ func (b *Builder) Build(ctx context.Context) (_ *App, err error) {
 	if b.maxResultBytes < 0 {
 		return nil, fmt.Errorf("MAX_RESULT_BYTES (--max-result-bytes): %d must be greater than 0", b.maxResultBytes)
 	}
+	if b.resultText != "" {
+		if err := mcpserver.ValidateResultText(b.resultText); err != nil {
+			return nil, fmt.Errorf("RESULT_TEXT (--result-text): %w", err)
+		}
+	}
 	if b.bootstrapToken != "" {
 		if err := auth.ValidateBootstrapToken(b.bootstrapToken); err != nil {
 			return nil, fmt.Errorf("BOOTSTRAP_ADMIN_TOKEN: %w", err)
@@ -244,6 +258,7 @@ func (b *Builder) Build(ctx context.Context) (_ *App, err error) {
 		Logger:          opts.Logger,
 		DefaultLimit:    b.defaultLimit,
 		MaxResultBytes:  b.maxResultBytes,
+		ResultText:      b.resultText,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create MCP server: %w", err)
