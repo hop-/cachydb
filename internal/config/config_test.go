@@ -182,7 +182,8 @@ func TestInitServerSettings(t *testing.T) {
 }
 
 // envKeys are the environment variables Init reads.
-var envKeys = []string{"PORT", "ROOT_DIR", "DB_NAME", "TRANSPORT", "WAL_RETENTION_AGE", "WAL_RETENTION_SIZE", "CACHE_SIZE"}
+var envKeys = []string{"PORT", "ROOT_DIR", "DB_NAME", "TRANSPORT", "WAL_RETENTION_AGE", "WAL_RETENTION_SIZE", "CACHE_SIZE",
+	"HOST", "AUTH", "TLS_CERT", "TLS_KEY", "BOOTSTRAP_ADMIN_TOKEN", "BOOTSTRAP_ADMIN_TOKEN_FILE"}
 
 // setEnv gives the test exactly env out of envKeys (the others are unset)
 // and reloads the configuration from the real environment afterwards.
@@ -353,4 +354,45 @@ func TestInitReadsOnlyDocumentedVariables(t *testing.T) {
 	if c.RootDirName != name {
 		t.Errorf("RootDirName = %q, want %q", c.RootDirName, name)
 	}
+}
+
+// TestInitAuthEnv: the listener and authentication settings come from
+// HOST, AUTH, TLS_CERT, TLS_KEY, BOOTSTRAP_ADMIN_TOKEN, and
+// BOOTSTRAP_ADMIN_TOKEN_FILE; the defaults are 127.0.0.1, auto, and none.
+// Values are taken as given (validation is the server's job).
+func TestInitAuthEnv(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		setEnv(t, nil)
+		if err := Init(); err != nil {
+			t.Fatal(err)
+		}
+		c := GetConfig()
+		if c.Host != "127.0.0.1" || c.Auth != "auto" || c.TLSCert != "" || c.TLSKey != "" ||
+			c.BootstrapAdminToken != "" || c.BootstrapAdminTokenFile != "" {
+			t.Fatalf("defaults = %+v", c)
+		}
+	})
+	t.Run("from env", func(t *testing.T) {
+		setEnv(t, map[string]string{
+			"HOST": "0.0.0.0", "AUTH": "required", "TLS_CERT": "/c.pem", "TLS_KEY": "/k.pem",
+			"BOOTSTRAP_ADMIN_TOKEN": "tok", "BOOTSTRAP_ADMIN_TOKEN_FILE": "/run/secrets/t",
+		})
+		if err := Init(); err != nil {
+			t.Fatal(err)
+		}
+		c := GetConfig()
+		if c.Host != "0.0.0.0" || c.Auth != "required" || c.TLSCert != "/c.pem" || c.TLSKey != "/k.pem" ||
+			c.BootstrapAdminToken != "tok" || c.BootstrapAdminTokenFile != "/run/secrets/t" {
+			t.Fatalf("from env = %+v", c)
+		}
+	})
+	t.Run("empty means unset", func(t *testing.T) {
+		setEnv(t, map[string]string{"HOST": "", "AUTH": ""})
+		if err := Init(); err != nil {
+			t.Fatal(err)
+		}
+		if c := GetConfig(); c.Host != "127.0.0.1" || c.Auth != "auto" {
+			t.Fatalf("empty values: host %q auth %q", c.Host, c.Auth)
+		}
+	})
 }

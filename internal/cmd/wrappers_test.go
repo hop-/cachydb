@@ -33,8 +33,14 @@ func saveGlobals(t *testing.T) {
 	eDB, eColl, eOut, iIn, iMode := exportDatabase, exportCollection, exportOutput, importInput, importOnConflict
 	fDB, fColl, fQuery, fFormat, gID := findDatabase, findCollection, findQuery, findFormat, getID
 	cURL, cFormat := clientURLFlag, clientToolsFormat
+	host, authMode, tlsCert, tlsKey := generalHost, generalAuth, generalTLSCert, generalTLSKey
+	hTLSCert, hTLSKey := healthcheckTLSCert, healthcheckTLSKey
+	uAdmin, uDefDB, uFormat, uLabel, cToken := userAddAdmin, userAddDefaultDB, userListFormat, userTokenLabel, clientTokenFlag
 	cfgErr := configErr
 	t.Cleanup(func() {
+		generalHost, generalAuth, generalTLSCert, generalTLSKey = host, authMode, tlsCert, tlsKey
+		healthcheckTLSCert, healthcheckTLSKey = hTLSCert, hTLSKey
+		userAddAdmin, userAddDefaultDB, userListFormat, userTokenLabel, clientTokenFlag = uAdmin, uDefDB, uFormat, uLabel, cToken
 		exportDatabase, exportCollection, exportOutput, importInput, importOnConflict = eDB, eColl, eOut, iIn, iMode
 		findDatabase, findCollection, findQuery, findFormat, getID = fDB, fColl, fQuery, fFormat, gID
 		clientURLFlag, clientToolsFormat = cURL, cFormat
