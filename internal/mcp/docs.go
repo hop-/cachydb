@@ -137,7 +137,7 @@ Workflow:
 1. list_databases; use_database (this session) or pass "database"; else your default, then the server default (current_database).
 2. create_collection, optionally with a schema; describe_collection shows schema, indexes, count.
 3. insert_document {"collection", "document"}; _id optional (UUID).
-4. find_documents {"query": {"filters": [{"field": "age", "operator": "gte", "value": 18}], "any": [[...], [...]], "sort": [{"field": "age", "order": "desc"}], "fields": ["name"], "limit": 10}}. Operators: eq ne gt gte lt lte in, contains (case-insensitive substring), has has_any has_all (array elements; indexed). Filters AND; "any" groups OR. A missing field matches nothing, not even ne. count_documents and distinct take the same filters.
+4. find_documents {"query": {"filters": [{"field": "age", "operator": "gte", "value": 18}], "any": [[...], [...]], "sort": [{"field": "age", "order": "desc"}], "fields": ["name"], "limit": 10}}. No limit: at most 100 docs and 1 MiB by default; if has_more, repeat with "skip": next_skip. Operators: eq ne gt gte lt lte in, contains (case-insensitive substring), has has_any has_all (array elements; indexed). Filters AND; "any" groups OR. A missing field matches nothing, not even ne. count_documents and distinct take the same filters.
 5. update_document: "updates" set fields, "unset" removes them, "upsert" creates; replace_document swaps a whole document. "if": [filters] on update/replace/delete writes only if the stored document still matches (compare-and-set; on "condition failed" re-read and retry).
 6. {"$now": true} as a value is the server time (RFC 3339 UTC).
 7. update_schema (checks every document), rename_collection, copy_collection, delete_collection, create_index, drop_index.

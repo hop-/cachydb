@@ -62,6 +62,14 @@ find_documents {"collection": "products", "query": {"filters": [{"field": "name"
 count_documents {"collection": "products"}
 ```
 
+One call returns at most 100 documents (and 1 MiB) unless you pass a
+`limit` or the server is configured otherwise. When the result has
+`"has_more": true`, repeat the call with `"skip"` set to its `next_skip`:
+
+```json
+find_documents {"collection": "products", "query": {"skip": 100}}
+```
+
 Update merges top-level fields (`unset` removes some; `{"$now": true}` is
 the server time); `if` makes it conditional; delete removes a document:
 

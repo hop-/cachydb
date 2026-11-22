@@ -99,8 +99,8 @@ type Query struct {
 	Any     [][]Filter `json:"any,omitempty" jsonschema:"OR groups: when set, a document must also match every filter of at least one group"`
 	Fields  []string   `json:"fields,omitempty" jsonschema:"Top-level fields to return (projection); _id is always returned; omit for whole documents"`
 	Sort    []SortKey  `json:"sort,omitempty" jsonschema:"Sort keys in order, then _id ascending; omit to sort by _id. Sorting by other fields reads every match"`
-	Limit   int        `json:"limit,omitempty" jsonschema:"Maximum number of documents to return; 0 or omitted means no limit"`
-	Skip    int        `json:"skip,omitempty" jsonschema:"Number of matching documents to skip, after sorting"`
+	Limit   int        `json:"limit,omitempty" jsonschema:"Maximum number of documents to return; 0 or omitted means the server's default limit (100 unless configured). A result byte cap (1 MiB unless configured) also applies; has_more says whether more match"`
+	Skip    int        `json:"skip,omitempty" jsonschema:"Number of matching documents to skip, after sorting; to page, set it to the previous result's next_skip"`
 }
 
 // MatchQuery is the query of count_documents and distinct: filters and OR
@@ -113,7 +113,7 @@ type MatchQuery struct {
 type FindDocumentsInput struct {
 	Database   string `json:"database,omitempty" jsonschema:"Database name; defaults to the session's use_database choice, then the user's default database, then the server default"`
 	Collection string `json:"collection" jsonschema:"Collection name"`
-	Query      *Query `json:"query,omitempty" jsonschema:"Filters, OR groups, projection, sort, limit, and skip; omit to return every document"`
+	Query      *Query `json:"query,omitempty" jsonschema:"Filters, OR groups, projection, sort, limit, and skip; omit to match every document (returned a page at a time, see has_more)"`
 }
 
 type UpdateDocumentInput struct {
@@ -236,6 +236,8 @@ type FindDocumentsOutput struct {
 	Success   bool             `json:"success" jsonschema:"Always true on success"`
 	Count     int              `json:"count" jsonschema:"Number of documents returned"`
 	Documents []map[string]any `json:"documents" jsonschema:"Matching documents in sort order (by default by _id), each a flat object with its _id"`
+	HasMore   bool             `json:"has_more" jsonschema:"True if more documents match after these (the limit, the default limit, or the result byte cap ended the page)"`
+	NextSkip  int              `json:"next_skip,omitempty" jsonschema:"Set when has_more is true: repeat the call with query.skip set to this value for the next page"`
 }
 
 type UpdateDocumentOutput struct {
@@ -421,7 +423,7 @@ func toolSpecs() []toolSpec {
 				return s.insertDocumentTool
 			}),
 		newSpec("find_documents",
-			"Find the documents of a collection matching every filter in query.filters (and, if given, at least one group of query.any), with optional sort, projection (fields), skip, and limit; sorted by _id by default. Operators include contains (case-insensitive substring) and has / has_any / has_all (array elements). Comparison is type-aware and a document missing the field matches no operator, not even ne. See resource cachydb://docs/query.",
+			"Find the documents of a collection matching every filter in query.filters (and, if given, at least one group of query.any), with optional sort, projection (fields), skip, and limit; sorted by _id by default. Returns at most the default limit (100) and 1 MiB unless configured; when has_more is true, call again with query.skip = next_skip. Operators include contains (case-insensitive substring) and has / has_any / has_all (array elements). Comparison is type-aware and a document missing the field matches no operator, not even ne. See resource cachydb://docs/query.",
 			readOnly("Find documents"), accessRead,
 			map[string]any{"collection": "products", "query": map[string]any{
 				"filters": []any{map[string]any{"field": "price", "operator": "lt", "value": 10}},

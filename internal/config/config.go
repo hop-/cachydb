@@ -49,6 +49,13 @@ type Config struct {
 	WALRetentionSize ByteSize
 	// CacheSize bounds the document cache; 0 disables it (env CACHE_SIZE).
 	CacheSize ByteSize
+
+	// DefaultLimit is the number of documents find_documents returns at
+	// most when the call gives no limit (env DEFAULT_LIMIT); positive.
+	DefaultLimit int
+	// MaxResultBytes caps the JSON size of the documents one
+	// find_documents call returns (env MAX_RESULT_BYTES); positive.
+	MaxResultBytes ByteSize
 }
 
 // defaults returns the configuration of an empty environment. RootDir is
@@ -64,6 +71,8 @@ func defaults() Config {
 		WALRetentionAge:  24 * time.Hour,
 		WALRetentionSize: GiB,
 		CacheSize:        64 * MiB,
+		DefaultLimit:     100,
+		MaxResultBytes:   MiB,
 	}
 }
 
@@ -97,6 +106,8 @@ func Init() error {
 		fromEnv("WAL_RETENTION_AGE", &cfg.WALRetentionAge, time.ParseDuration),
 		fromEnv("WAL_RETENTION_SIZE", &cfg.WALRetentionSize, ParseByteSize),
 		fromEnv("CACHE_SIZE", &cfg.CacheSize, ParseByteSize),
+		fromEnv("DEFAULT_LIMIT", &cfg.DefaultLimit, ParsePositiveInt),
+		fromEnv("MAX_RESULT_BYTES", &cfg.MaxResultBytes, ParsePositiveByteSize),
 	)
 	if err != nil {
 		err = fmt.Errorf("loading configuration from the environment: %w", err)
@@ -129,6 +140,31 @@ func fromEnv[T any](name string, dst *T, parse func(string) (T, error)) error {
 	}
 	*dst = v
 	return nil
+}
+
+// ParsePositiveInt parses a decimal integer greater than zero.
+func ParsePositiveInt(s string) (int, error) {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, err
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("%d: must be greater than 0", n)
+	}
+	return n, nil
+}
+
+// ParsePositiveByteSize parses a size (see ParseByteSize) greater than
+// zero.
+func ParsePositiveByteSize(s string) (ByteSize, error) {
+	n, err := ParseByteSize(s)
+	if err != nil {
+		return 0, err
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("invalid size %q: must be greater than 0", s)
+	}
+	return n, nil
 }
 
 // asIs is the parser of a string setting.

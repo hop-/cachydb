@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -32,6 +33,13 @@ const httpSessionTimeout = 30 * time.Minute
 // context is cancelled.
 const httpShutdownTimeout = 5 * time.Second
 
+// Result bounds of find_documents (approach-agent-interface §2): the
+// defaults of Config.DefaultLimit and Config.MaxResultBytes.
+const (
+	DefaultFindLimit      = 100
+	DefaultMaxResultBytes = 1 << 20 // 1 MiB
+)
+
 // Server is the CachyDB MCP server. Its tool handlers only call methods of
 // the *db.Engine it was given; the engine is owned by the caller, which
 // must close it after Close returns.
@@ -44,6 +52,10 @@ type Server struct {
 	tlsCert       string // PEM files; both set = HTTPS
 	tlsKey        string
 	version       string // build version, reported by /healthz
+	// defaultLimit is the find_documents limit when the call gives none;
+	// maxResultBytes caps the JSON size of its documents.
+	defaultLimit   int
+	maxResultBytes int64
 	// tokensRequired means every /mcp request must carry the token of a
 	// user in users; /healthz never needs one.
 	tokensRequired bool
@@ -107,6 +119,13 @@ type Config struct {
 	// Logger receives failed authentications (INFO); nil means
 	// slog.Default().
 	Logger *slog.Logger
+	// DefaultLimit is the number of documents find_documents returns at
+	// most when the call gives no limit (or 0); 0 means DefaultFindLimit.
+	DefaultLimit int
+	// MaxResultBytes caps the JSON size of the documents find_documents
+	// returns, whatever the limit (at least one document is returned); 0
+	// means DefaultMaxResultBytes.
+	MaxResultBytes int64
 }
 
 // NewServer creates a server without TLS or tokens: New with the given
@@ -144,6 +163,15 @@ func New(ctx context.Context, engine *db.Engine, cfg Config) (*Server, error) {
 	if cfg.TokensRequired && cfg.Users == nil {
 		return nil, errors.New("creating MCP server: tokens are required but there is no auth store")
 	}
+	if cfg.DefaultLimit < 0 || cfg.MaxResultBytes < 0 {
+		return nil, fmt.Errorf("creating MCP server: the default limit (%d) and the result byte cap (%d) must not be negative", cfg.DefaultLimit, cfg.MaxResultBytes)
+	}
+	if cfg.DefaultLimit == 0 {
+		cfg.DefaultLimit = DefaultFindLimit
+	}
+	if cfg.MaxResultBytes == 0 {
+		cfg.MaxResultBytes = DefaultMaxResultBytes
+	}
 	if _, err := engine.CreateDatabase(ctx, cfg.DefaultDatabase); err != nil {
 		return nil, fmt.Errorf("creating default database %q: %w", cfg.DefaultDatabase, err)
 	}
@@ -160,6 +188,8 @@ func New(ctx context.Context, engine *db.Engine, cfg Config) (*Server, error) {
 		tlsCert:        cfg.Listen.TLSCert,
 		tlsKey:         cfg.Listen.TLSKey,
 		version:        cfg.Version,
+		defaultLimit:   cfg.DefaultLimit,
+		maxResultBytes: cfg.MaxResultBytes,
 		tokensRequired: cfg.TokensRequired,
 		users:          cfg.Users,
 		logger:         logger,
@@ -784,16 +814,57 @@ func (s *Server) findDocumentsTool(ctx context.Context, req *mcp.CallToolRequest
 	if err != nil {
 		return nil, FindDocumentsOutput{}, err
 	}
-	docs, err := coll.Find(ctx, toDBQuery(in.Query))
+	q := toDBQuery(in.Query)
+	limit := q.Limit
+	if limit <= 0 {
+		limit = s.defaultLimit
+	}
+	// Ask for one document more than the limit, to know whether more
+	// match (has_more) without counting them.
+	q.Limit = limit
+	if limit < math.MaxInt {
+		q.Limit = limit + 1
+	}
+	var (
+		out     = make([]map[string]any, 0)
+		size    = int64(len("[]")) // the JSON size of out
+		hasMore bool
+		encErr  error
+	)
+	err = coll.Iterate(ctx, q, func(doc *db.Document) bool {
+		if len(out) == limit {
+			hasMore = true
+			return false
+		}
+		m := docMap(doc)
+		data, err := json.Marshal(m)
+		if err != nil {
+			encErr = err
+			return false
+		}
+		n := int64(len(data))
+		if len(out) > 0 {
+			n++ // the comma before it
+		}
+		if len(out) > 0 && size+n > s.maxResultBytes {
+			hasMore = true
+			return false
+		}
+		out = append(out, m)
+		size += n
+		return true
+	})
+	if err == nil {
+		err = encErr
+	}
 	if err != nil {
 		return nil, FindDocumentsOutput{}, toolError("find documents", err)
 	}
-
-	out := make([]map[string]any, len(docs))
-	for i, doc := range docs {
-		out[i] = docMap(doc)
+	res := FindDocumentsOutput{Success: true, Count: len(out), Documents: out, HasMore: hasMore}
+	if hasMore {
+		res.NextSkip = max(q.Skip, 0) + len(out)
 	}
-	return nil, FindDocumentsOutput{Success: true, Count: len(docs), Documents: out}, nil
+	return nil, res, nil
 }
 
 func (s *Server) countDocumentsTool(ctx context.Context, req *mcp.CallToolRequest, in CountDocumentsInput) (*mcp.CallToolResult, CountDocumentsOutput, error) {

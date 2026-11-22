@@ -31,6 +31,9 @@ type Builder struct {
 	walRetentionSize int64
 	cacheSizeSet     bool
 	cacheSize        int64
+
+	defaultLimit   int   // find_documents default limit; 0 = the server default
+	maxResultBytes int64 // find_documents result byte cap; 0 = the server default
 }
 
 func NewBuilder() *Builder {
@@ -137,6 +140,17 @@ func (b *Builder) WithCacheSize(n int64) *Builder {
 	return b
 }
 
+// WithResultLimits sets the find_documents bounds: the number of
+// documents returned when a call gives no limit, and the cap on the JSON
+// size of the documents returned. Zero keeps the server default
+// (mcpserver.DefaultFindLimit, mcpserver.DefaultMaxResultBytes); Build
+// rejects a negative value.
+func (b *Builder) WithResultLimits(defaultLimit int, maxResultBytes int64) *Builder {
+	b.defaultLimit = defaultLimit
+	b.maxResultBytes = maxResultBytes
+	return b
+}
+
 // EngineOptions returns the db.Options the builder opens the engine with.
 func (b *Builder) EngineOptions() db.Options {
 	logger := b.logger
@@ -182,6 +196,12 @@ func (b *Builder) Build(ctx context.Context) (_ *App, err error) {
 	if err := b.listen.Validate(); err != nil {
 		return nil, err
 	}
+	if b.defaultLimit < 0 {
+		return nil, fmt.Errorf("DEFAULT_LIMIT (--default-limit): %d must be greater than 0", b.defaultLimit)
+	}
+	if b.maxResultBytes < 0 {
+		return nil, fmt.Errorf("MAX_RESULT_BYTES (--max-result-bytes): %d must be greater than 0", b.maxResultBytes)
+	}
 	if b.bootstrapToken != "" {
 		if err := auth.ValidateBootstrapToken(b.bootstrapToken); err != nil {
 			return nil, fmt.Errorf("BOOTSTRAP_ADMIN_TOKEN: %w", err)
@@ -222,6 +242,8 @@ func (b *Builder) Build(ctx context.Context) (_ *App, err error) {
 		TokensRequired:  decision.TokensRequired,
 		Users:           users,
 		Logger:          opts.Logger,
+		DefaultLimit:    b.defaultLimit,
+		MaxResultBytes:  b.maxResultBytes,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create MCP server: %w", err)

@@ -93,6 +93,7 @@ on-disk format versions this build reads and writes.
 | `Get(ctx, id) (*Document, error)` | Deep copy; `ErrNotFound` |
 | `Find(ctx, *Query) ([]*Document, error)` | See [Queries](#queries) |
 | `FindWithPlan(ctx, *Query) ([]*Document, QueryPlan, error)` | `Find` plus the plan it ran: driver, index, whether the order was provided, examined and returned counts (for `explain`) |
+| `Iterate(ctx, *Query, func(*Document) bool) error` | Runs the query as `Find` does and passes each result (a copy) to the callback in order until it returns false, without collecting them; the callback runs inside the read snapshot and must not write. If a compaction or index change restarts the query, it continues by position after the results already passed (as `skip` paging does). Backs the bounded `find_documents` |
 | `CountDocuments(ctx, *Query) (int, error)` | Filters and `Any` only; fast paths below |
 | `Distinct(ctx, field, *Query) ([]any, error)` | Arrays contribute each element; deduplicated like `eq`, sorted by the sort order |
 | `Update(ctx, id, set map[string]any) (*Document, error)` | `UpdateWith` with only `Set` |

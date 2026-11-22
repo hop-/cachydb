@@ -67,23 +67,105 @@ func (c *Collection) FindWithPlan(ctx context.Context, q *Query) ([]*Document, Q
 	return c.runQuery(ctx, cq)
 }
 
-// runQuery runs a compiled query, planning it again (up to maxReadRetries
-// times) when a compaction or an index change interrupted it. Callers are
+// Iterate runs q as Find does and calls fn with each result in order (a
+// copy fn may keep), until fn returns false or the results end. Unlike
+// Find, it never holds more than the results fn has not seen yet (a sort
+// the driver does not provide still keeps the best q.Skip+q.Limit matches,
+// or every match without a limit), so a caller can stop on something other
+// than a count, such as the size of what it has taken.
+//
+// fn runs while the query holds its read snapshot: it must not write to
+// the engine or block for long. When the query has to start over (a
+// compaction or an index change interrupted it), Iterate continues after
+// the results fn already received, by position, as paging with q.Skip
+// does; once fn has returned false it does not start over.
+func (c *Collection) Iterate(ctx context.Context, q *Query, fn func(*Document) bool) error {
+	_, err := c.iterate(ctx, q, fn)
+	return err
+}
+
+// iterate is Iterate that also describes how the query ran (see
+// FindWithPlan); Returned counts the results fn received.
+func (c *Collection) iterate(ctx context.Context, q *Query, fn func(*Document) bool) (QueryPlan, error) {
+	e := c.db.e
+	if err := e.enter(); err != nil {
+		return QueryPlan{}, err
+	}
+	defer e.exit()
+	cq, err := compileQuery(q)
+	if err != nil {
+		return QueryPlan{}, err
+	}
+	return c.streamQuery(ctx, cq, fn, nil)
+}
+
+// runQuery runs a compiled query and collects its results. Callers are
 // inside an enter/exit pair.
 func (c *Collection) runQuery(ctx context.Context, cq *compiledQuery) ([]*Document, QueryPlan, error) {
-	for attempt := 0; ; attempt++ {
-		docs, plan, err := c.findOnce(ctx, cq, attempt < maxReadRetries/2)
-		if errors.Is(err, errQueryRetry) {
-			if attempt < maxReadRetries {
-				continue
-			}
-			err = c.retryErr()
-		}
-		if err != nil {
-			return nil, plan, err
-		}
-		return docs, plan, nil
+	out := make([]*Document, 0)
+	plan, err := c.streamQuery(ctx, cq,
+		func(doc *Document) bool { out = append(out, doc); return true },
+		func() { out = out[:0] })
+	if err != nil {
+		return nil, plan, err
 	}
+	return out, plan, nil
+}
+
+// streamQuery runs a compiled query and calls emit with each result in
+// order until emit returns false. When a compaction or an index change
+// interrupts it, it plans the query again (up to maxReadRetries times):
+// with a restart function it calls it and starts from the first result;
+// without one it continues after the results emit already received, and
+// once emit returned false it stops. Callers are inside an enter/exit
+// pair.
+func (c *Collection) streamQuery(ctx context.Context, cq *compiledQuery, emit func(*Document) bool, restart func()) (QueryPlan, error) {
+	delivered, stopped := 0, false
+	count := func(doc *Document) bool {
+		delivered++
+		if !emit(doc) {
+			stopped = true
+			return false
+		}
+		return true
+	}
+	run := cq
+	for attempt := 0; ; attempt++ {
+		plan, err := c.findOnce(ctx, run, attempt < maxReadRetries/2, count)
+		if errors.Is(err, errQueryRetry) {
+			switch {
+			case restart == nil && stopped:
+				err = nil // the consumer has what it wanted
+			case attempt >= maxReadRetries:
+				err = c.retryErr()
+			case restart != nil:
+				restart()
+				delivered = 0
+				continue
+			default:
+				if run = cq.resumeAfter(delivered); run != nil {
+					continue
+				}
+				err = nil // the limit was reached
+			}
+		}
+		plan.Returned = delivered
+		return plan, err
+	}
+}
+
+// resumeAfter returns cq with its first n results skipped, or nil when its
+// limit leaves nothing after them.
+func (cq *compiledQuery) resumeAfter(n int) *compiledQuery {
+	next := *cq
+	next.skip += n
+	if cq.limit > 0 {
+		next.limit -= n
+		if next.limit <= 0 {
+			return nil
+		}
+	}
+	return &next
 }
 
 // find is FindWithPlan that reports only the number of candidates
@@ -206,55 +288,60 @@ func (cq *compiledQuery) matches(doc *Document) bool {
 	return matchQuery(doc, cq.filters, cq.anyOf)
 }
 
-// findOnce runs a compiled query in one snapshot. It returns errQueryRetry
-// when the query has to start over (see plan.go).
-func (c *Collection) findOnce(ctx context.Context, cq *compiledQuery, useIndexes bool) ([]*Document, QueryPlan, error) {
+// findOnce runs a compiled query in one snapshot, calling emit with each
+// result in order until emit returns false. It returns errQueryRetry when
+// the query has to start over (see plan.go), possibly after results were
+// emitted. Returned in the plan is the number of results emitted.
+func (c *Collection) findOnce(ctx context.Context, cq *compiledQuery, useIndexes bool, emit func(*Document) bool) (QueryPlan, error) {
 	s, err := c.openSnap(useIndexes)
 	if err != nil {
-		return nil, QueryPlan{}, err
+		return QueryPlan{}, err
 	}
 	defer s.close()
 	opt, err := c.choosePlan(s, cq, true)
 	if err != nil {
-		return nil, QueryPlan{}, err
+		return QueryPlan{}, err
 	}
 	plan := QueryPlan{Driver: opt.driver, Index: strings.Join(opt.index, ",")}
-	out := make([]*Document, 0)
+	counted := func(doc *Document) bool {
+		plan.Returned++
+		return emit(doc)
+	}
 	switch {
 	case opt.never:
 		plan.OrderProvided = true
 	case opt.sortWalk:
 		plan.OrderProvided = true
-		out, plan.Examined, err = c.findBySortWalk(ctx, s, cq, opt)
+		plan.Examined, err = c.findBySortWalk(ctx, s, cq, opt, counted)
 	case cq.sort != nil:
-		out, plan.Examined, err = c.findByHeap(ctx, s, cq, opt)
+		plan.Examined, err = c.findByHeap(ctx, s, cq, opt, counted)
 	default:
-		out, plan.Examined, plan.OrderProvided, err = c.findByID(ctx, s, cq, opt)
+		plan.Examined, plan.OrderProvided, err = c.findByID(ctx, s, cq, opt, counted)
 	}
 	if err != nil {
-		return nil, plan, err
+		return plan, err
 	}
 	s.close()
 	if !c.indexesUnchanged(opt.used) {
-		return nil, plan, errQueryRetry // an index changed meanwhile: plan again
+		return plan, errQueryRetry // an index changed meanwhile: plan again
 	}
-	plan.Returned = len(out)
-	return out, plan, nil
+	return plan, nil
 }
 
-// queryRun collects the results of a query in order: it examines each
-// candidate it is given, skips and keeps matches, and says when it has
-// enough.
+// queryRun passes the results of a query on in order: it examines each
+// candidate it is given, skips matches, emits the rest, and says when it
+// has enough.
 type queryRun struct {
-	ctx               context.Context
-	cq                *compiledQuery
-	out               []*Document
-	matched, examined int
-	err               error
+	ctx                         context.Context
+	cq                          *compiledQuery
+	emit                        func(*Document) bool
+	matched, examined, returned int
+	err                         error
 }
 
-// take examines doc (shared: it is copied when kept). It returns false
-// when the query has all it needs or the context ended (r.err).
+// take examines doc (shared: it is copied when emitted). It returns false
+// when the query has all it needs, the consumer stopped, or the context
+// ended (r.err).
 func (r *queryRun) take(doc *Document) bool {
 	if r.examined%findCtxCheckEvery == 0 {
 		if err := r.ctx.Err(); err != nil {
@@ -270,25 +357,28 @@ func (r *queryRun) take(doc *Document) bool {
 	if r.matched <= r.cq.skip {
 		return true
 	}
-	r.out = append(r.out, project(doc, false, r.cq.fieldPaths))
-	return r.cq.limit == 0 || len(r.out) < r.cq.limit
+	r.returned++
+	if !r.emit(project(doc, false, r.cq.fieldPaths)) {
+		return false
+	}
+	return r.cq.limit == 0 || r.returned < r.cq.limit
 }
 
 // findByID runs a query in _id order (ascending, or descending for a sort
 // on _id desc). A driver that yields _id order streams; any other has its
 // ids collected and sorted first, without reading documents. The overlay's
 // candidates are merged in by id.
-func (c *Collection) findByID(ctx context.Context, s *querySnap, cq *compiledQuery, opt *planOption) ([]*Document, int, bool, error) {
+func (c *Collection) findByID(ctx context.Context, s *querySnap, cq *compiledQuery, opt *planOption, emit func(*Document) bool) (int, bool, error) {
 	desc := cq.idDesc
 	src, err := opt.open(ctx, s, desc)
 	if err != nil {
-		return nil, 0, false, err
+		return 0, false, err
 	}
 	ordered := !opt.byValue && (!desc || opt.driver == driverKeydir || opt.driver == driverIDs)
 	if !ordered {
 		ids, err := collectIDs(ctx, src)
 		if err != nil {
-			return nil, 0, false, c.storeErr(err)
+			return 0, false, c.storeErr(err)
 		}
 		src = &listSource{ids: ids, desc: desc}
 	}
@@ -298,27 +388,27 @@ func (c *Collection) findByID(ctx context.Context, s *querySnap, cq *compiledQue
 	}
 	before := func(a, b string) bool { return a < b != desc }
 
-	r := &queryRun{ctx: ctx, cq: cq, out: make([]*Document, 0)}
+	r := &queryRun{ctx: ctx, cq: cq, emit: emit}
 	oi := 0
 	for {
 		id, ke, haveEntry, ok := src.next()
 		if !ok {
 			if err := src.err(); err != nil {
-				return nil, r.examined, ordered, c.storeErr(err)
+				return r.examined, ordered, c.storeErr(err)
 			}
 			break
 		}
 		for ; oi < len(ov) && before(ov[oi], id); oi++ {
 			if !r.take(s.overlay[ov[oi]]) {
-				return r.out, r.examined, ordered, r.err
+				return r.examined, ordered, r.err
 			}
 		}
 		doc, err := c.snapDoc(s, id, ke, haveEntry)
 		if err != nil {
-			return nil, r.examined, ordered, err
+			return r.examined, ordered, err
 		}
 		if doc != nil && !r.take(doc) {
-			return r.out, r.examined, ordered, r.err
+			return r.examined, ordered, r.err
 		}
 	}
 	for ; oi < len(ov); oi++ {
@@ -326,13 +416,13 @@ func (c *Collection) findByID(ctx context.Context, s *querySnap, cq *compiledQue
 			break
 		}
 	}
-	return r.out, r.examined, ordered, r.err
+	return r.examined, ordered, r.err
 }
 
 // findBySortWalk runs a query whose single sort key is driven by its
 // index: the walk yields the stored documents in the sort order, and the
 // overlay's candidates, sorted the same way, are merged in.
-func (c *Collection) findBySortWalk(ctx context.Context, s *querySnap, cq *compiledQuery, opt *planOption) ([]*Document, int, error) {
+func (c *Collection) findBySortWalk(ctx context.Context, s *querySnap, cq *compiledQuery, opt *planOption, emit func(*Document) bool) (int, error) {
 	h := &sortHeap{keys: cq.sort}
 	var ov []*sortItem
 	for _, id := range s.overlayIDs(opt.cand) {
@@ -341,21 +431,21 @@ func (c *Collection) findBySortWalk(ctx context.Context, s *querySnap, cq *compi
 	slices.SortFunc(ov, h.cmp)
 	src, err := opt.open(ctx, s, cq.sort[0].Order == orderDesc)
 	if err != nil {
-		return nil, 0, err
+		return 0, err
 	}
-	r := &queryRun{ctx: ctx, cq: cq, out: make([]*Document, 0)}
+	r := &queryRun{ctx: ctx, cq: cq, emit: emit}
 	oi := 0
 	for {
 		id, ke, haveEntry, ok := src.next()
 		if !ok {
 			if err := src.err(); err != nil {
-				return nil, r.examined, c.storeErr(err)
+				return r.examined, c.storeErr(err)
 			}
 			break
 		}
 		doc, err := c.snapDoc(s, id, ke, haveEntry)
 		if err != nil {
-			return nil, r.examined, err
+			return r.examined, err
 		}
 		if doc == nil {
 			continue
@@ -363,11 +453,11 @@ func (c *Collection) findBySortWalk(ctx context.Context, s *querySnap, cq *compi
 		it := newSortItem(doc, false, cq.sortPaths)
 		for ; oi < len(ov) && h.cmp(ov[oi], it) < 0; oi++ {
 			if !r.take(ov[oi].doc) {
-				return r.out, r.examined, r.err
+				return r.examined, r.err
 			}
 		}
 		if !r.take(doc) {
-			return r.out, r.examined, r.err
+			return r.examined, r.err
 		}
 	}
 	for ; oi < len(ov); oi++ {
@@ -375,13 +465,13 @@ func (c *Collection) findBySortWalk(ctx context.Context, s *querySnap, cq *compi
 			break
 		}
 	}
-	return r.out, r.examined, r.err
+	return r.examined, r.err
 }
 
 // findByHeap runs a query with a sort the driver does not provide: it
 // reads every candidate, keeps the best skip+limit matches (all of them
-// without a limit) in a bounded heap, sorts them, and pages.
-func (c *Collection) findByHeap(ctx context.Context, s *querySnap, cq *compiledQuery, opt *planOption) ([]*Document, int, error) {
+// without a limit) in a bounded heap, sorts them, pages, and emits.
+func (c *Collection) findByHeap(ctx context.Context, s *querySnap, cq *compiledQuery, opt *planOption, emit func(*Document) bool) (int, error) {
 	keep := 0
 	if cq.limit > 0 {
 		keep = cq.skip + cq.limit
@@ -402,15 +492,16 @@ func (c *Collection) findByHeap(ctx context.Context, s *querySnap, cq *compiledQ
 		return true
 	})
 	if err != nil {
-		return nil, examined, err
+		return examined, err
 	}
 	items := h.items
 	slices.SortFunc(items, h.cmp)
-	out := make([]*Document, 0)
 	for i := cq.skip; i < len(items); i++ {
-		out = append(out, project(items[i].doc, items[i].owned, cq.fieldPaths))
+		if !emit(project(items[i].doc, items[i].owned, cq.fieldPaths)) {
+			break
+		}
 	}
-	return out, examined, nil
+	return examined, nil
 }
 
 // eachCandidate calls fn with every candidate of opt in s, in no

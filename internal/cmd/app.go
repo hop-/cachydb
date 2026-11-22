@@ -97,7 +97,31 @@ func setAllFlagsToCmd(cmd *cobra.Command) {
 		c.DBName,
 		"default database, created if missing (env DB_NAME)",
 	)
+	cmd.Flags().IntVar(
+		&generalDefaultLimit,
+		"default-limit",
+		c.DefaultLimit,
+		"documents find_documents returns at most when a call gives no limit (env DEFAULT_LIMIT)",
+	)
+	generalMaxResultBytes = c.MaxResultBytes
+	cmd.Flags().Var(
+		&generalMaxResultBytes,
+		"max-result-bytes",
+		"cap on the JSON size of the documents one find_documents call returns, e.g. 1MiB; at least one document is returned (env MAX_RESULT_BYTES)",
+	)
 	setEngineFlags(cmd.Flags())
+}
+
+// validateResultLimits rejects a default limit or result byte cap that is
+// not positive.
+func validateResultLimits(limit int, maxBytes config.ByteSize) error {
+	if limit <= 0 {
+		return fmt.Errorf("invalid --default-limit %d: must be greater than 0", limit)
+	}
+	if maxBytes <= 0 {
+		return fmt.Errorf("invalid --max-result-bytes %s: must be greater than 0", maxBytes)
+	}
+	return nil
 }
 
 // validateTransport rejects a transport other than stdio or http, so a
@@ -119,6 +143,9 @@ func runApp(cmd *cobra.Command, _ []string) error {
 	if err := validateTransport(generalTransport); err != nil {
 		return err
 	}
+	if err := validateResultLimits(generalDefaultLimit, generalMaxResultBytes); err != nil {
+		return err
+	}
 	ctx := cmd.Context()
 	c := config.GetConfig()
 	bootstrap, err := app.BootstrapToken(c.BootstrapAdminToken, c.BootstrapAdminTokenFile)
@@ -137,6 +164,7 @@ func runApp(cmd *cobra.Command, _ []string) error {
 		}).
 		WithAuth(generalAuth).
 		WithBootstrapAdminToken(bootstrap).
+		WithResultLimits(generalDefaultLimit, int64(generalMaxResultBytes)).
 		WithVersion(getVersion()).
 		Build(ctx)
 	if err != nil {

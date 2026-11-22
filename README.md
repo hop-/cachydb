@@ -127,6 +127,8 @@ CLI flags (override environment variables, which override the defaults):
       --wal-retention-age    Keep processed WAL for this long, e.g. 24h (0 = no age limit)
       --wal-retention-size   Keep at most this much processed WAL, e.g. 1GiB (0 = no size limit)
       --cache-size           Document cache size, e.g. 64MiB (0 = cache disabled)
+      --default-limit        Documents find_documents returns without a limit (default 100)
+      --max-result-bytes     Cap on the JSON size of one find_documents result (default 1MiB)
 ```
 
 Environment variables:
@@ -142,6 +144,8 @@ Environment variables:
 - `WAL_RETENTION_AGE`: How long processed WAL segments are kept, as a Go duration (default: `24h`, `0` = no age limit)
 - `WAL_RETENTION_SIZE`: Maximum size of processed WAL kept (default: `1GiB`, `0` = no size limit)
 - `CACHE_SIZE`: Document cache size (default: `64MiB`, `0` = disabled)
+- `DEFAULT_LIMIT`: Documents `find_documents` returns at most when a call gives no `limit` (default: `100`); results report `has_more` and `next_skip` for paging
+- `MAX_RESULT_BYTES`: Cap on the JSON size of the documents one `find_documents` call returns; at least one document is returned (default: `1MiB`)
 
 Sizes accept `B`, `KiB`, `MiB`, `GiB`, `TiB` (powers of 1024) and `KB`, `MB`, `GB`, `TB` (powers of 1000). Retention never deletes WAL that has not yet been written to the data segments.
 
@@ -458,7 +462,7 @@ Query documents in a collection.
 - All `filters` must match; with `any`, at least one group must match too (OR of ANDs). `field` is a top-level field name or `_id` (nested paths are not supported).
 - Comparison is type-aware: numbers compare numerically, strings lexically. Values of different types never match `eq`, `gt`, `gte`, `lt`, or `lte`. `eq`/`in` compare arrays as whole values; use `has` for elements.
 - A document that lacks the filtered field matches no operator, including `ne` (unlike MongoDB's `$ne`).
-- Results are sorted by `sort` (any fields, `asc`/`desc`; missing < null < booleans < numbers < strings < arrays < objects), then `_id`; `skip` and `limit` page deterministically. `fields` returns only the listed fields plus `_id`. An omitted or empty `query` returns all documents.
+- Results are sorted by `sort` (any fields, `asc`/`desc`; missing < null < booleans < numbers < strings < arrays < objects), then `_id`; `skip` and `limit` page deterministically. `fields` returns only the listed fields plus `_id`. An omitted or empty `query` matches all documents. Without a `limit` a call returns at most 100 documents (`DEFAULT_LIMIT`), and every result stays within 1 MiB of JSON (`MAX_RESULT_BYTES`, at least one document); when `has_more` is `true`, repeat the call with `skip` set to `next_skip`.
 
 #### count_documents / distinct
 

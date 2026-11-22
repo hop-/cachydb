@@ -28,7 +28,9 @@ and skip **inside a `query` object**:
 }
 ```
 
-An omitted or empty `query` returns every document in the collection.
+An omitted or empty `query` matches every document in the collection;
+one call returns at most the server's default limit of them (100 unless
+configured), see "Sorting, projection, and paging".
 
 ## Filters and OR groups
 
@@ -115,9 +117,24 @@ be stored literally.
   `{"_id": …, "meta": {"author": …}}`. Filters and sort may use fields
   that are not returned. Omit it for whole documents.
 - `skip` matching documents are skipped (after sorting), then at most
-  `limit` are returned. `limit` 0 or omitted means no limit.
-- The result has `count` (the number returned) and `documents`; each
-  document is a flat object with its `_id`.
+  `limit` are returned. `limit` 0 or omitted means the server's default
+  limit (`DEFAULT_LIMIT`, 100 unless configured); a positive `limit` is
+  used as given.
+- A result byte cap (`MAX_RESULT_BYTES`, 1 MiB unless configured) always
+  applies: documents are added until the next one would make the JSON of
+  `documents` larger than the cap. At least one document is returned
+  even if it alone is larger, so paging never gets stuck.
+- The result has `count` (the number returned), `documents` (each a flat
+  object with its `_id`), and `has_more`: `true` if more documents match
+  after these. When it is `true`, `next_skip` is set too.
+- **To page**, repeat the same call (same filters and `sort`) with
+  `"skip": next_skip` until `has_more` is `false`. Pages follow the sort
+  order, so concurrent writes can shift what a later page holds. To know
+  the total first, use `count_documents`.
+
+```json
+{"collection": "notes", "query": {"sort": [{"field": "updated", "order": "desc"}], "skip": 100}}
+```
 
 ## Counting and distinct values
 

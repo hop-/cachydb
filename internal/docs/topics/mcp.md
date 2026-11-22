@@ -245,11 +245,17 @@ retry.
 | Collections | `create_collection`, `list_collections`, `describe_collection`, `update_schema`, `rename_collection`, `copy_collection`, `delete_collection` |
 | Indexes | `create_index`, `drop_index` |
 | Writing | `insert_document`, `update_document` (`updates`, `unset`, `if`, `upsert`), `replace_document`, `delete_document` (`if`) |
-| Reading | `find_documents` (`filters`, `any`, `sort`, `fields`, `limit`, `skip`), `count_documents`, `distinct` |
+| Reading | `find_documents` (`filters`, `any`, `sort`, `fields`, `limit`, `skip`; result `has_more`, `next_skip`), `count_documents`, `distinct` |
 | Users (only when the server requires tokens) | `whoami` (everyone); `list_users`, `create_user`, `set_access`, `create_token`, `revoke_token`, `delete_user` (server admins; hidden from other users) |
 
 `cachydb docs tools` has every schema and an example call; the user tools
 are in `cachydb docs access`.
+
+`find_documents` never returns an unbounded result: without a `limit` it
+returns at most `--default-limit` documents (100), and the JSON of its
+documents stays within `--max-result-bytes` (1 MiB), with at least one
+document. Page with `"skip": next_skip` while `has_more` is `true`; see
+`cachydb docs query`.
 
 ## Self-description
 

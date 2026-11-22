@@ -410,9 +410,18 @@ func (c clientStore) Describe(ctx context.Context, database, collection string) 
 	return schema, indexes, nil
 }
 
+// Documents reads every document of the collection in _id order, one
+// find_documents page at a time. It asks for clientPageSize documents per
+// page; the server's result byte cap may return fewer, so it follows
+// has_more and next_skip. A server older than those keys returns full
+// pages, and the listing ends at the first short one.
 func (c clientStore) Documents(ctx context.Context, database, collection string, fn func(map[string]any) error) error {
-	for skip := 0; ; skip += clientPageSize {
-		var out mcpserver.FindDocumentsOutput
+	for skip := 0; ; {
+		var out struct {
+			Documents []map[string]any `json:"documents"`
+			HasMore   *bool            `json:"has_more"`
+			NextSkip  int              `json:"next_skip"`
+		}
 		err := callInto(ctx, c.cs, "find_documents", map[string]any{
 			"database": database, "collection": collection,
 			"query": map[string]any{"skip": skip, "limit": clientPageSize},
@@ -425,8 +434,18 @@ func (c clientStore) Documents(ctx context.Context, database, collection string,
 				return err
 			}
 		}
-		if len(out.Documents) < clientPageSize {
+		switch {
+		case out.HasMore == nil: // a server without paging keys
+			if len(out.Documents) < clientPageSize {
+				return nil
+			}
+			skip += clientPageSize
+		case !*out.HasMore:
 			return nil
+		case out.NextSkip <= skip:
+			return fmt.Errorf("find_documents on %s.%s: has_more without a next_skip after %d", database, collection, skip)
+		default:
+			skip = out.NextSkip
 		}
 	}
 }

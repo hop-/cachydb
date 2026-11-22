@@ -277,7 +277,7 @@ Annotations (all tools also set `openWorldHint: false` and a title):
 | `copy_collection` | `collection`, `new_name`, `target_database`?, `database`? | `message`, `copied` |
 | `delete_collection` | `collection`, `database`? | `message` (`ErrNotFound` if missing) |
 | `insert_document` | `collection`, `document`, `database`? | `id`, `message` |
-| `find_documents` | `collection`, `query`?, `database`? | `count`, `documents` |
+| `find_documents` | `collection`, `query`?, `database`? | `count`, `documents`, `has_more`, `next_skip` (when `has_more`) |
 | `count_documents` | `collection`, `query`? (`filters`, `any`), `database`? | `count` |
 | `distinct` | `collection`, `field`, `query`? (`filters`, `any`), `database`? | `values` |
 | `update_document` | `collection`, `id`, `updates`?, `unset`?, `if`?, `upsert`?, `database`? | `message`, `upserted` |
@@ -348,7 +348,18 @@ Filters, OR groups, projection, sort, limit, and skip are nested under
 - A document **missing the field matches no operator, including `ne`**
   (unlike MongoDB's `$ne`).
 - Results are sorted by `sort`, then `_id`; `skip`/`limit` page
-  deterministically. An omitted or empty `query` returns every document.
+  deterministically. An omitted or empty `query` matches every document.
+- **Bounded results** (plan 013 §2): `limit` omitted or 0 means
+  `Config.DefaultLimit` (`--default-limit`/`DEFAULT_LIMIT`, 100); a
+  positive `limit` is used as given. `Config.MaxResultBytes`
+  (`--max-result-bytes`/`MAX_RESULT_BYTES`, 1 MiB) always caps the JSON
+  size of `documents` (each document marshalled once as it is added, plus
+  brackets and commas); the first document is returned even when it alone
+  is larger. The handler runs `Collection.Iterate` with `limit + 1` and
+  stops on the limit or the cap, so it never loads every match;
+  `has_more` is true when a further match exists, and `next_skip` is then
+  `skip + count`. The engine's `Find`, `utils find`, and `client export`
+  (which follows `has_more`/`next_skip`) are not bounded by these.
 - Each document is returned as a flat object with `_id` (only the
   `fields` listed, plus `_id`, when `fields` is set).
 

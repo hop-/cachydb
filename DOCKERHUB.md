@@ -95,6 +95,8 @@ Configure the container with environment variables:
 | `WAL_RETENTION_AGE` | `24h` | Keep processed WAL this long; `0` = no age limit |
 | `WAL_RETENTION_SIZE` | `1GiB` | Keep at most this much processed WAL; `0` = no size limit |
 | `CACHE_SIZE` | `64MiB` | Document cache size; `0` disables the cache |
+| `DEFAULT_LIMIT` | `100` | Documents `find_documents` returns at most when a call gives no `limit` |
+| `MAX_RESULT_BYTES` | `1MiB` | Cap on the JSON size of the documents one `find_documents` call returns (at least one is returned) |
 
 ```bash
 docker run -d -p 127.0.0.1:8080:8080 -v cachydb-data:/data \

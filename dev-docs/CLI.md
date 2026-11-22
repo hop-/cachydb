@@ -31,6 +31,8 @@ cachydb app [flags]
 | `--wal-retention-age` | | `24h` (or `WAL_RETENTION_AGE`) | Keep processed WAL segments this long; Go duration; `0` = no age limit |
 | `--wal-retention-size` | | `1GiB` (or `WAL_RETENTION_SIZE`) | Keep at most this much processed WAL; `0` = no size limit |
 | `--cache-size` | | `64MiB` (or `CACHE_SIZE`) | Document cache size; `0` = cache disabled |
+| `--default-limit` | | `100` (or `DEFAULT_LIMIT`) | Documents `find_documents` returns at most when a call gives no `limit`; must be > 0 (server only) |
+| `--max-result-bytes` | | `1MiB` (or `MAX_RESULT_BYTES`) | Cap on the JSON size of one `find_documents` result's documents, at least one document returned; must be > 0 (server only) |
 
 The server takes the data-directory lock; a second server (or a `utils`
 command) on the same directory fails with *"data directory is in use by
@@ -347,6 +349,8 @@ status 1 and an error that names the variable.
 | `WAL_RETENTION_AGE` | `24h` | `--wal-retention-age` |
 | `WAL_RETENTION_SIZE` | `1GiB` | `--wal-retention-size` |
 | `CACHE_SIZE` | `64MiB` | `--cache-size` |
+| `DEFAULT_LIMIT` | `100` | `--default-limit` (server only) |
+| `MAX_RESULT_BYTES` | `1MiB` | `--max-result-bytes` (server only) |
 | `CACHYDB_URL` | `http://127.0.0.1:7601/mcp` | `cachydb client --url` (read by `client` only) |
 | `CACHYDB_TOKEN` | none | `cachydb client --token` (read by `client` only) |
 | `BOOTSTRAP_ADMIN_TOKEN` | none | none (a secret; env only) |

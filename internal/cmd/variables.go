@@ -26,4 +26,6 @@ var (
 	generalWALRetentionAge  time.Duration
 	generalWALRetentionSize config.ByteSize
 	generalCacheSize        config.ByteSize
+	generalDefaultLimit     int
+	generalMaxResultBytes   config.ByteSize
 )

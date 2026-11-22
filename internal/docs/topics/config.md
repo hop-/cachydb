@@ -1,7 +1,7 @@
 ---
 name: config
 title: Configuration
-summary: Every flag and environment variable, defaults, precedence (flag > env > default), listen host, AUTH, BOOTSTRAP_ADMIN_TOKEN and TLS, value formats, cachydb client (CACHYDB_URL, CACHYDB_TOKEN), utils user, and the export format
+summary: Every flag and environment variable, defaults, precedence (flag > env > default), listen host, AUTH, find_documents result limits, BOOTSTRAP_ADMIN_TOKEN and TLS, value formats, cachydb client (CACHYDB_URL, CACHYDB_TOKEN), utils user, and the export format
 ---
 # Configuration
 
@@ -22,6 +22,8 @@ environment variable, which wins over the default.**
 | `-d, --db` | `DB_NAME` | `main` | Default database; created at startup if missing |
 | | `BOOTSTRAP_ADMIN_TOKEN` | none | At every start, make sure the server admin `admin` exists and holds this token (32 to 512 characters); never logged; no flag |
 | | `BOOTSTRAP_ADMIN_TOKEN_FILE` | none | A file holding the bootstrap token (for Docker secrets); not together with `BOOTSTRAP_ADMIN_TOKEN` |
+| `--default-limit` | `DEFAULT_LIMIT` | `100` | Documents `find_documents` returns at most when a call gives no `limit` (or `0`); must be greater than 0 |
+| `--max-result-bytes` | `MAX_RESULT_BYTES` | `1MiB` | Cap on the JSON size of the documents one `find_documents` call returns, whatever its `limit`; at least one document is always returned; must be greater than 0 |
 
 ### When clients need a token
 
@@ -42,6 +44,11 @@ see `cachydb docs access` for users, access levels, and tokens.
 
 TLS needs both files; setting only one is a start-up error. The
 certificate and key are read once at start-up.
+
+`--default-limit` and `--max-result-bytes` bound what one `find_documents`
+call returns; its `has_more` and `next_skip` say how to get the rest (see
+`cachydb docs query`). `cachydb utils find` and `cachydb client export`
+are not bounded by them.
 
 ## Engine tuning (server and `cachydb utils`)
 
