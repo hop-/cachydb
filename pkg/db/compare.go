@@ -3,7 +3,6 @@ package db
 import (
 	"cmp"
 	"encoding/json"
-	"fmt"
 	"maps"
 	"math"
 	"reflect"
@@ -255,7 +254,7 @@ type compiledFilter struct {
 func compileFilter(f QueryFilter) (compiledFilter, error) {
 	op, ok := operatorCodes[f.Operator]
 	if !ok {
-		return compiledFilter{}, fmt.Errorf("filter on field %q: unknown operator %q (want one of %s)",
+		return compiledFilter{}, invalidArgf("filter on field %q: unknown operator %q (want one of %s)",
 			f.Field, f.Operator, strings.Join(operatorNames, " "))
 	}
 	cf := compiledFilter{field: f.Field, path: compilePath(f.Field), op: op, value: f.Value}
@@ -282,13 +281,13 @@ func compileFilter(f QueryFilter) (compiledFilter, error) {
 	case opExists:
 		b, ok := f.Value.(bool)
 		if !ok {
-			return compiledFilter{}, fmt.Errorf("filter on field %q: exists takes a boolean, got %s", f.Field, describeValue(f.Value))
+			return compiledFilter{}, invalidArgf("filter on field %q: exists takes a boolean, got %s", f.Field, describeValue(f.Value))
 		}
 		cf.exists = b
 	case opStartsWith:
 		s, ok := f.Value.(string)
 		if !ok {
-			return compiledFilter{}, fmt.Errorf("filter on field %q: starts_with takes a string, got %s", f.Field, describeValue(f.Value))
+			return compiledFilter{}, invalidArgf("filter on field %q: starts_with takes a string, got %s", f.Field, describeValue(f.Value))
 		}
 		cf.s = s
 	}

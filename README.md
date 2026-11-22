@@ -296,7 +296,7 @@ Create a new database.
 
 #### list_databases
 
-List all databases.
+List the databases you can read (every database when the server requires no tokens).
 
 ```json
 {}
@@ -534,6 +534,18 @@ Update (`updates`, `unset`, `inc`, `push`, `add_to_set`, `pull`) or delete every
 {"collection": "users", "query": {"filters": [{"field": "status", "operator": "eq", "value": "deleted"}]}, "limit": 1000}
 ```
 
+#### server_stats
+
+Per collection the document count, data bytes, index bytes, and index names, with per-database totals, for one `database` or every database you can read. Server admins (everyone without tokens) also get the WAL size, cache size, hits and misses, version, and uptime. `cachydb utils stats [-d DB] [--format json]` prints the same offline.
+
+```json
+{"database": "users_db"}
+```
+
+#### Errors
+
+Every tool error starts with a stable code in brackets, such as `[not_found]`, `[invalid_argument]`, `[unique_violation]`, `[limit_exceeded]`, or `[permission_denied]`, followed by the message and a hint. Only arguments that fail the input schema come back as `validating "arguments": …` without a code. `cachydb docs errors` lists every code.
+
 ### Index Management
 
 #### create_index
@@ -566,7 +578,7 @@ cachydb/
 ├── main.go                 # Entry point
 ├── internal/
 │   ├── app/               # Application setup (opens the engine, starts the MCP server)
-│   ├── cmd/               # CLI commands (server, docs, version, utils list/migrate/export/import/find/get/verify, client)
+│   ├── cmd/               # CLI commands (server, docs, version, utils list/stats/migrate/export/import/find/get/verify, client)
 │   ├── config/            # Configuration (env vars, size parsing)
 │   ├── docs/              # Built-in agent docs topics (cachydb docs, MCP resources)
 │   └── mcp/
@@ -665,6 +677,7 @@ Databases carry a schema version. `cachydb utils` commands open the data directo
 
 ```bash
 ./cachydb utils list -c                  # databases, schema versions, collections and document counts
+./cachydb utils stats                    # document counts, data and index bytes, WAL and cache figures
 ./cachydb utils migrate --all            # migrate every database to the current schema version
 ./cachydb utils migrate --database mydb  # migrate one database
 ./cachydb utils migrate --list           # list registered migrations

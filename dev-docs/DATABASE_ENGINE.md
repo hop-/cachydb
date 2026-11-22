@@ -72,6 +72,8 @@ on-disk format versions this build reads and writes.
 | `DropDatabase(ctx, name) error` | Waits for in-flight writes in the database |
 | `MigrateDatabase(ctx, name, target) error` | See [Migrations](#migrations) |
 | `MigrateAll(ctx, target) error` | Every database `ListDatabases` returns (not the system database) |
+| `Stats(ctx) (Stats, error)` | `Databases` (every database `ListDatabases` returns, through `Database.Stats`; dropped ones are skipped) and `Server` (`ServerStats`); `stats.go` |
+| `ServerStats() (ServerStats, error)` | `WALBytes` (the WAL segment files, `wal.Log.Size`) and `Cache` (`CacheStats`: `Bytes`, `MaxBytes`, `Entries`, `Hits`, `Misses`; the hit and miss counters of `internal/cache` count every lookup since `Open`, a disabled cache only misses) |
 
 ### Database (`database.go`)
 
@@ -83,6 +85,7 @@ on-disk format versions this build reads and writes.
 | `ListCollections() []string` | Sorted; nil when empty |
 | `DropCollection(ctx, name) error` | MCP `delete_collection` |
 | `RenameCollection(ctx, old, new) error` | Same database; flushes the collection, then WAL op 10 (`rename_coll`) + directory rename + `coll.meta` rewrite; `ErrNotFound`, `ErrExists`; old handles return `ErrNotFound` afterwards |
+| `Stats(ctx) (DatabaseStats, error)` | Every collection's `Collection.Stats` (sorted; dropped ones skipped) and the sums `Documents`, `DataBytes`, `IndexBytes`; `ErrNotFound` for a dropped database |
 | `CopyCollection(ctx, name, newName, target *Database) (int, error)` | `target` nil = same database; creates the target with the schema and indexes (unique ones stay unique, F-015), then inserts every document (same ids, ascending) through `Collection.Batch`, each batch at most `MaxBatchDocs` documents and about `MaxBatchBytes` (sizes estimated, a batch over the limit is split in halves); **not atomic** as a whole (on error the target holds the batches written before it; drop it); `ErrExists` |
 
 ### Collection (`document.go`, `collection.go`)
@@ -110,6 +113,7 @@ on-disk format versions this build reads and writes.
 | `Schema() *Schema`, `Indexes() []IndexInfo` | Copies; indexes sorted by name, with `Unique` (MCP `describe_collection`) |
 | `UpdateSchema(ctx, *Schema) error` | `nil` removes the schema. Validates every document first (all or nothing; the error lists up to 10 failing ids and the total), then WAL op 9 (`update_schema`) + `coll.meta`; holds `Database.mu` exclusively throughout |
 | `Count() int` | O(1) |
+| `Stats(ctx) (CollectionStats, error)` | `Documents` (`Count`), `DataBytes` (sum of the record bytes of its data segments from the index file's accounting: superseded versions count until compaction, unflushed changes do not), `IndexBytes` (`index.db` file size), `Indexes` (names, sorted); `ErrNotFound` for a dropped collection. Backs `server_stats` and `utils stats` |
 | `Name() string` | |
 
 ### Conditional writes and `$now`
@@ -229,7 +233,8 @@ Returned documents are deep copies: mutating them never changes stored data.
 
 ### Sentinel errors (`errors.go`)
 
-Errors are wrapped with context; test them with `errors.Is`.
+Errors are wrapped with context; test them with `errors.Is`. Where a
+sentinel was added to an existing error, `withSentinel` keeps its text.
 
 | Error | When |
 |-------|------|
@@ -241,9 +246,11 @@ Errors are wrapped with context; test them with `errors.Is`.
 | `ErrUniqueViolation` | A write's value for a unique index belongs to another document, or `CreateIndex` with `Unique(true)` found documents sharing a value; nothing was written |
 | `ErrInvalidUpdate` | Misuse of the update operators: `Inc` on a non-number or a non-numeric/non-finite `Inc` value or an overflowing sum, `Push`/`AddToSet`/`Pull` on a non-array, an operator on `"_id"`, or a field named by an operator and by `Set`, `Unset`, or another operator; nothing was written |
 | `ErrBatchTooLarge` | A `Batch` has more operations than `MaxBatchDocs` or a larger payload than `MaxBatchBytes`, or `UpdateMany`/`DeleteMany` without a limit match more than `MaxBatchDocs` documents; the text states the limit (and the match count); nothing was written |
+| `ErrInvalidArgument` | A query or argument the engine cannot take: an unknown filter operator, `exists` with a non-boolean or `starts_with` with a non-string value, a bad sort key, an empty `Distinct` field, an empty or too long document id, a query with sort/fields/skip/limit for `UpdateMany`/`DeleteMany`, `Upsert` in `UpdateMany`, or a malformed `WriteOp`; the message is unchanged from before (F-022) |
+| `ErrQueryInterrupted` | A query started over more than `maxReadRetries` times because compactions or index changes moved its data (`collection "c": the query was interrupted …; retry it`); retry |
 | `ErrClosed` | Engine closed |
 | `ErrDataDirInUse` | Another process (or engine) holds `cachydb.lock` |
-| `ErrIncompatibleDataDir` | Old-format or newer-format data directory |
+| `ErrIncompatibleDataDir` | Old-format or newer-format data directory, or (F-022) a document id longer than this version can store found in a data segment or the WAL at `Open` |
 | `ErrWALCorrupt` | WAL damaged before its tail, or WAL files missing |
 | `ErrWALFailed` | A WAL fsync failed; writes fail until restart, reads continue |
 | `ErrSchemaTooNew` | A database's schema version is newer than `CurrentSchemaVersion` |

@@ -6,10 +6,32 @@ summary: Errors agents may see from the tools and the CLI, what each means, and 
 # Error messages
 
 Tool errors come back as an MCP tool result with `isError: true`. The text
-starts with the action (for example `find documents:`) followed by the
-cause; "not found" and schema errors end with a short `(hint: …)`. Invalid
-arguments are rejected before the tool runs, with a message
-starting `validating "arguments":`.
+starts with a stable code in brackets, then the action (for example
+`find documents:`) and the cause; "not found" and schema errors end with a
+short `(hint: …)`:
+`[not_found] find documents: collection "x" in database "main": not found (hint: …)`.
+Branch on the code; the rest of the text may change between versions.
+
+The one exception: arguments that do not match the tool's input schema
+are rejected before the tool runs, with a message starting
+`validating "arguments":` and no code.
+
+## Error codes
+
+| Code | Meaning | What to do |
+| --- | --- | --- |
+| `not_found` | The database, collection, document, index, or user does not exist | Check the name; `list_databases`, `list_collections`, `current_database` |
+| `already_exists` | The name or `_id` is taken (also an `_id` repeated within one batch call) | Use another name or id |
+| `invalid_name` | A name breaks the naming rule | Use letters, digits, `_` and `-`, starting with a letter or digit, at most 64 characters |
+| `invalid_argument` | The call is malformed: an unknown operator or a bad `exists` / `starts_with` value, a bad sort key, an update operator on the wrong type, an empty batch query without `all`, a negative `limit`, nothing to change, an empty or too long `_id`, a `set_access` mistake, or removing the last server admin | Fix the arguments the message names |
+| `schema_violation` | The document or schema breaks the collection schema | Fix the fields listed; see `cachydb docs schema` |
+| `unique_violation` | A unique index already has that value | Use another value, or change the other document first |
+| `condition_failed` | An `if` condition did not match; nothing was written | Re-read the document and retry |
+| `limit_exceeded` | A batch is larger than the server's limits (`batch too large`: more than 10,000 documents or 32 MiB, or more than 10,000 matches for `update_documents` / `delete_documents` without a `limit`; the message states the count) | Split the batch, or pass a `limit` and repeat |
+| `permission_denied` | The token's user lacks the access the call needs, or is no longer valid | Call `whoami`; ask a server admin; see `cachydb docs access` |
+| `unavailable` | The server is shutting down, the write-ahead log failed, or a query was interrupted too often by background compaction | Retry later; after a write-ahead log failure restart the server |
+| `cancelled` | The client cancelled the call or it timed out | Retry if needed |
+| `internal` | Anything else, usually damaged data | Read the message; see "When the server does not start" below |
 
 ## Tool errors
 
@@ -25,12 +47,14 @@ starting `validating "arguments":`.
 | `in both updates and unset` | `update_document` named a field in both | Use one of them per field |
 | `give updates, unset, or an operator` | `update_document` or `update_documents` had nothing to change | Pass `updates`, `unset`, or an update operator (`inc`, `push`, `add_to_set`, `pull`) |
 | `invalid update` | An update operator met a field of the wrong type (`inc` on a non-number; `push`, `add_to_set`, `pull` on a non-array), or a field was named in more than one of `updates`, `unset`, and the operators; nothing was written | Check the field's current value (`get_document`); name each field once; see `cachydb docs query` |
+| `batch too large` | A batch call exceeded a limit (10,000 documents or 32 MiB per call; for `update_documents` / `delete_documents`, more than 10,000 matches without a `limit`, with the match count); nothing was written | Split the batch, or pass a `limit` and repeat the call |
 | `unique index violation` | A write gives a unique index's value to a second document, or `create_index` with `unique` found documents sharing a value (listed); nothing was written | Use another value, or change the other document first |
 | `field "_id" in data is reserved` / `field "_id" cannot be changed` | `_id` was not a string on insert, or was in `updates` | Pass a string `_id` on insert only |
 | `validating "arguments"` | The arguments do not match the tool's input schema (missing field, wrong type, unknown operator or field type) | Fix the arguments; the message names the property; see `cachydb docs tools` |
 | `the database engine is shut down` | The server is stopping | Reconnect after it restarts |
 | `write-ahead log failure, restart the server` | A disk write or fsync failed; writes stop | Check the disk, then restart the server |
 | `request cancelled` | The client cancelled the call or it timed out | Retry if needed |
+| `the query was interrupted by compactions or index changes` | Background compaction or index changes made a query start over too often | Retry the call |
 | `permission denied: user "u" needs write access to database "d"` / `must be a server admin` | With tokens, the user lacks the level the call needs (`use_database` and other tools say the same for a database the user cannot read, whether it exists or not) | Call `whoami` to see your access; ask a server admin for a grant; see `cachydb docs access` |
 | `unauthenticated` | The user of the session's token was removed, or the call carried no token | Ask a server admin for a valid token |
 | `last server admin` | `delete_user` or `set_access` would remove or demote the only server admin | Make another user a server admin first |

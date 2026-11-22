@@ -84,6 +84,13 @@ func call(t *testing.T, cs *mcp.ClientSession, tool string, args map[string]any)
 	if err != nil {
 		t.Fatalf("CallTool(%s): %v", tool, err)
 	}
+	// AC-25: every tool error starts with a known code, except the SDK's
+	// argument validation errors.
+	if text := resultText(res); res.IsError && !strings.HasPrefix(text, `validating "arguments"`) {
+		if code, ok := ErrorCodeOf(text); !ok {
+			t.Errorf("CallTool(%s): tool error without a known code (%q): %s", tool, code, text)
+		}
+	}
 	return res
 }
 
@@ -132,10 +139,10 @@ func TestListToolsUnchanged(t *testing.T) {
 		"create_index", "current_database", "delete_collection", "delete_database",
 		"delete_document", "delete_documents", "describe_collection", "distinct", "drop_index",
 		"find_documents", "get_document", "insert_document", "insert_documents", "list_collections", "list_databases",
-		"rename_collection", "replace_document", "update_document", "update_documents", "update_schema",
+		"rename_collection", "replace_document", "server_stats", "update_document", "update_documents", "update_schema",
 		"use_database",
 	}
-	if len(want) != 25 {
+	if len(want) != 26 {
 		t.Fatalf("want lists %d tools", len(want))
 	}
 	if !slices.Equal(got, want) {

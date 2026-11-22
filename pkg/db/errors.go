@@ -1,6 +1,9 @@
 package db
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // Sentinel errors returned (usually wrapped) by the engine. Callers inspect
 // them with errors.Is.
@@ -33,4 +36,36 @@ var (
 	// non-array), a non-numeric inc value, or a field named by more than one
 	// of Set, Unset, and the operators. Nothing was written.
 	ErrInvalidUpdate = errors.New("invalid update")
+	// ErrInvalidArgument reports a query or argument the engine cannot
+	// take: an unknown filter operator, exists with a non-boolean or
+	// starts_with with a non-string value, a bad sort key, an empty
+	// Distinct field, a document id that is empty or too long, a write
+	// query of UpdateMany or DeleteMany with sort, fields, skip, or limit,
+	// or a malformed batch operation. Nothing was read or written.
+	ErrInvalidArgument = errors.New("invalid argument")
+	// ErrQueryInterrupted reports a query that compactions or index
+	// changes made start over too often; nothing is wrong with the query
+	// or the data. Retry it.
+	ErrQueryInterrupted = errors.New("query interrupted")
 )
+
+// sentinelError is an error whose text is err's alone and that also
+// matches sentinel with errors.Is, so a sentinel can be added to an
+// existing error without changing its message.
+type sentinelError struct {
+	sentinel error
+	err      error
+}
+
+func (e *sentinelError) Error() string   { return e.err.Error() }
+func (e *sentinelError) Unwrap() []error { return []error{e.sentinel, e.err} }
+
+// withSentinel returns err, unchanged in text, also matching sentinel.
+func withSentinel(sentinel, err error) error {
+	return &sentinelError{sentinel: sentinel, err: err}
+}
+
+// invalidArgf is fmt.Errorf that also matches ErrInvalidArgument.
+func invalidArgf(format string, args ...any) error {
+	return withSentinel(ErrInvalidArgument, fmt.Errorf(format, args...))
+}

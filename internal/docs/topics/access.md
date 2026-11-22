@@ -15,7 +15,7 @@ requirement every client has full access and none of this applies.
 
 | Level | Allows |
 | --- | --- |
-| `read` | `list_collections`, `describe_collection`, `find_documents`, `count_documents`, `distinct` |
+| `read` | `list_collections`, `describe_collection`, `find_documents`, `get_document`, `count_documents`, `distinct`, `server_stats` |
 | `write` | `read` plus `insert_document`, `insert_documents`, `update_document`, `update_documents`, `replace_document`, `delete_document`, `delete_documents` |
 | `admin` | `write` plus `create_collection`, `update_schema`, `rename_collection`, `delete_collection`, `create_index`, `drop_index` |
 | server admin | everything: every database, `create_database`, `delete_database`, and the user tools below |
@@ -23,10 +23,11 @@ requirement every client has full access and none of this applies.
 A grant gives one level on one database; database `*` covers every
 database, including ones created later, and the higher of the two
 applies. `copy_collection` needs `read` on the source and `admin` on the
-target database. `list_databases` shows only the databases the user can
-read, and `use_database` needs `read`. Deleting a database removes every
-grant on it, so a database created later under that name starts with
-none. A call without the needed level fails with `permission denied`,
+target database. `list_databases` and `server_stats` show only the
+databases the user can read (`server_stats` adds the server totals for
+server admins only), and `use_database` needs `read`. Deleting a
+database removes every grant on it, so a database created later under
+that name starts with none. A call without the needed level fails with `permission denied`,
 naming the user, the database, and the level (see `cachydb docs errors`).
 
 A user may have a default database: calls that give no `database` and

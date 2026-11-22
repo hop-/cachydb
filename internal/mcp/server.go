@@ -52,7 +52,8 @@ type Server struct {
 	httpAddr      string // host:port the HTTP transport listens on
 	tlsCert       string // PEM files; both set = HTTPS
 	tlsKey        string
-	version       string // build version, reported by /healthz
+	version       string    // build version, reported by /healthz
+	started       time.Time // when New created the server (server_stats uptime)
 	// defaultLimit is the find_documents limit when the call gives none;
 	// maxResultBytes caps the JSON size of its documents.
 	defaultLimit   int
@@ -189,6 +190,7 @@ func New(ctx context.Context, engine *db.Engine, cfg Config) (*Server, error) {
 		tlsCert:        cfg.Listen.TLSCert,
 		tlsKey:         cfg.Listen.TLSKey,
 		version:        cfg.Version,
+		started:        time.Now(),
 		defaultLimit:   cfg.DefaultLimit,
 		maxResultBytes: cfg.MaxResultBytes,
 		tokensRequired: cfg.TokensRequired,
@@ -539,8 +541,15 @@ func (s *Server) startHTTP(ctx context.Context) error {
 
 // toolError turns an engine error into the error a tool returns; the SDK
 // reports it to the client as a tool error (IsError) carrying the message.
-// Client errors end with a short hint on what to do next.
+// Client errors end with a short hint on what to do next. The text starts
+// with the error's stable code in brackets (errorCode, errors.go).
 func toolError(action string, err error) error {
+	return withCode(err, describeError(action, err))
+}
+
+// describeError is the text of a tool error without its code: the action,
+// the cause, and a hint.
+func describeError(action string, err error) error {
 	switch {
 	case errors.Is(err, db.ErrNotFound):
 		return fmt.Errorf("%s: %w (hint: list_databases and list_collections show what exists; current_database shows the database used when none is given)", action, err)
@@ -670,7 +679,7 @@ func (s *Server) useDatabaseTool(ctx context.Context, req *mcp.CallToolRequest, 
 		return nil, UseDatabaseOutput{}, toolError("use database", err)
 	}
 	if req.Session == nil {
-		return nil, UseDatabaseOutput{}, errors.New("use database: no MCP session")
+		return nil, UseDatabaseOutput{}, toolError("use database", errors.New("no MCP session"))
 	}
 	s.trackSession(req.Session).set(in.Name)
 	return nil, UseDatabaseOutput{
@@ -826,10 +835,10 @@ func emptyMatch(q *MatchQuery) bool {
 // limit; action names the tool in the error.
 func checkBatchQuery(action string, q *MatchQuery, all bool, limit int) error {
 	if limit < 0 {
-		return fmt.Errorf("%s: limit must not be negative, got %d", action, limit)
+		return toolError(action, invalidArgf("limit must not be negative, got %d", limit))
 	}
 	if !all && emptyMatch(q) {
-		return fmt.Errorf("%s: the query is empty and would match every document; give query.filters or query.any, or set \"all\": true", action)
+		return toolError(action, invalidArgf("the query is empty and would match every document; give query.filters or query.any, or set \"all\": true"))
 	}
 	return nil
 }
@@ -857,7 +866,7 @@ func (s *Server) updateDocumentsTool(ctx context.Context, req *mcp.CallToolReque
 	}
 	u := updateSpec(in.Updates, in.Unset, in.Inc, in.Push, in.AddToSet, in.Pull)
 	if u == nil {
-		return nil, UpdateDocumentsOutput{}, errors.New("update documents: give updates, unset, or an operator (inc, push, add_to_set, pull)")
+		return nil, UpdateDocumentsOutput{}, toolError("update documents", invalidArgf("give updates, unset, or an operator (inc, push, add_to_set, pull)"))
 	}
 	coll, err := s.getCollection(in.Database, in.Collection, "update documents")
 	if err != nil {
@@ -1042,7 +1051,7 @@ func (s *Server) updateDocumentTool(ctx context.Context, req *mcp.CallToolReques
 	}
 	u := updateSpec(in.Updates, in.Unset, in.Inc, in.Push, in.AddToSet, in.Pull)
 	if u == nil {
-		return nil, UpdateDocumentOutput{}, errors.New("update document: give updates, unset, or an operator (inc, push, add_to_set, pull)")
+		return nil, UpdateDocumentOutput{}, toolError("update document", invalidArgf("give updates, unset, or an operator (inc, push, add_to_set, pull)"))
 	}
 	u.If, u.Upsert = toDBFilters(in.If), in.Upsert
 	_, upserted, err := coll.UpdateWith(ctx, in.ID, *u)
@@ -1214,4 +1223,74 @@ func (s *Server) dropIndexTool(ctx context.Context, req *mcp.CallToolRequest, in
 		return nil, MessageOutput{}, toolError("drop index", err)
 	}
 	return nil, MessageOutput{Success: true, Message: fmt.Sprintf("Index '%s' dropped", in.IndexName)}, nil
+}
+
+// serverStatsTool reports the figures of the database asked for (its read
+// access was checked by authorizeCall), or of every database the
+// principal can read, and the server totals for server admins.
+func (s *Server) serverStatsTool(ctx context.Context, _ *mcp.CallToolRequest, in ServerStatsInput) (*mcp.CallToolResult, ServerStatsOutput, error) {
+	const action = "server stats"
+	p, ok := principalFrom(ctx)
+	if !ok {
+		return nil, ServerStatsOutput{}, toolError(action, errNoPrincipal)
+	}
+	names := []string{in.Database}
+	if in.Database == "" {
+		names = s.engine.ListDatabases()
+		if !p.Implicit {
+			readable := names[:0]
+			for _, name := range names {
+				if p.Can(name, auth.LevelRead) {
+					readable = append(readable, name)
+				}
+			}
+			names = readable
+		}
+	}
+	out := ServerStatsOutput{Success: true, Databases: []DatabaseStats{}}
+	for _, name := range names {
+		d, err := s.engine.Database(name)
+		var ds db.DatabaseStats
+		if err == nil {
+			ds, err = d.Stats(ctx)
+		}
+		if err != nil {
+			if in.Database == "" && errors.Is(err, db.ErrNotFound) {
+				continue // dropped meanwhile
+			}
+			return nil, ServerStatsOutput{}, toolError(action, err)
+		}
+		out.Databases = append(out.Databases, NewDatabaseStats(ds))
+	}
+	if p.Implicit || p.ServerAdmin {
+		srv, err := s.engine.ServerStats()
+		if err != nil {
+			return nil, ServerStatsOutput{}, toolError(action, err)
+		}
+		out.Server = &ServerTotals{
+			Version:       s.version,
+			UptimeSeconds: int64(time.Since(s.started).Seconds()),
+			WALBytes:      srv.WALBytes,
+			Cache:         NewCacheTotal(srv.Cache),
+		}
+	}
+	return nil, out, nil
+}
+
+// NewDatabaseStats converts the engine's figures of one database to the
+// server_stats form (also used by cachydb utils stats).
+func NewDatabaseStats(ds db.DatabaseStats) DatabaseStats {
+	out := DatabaseStats{Name: ds.Name, Documents: ds.Documents, DataBytes: ds.DataBytes, IndexBytes: ds.IndexBytes,
+		Collections: make([]CollectionStats, len(ds.Collections))}
+	for i, c := range ds.Collections {
+		out.Collections[i] = CollectionStats{Name: c.Name, Documents: c.Documents, DataBytes: c.DataBytes,
+			IndexBytes: c.IndexBytes, Indexes: nonNil(c.Indexes)}
+	}
+	return out
+}
+
+// NewCacheTotal converts the engine's cache figures to the server_stats
+// form.
+func NewCacheTotal(c db.CacheStats) CacheTotal {
+	return CacheTotal{Bytes: c.Bytes, MaxBytes: c.MaxBytes, Entries: c.Entries, Hits: c.Hits, Misses: c.Misses}
 }

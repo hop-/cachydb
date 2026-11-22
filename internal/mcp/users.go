@@ -206,10 +206,10 @@ func actor(ctx context.Context) string {
 func userToolError(action string, err error) error {
 	switch {
 	case errors.Is(err, db.ErrNotFound):
-		return fmt.Errorf("%s: %w (hint: list_users shows the users and their token labels)", action, err)
+		return withCode(err, fmt.Errorf("%s: %w (hint: list_users shows the users and their token labels)", action, err))
 	case errors.Is(err, auth.ErrLastServerAdmin), errors.Is(err, auth.ErrInvalidLevel):
 		// The auth message says what to do.
-		return fmt.Errorf("%s: %w", action, err)
+		return withCode(err, fmt.Errorf("%s: %w", action, err))
 	default:
 		return toolError(action, err)
 	}
@@ -302,9 +302,9 @@ func (in SetAccessInput) accessChange() (auth.AccessChange, error) {
 	c := auth.AccessChange{Database: in.Database, ServerAdmin: in.ServerAdmin, DefaultDatabase: in.DefaultDatabase}
 	switch {
 	case in.Database != "" && in.Level == "":
-		return c, errors.New("give level with database (none removes the grant)")
+		return c, invalidArgf("give level with database (none removes the grant)")
 	case in.Database == "" && in.Level != "":
-		return c, errors.New("give database with level")
+		return c, invalidArgf("give database with level")
 	case in.Level == "none":
 		c.Level = auth.LevelNone
 	case in.Level != "":
@@ -315,7 +315,7 @@ func (in SetAccessInput) accessChange() (auth.AccessChange, error) {
 		c.Level = l
 	}
 	if c.IsZero() {
-		return c, errors.New("nothing to change: give database and level, server_admin, or default_database")
+		return c, invalidArgf("nothing to change: give database and level, server_admin, or default_database")
 	}
 	return c, nil
 }

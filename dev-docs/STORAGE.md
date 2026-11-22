@@ -297,7 +297,9 @@ keyed by `(db, coll, id)` and tagged with the WAL offset, so a stale entry
 never matches a newer version. The cached pointer is never handed out:
 `Get` returns a deep clone, and `Find` clones only the documents it
 returns. A cached `Get` is ~8.5× faster than an uncached one
-(`BenchmarkGet`).
+(`BenchmarkGet`). `LRU.Stats` reports its size and atomic hit and miss counters
+(every `Get`; a disabled cache only misses), shown by `server_stats` and
+`utils stats`.
 
 ## Write path (`pkg/db/document.go`)
 

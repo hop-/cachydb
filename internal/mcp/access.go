@@ -81,6 +81,18 @@ func (in *GetDocumentInput) databaseArg() *string        { return &in.Database }
 func (in *InsertDocumentsInput) databaseArg() *string    { return &in.Database }
 func (in *UpdateDocumentsInput) databaseArg() *string    { return &in.Database }
 func (in *DeleteDocumentsInput) databaseArg() *string    { return &in.Database }
+func (in *ServerStatsInput) databaseArg() *string        { return &in.Database }
+
+// allDatabasesArg is implemented (on the pointer) by the input of a tool
+// whose empty "database" argument means every database the principal can
+// read, not the resolved default: authorizeCall then checks no database,
+// and the handler filters by the principal itself (server_stats).
+type allDatabasesArg interface {
+	databaseArg
+	allDatabases()
+}
+
+func (in *ServerStatsInput) allDatabases() {}
 
 // extraAccess of copy_collection: the copy is created in the target
 // database (the source database when target_database is empty), which
@@ -188,8 +200,12 @@ func (s *Server) authorizeCall(ctx context.Context, req *mcp.CallToolRequest, na
 	checks := []accessCheck{{level: acc.level}}
 	if a, ok := in.(databaseArg); ok {
 		arg := a.databaseArg()
-		*arg = s.databaseName(ss, p, *arg)
-		checks[0].database = *arg
+		if _, all := in.(allDatabasesArg); all && *arg == "" {
+			checks = checks[:0] // the handler shows only readable databases
+		} else {
+			*arg = s.databaseName(ss, p, *arg)
+			checks[0].database = *arg
+		}
 	}
 	if e, ok := in.(extraAccess); ok {
 		checks = append(checks, e.extraAccess()...)

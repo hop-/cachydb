@@ -150,7 +150,7 @@ every subcommand: `-R/--root`, `--wal-retention-age`,
 run recovery (WAL replay), then close the engine with a flush. They
 therefore **fail while a server is running** on the same directory. Stop
 the server first, or use `cachydb client` against it: the data commands
-(`export`, `import`, `find`, `get`) add a hint naming the `cachydb client`
+(`export`, `import`, `find`, `get`, and `stats`) add a hint naming the `cachydb client`
 command to the data-directory-in-use error (`clientHint` in `export.go`).
 `utils verify` is the exception: it takes the lock but reads the files
 without running recovery (`db.Verify`), and has no client equivalent.
@@ -176,6 +176,37 @@ Found 2 database(s):
     └─ users (2 documents)
   other (schema version: 1)
     └─ (no collections)
+```
+
+### `cachydb utils stats` (`stats.go`)
+
+The offline twin of the `server_stats` MCP tool (plan 013 §7).
+
+```bash
+cachydb utils stats [-d DB] [--format text|json] [-R DIR]
+```
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--database` | `-d` | Only this database (a missing one fails with not found) |
+| `--format` | `-f` | `text` (default) or `json` |
+
+For every database (sorted; `_system` is not listed): document count,
+data bytes, and index bytes, then per collection the same plus the index
+names (`Database.Stats`, `Collection.Stats`); then a server line with the
+build version, the WAL size, and the document cache (`Engine.ServerStats`:
+size, limit, entries, hits, misses; a freshly opened engine has an empty
+cache). `--format json` prints `{"databases": [...], "server": {"version",
+"wal_bytes", "cache"}}` with the keys of `server_stats`
+(`mcpserver.NewDatabaseStats`/`NewCacheTotal`), without `uptime_seconds`.
+The data-directory-in-use error carries a hint naming
+`cachydb client call server_stats`. `utils list -c` is unchanged.
+
+```
+main: 1 collection(s), 2 documents, data 224 bytes, index 32768 bytes
+  └─ users: 2 documents, data 224 bytes, index 32768 bytes, indexes: by_name
+
+server: version v0.1.0, WAL 331 bytes, cache 0 of 67108864 bytes (0 documents), 0 hits, 0 misses
 ```
 
 ### `cachydb utils migrate`
@@ -395,7 +426,7 @@ main.go → cmd.Execute()
       newBuilder() … Build(ctx)         # db.Open + mcp.NewServer
       App.Start(ctx)                    # until signal / stdin EOF (exit 0) / error
       App.Stop(WithoutCancel(ctx))      # 10s: sessions, Engine.Close
-    runList / runMigrate                # utils: withEngine(Open … Close)
+    runList / runMigrate / utils stats  # utils: withEngine(Open … Close)
     utils user …                        # withUsers: withEngine + auth.Open (creates _system)
     utils export/import/find/get        # withEngine; exportfmt.Engine adapter
     utils verify                        # db.Verify: lock, read-only checks (or rebuild); no recovery

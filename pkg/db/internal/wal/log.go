@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -648,4 +649,25 @@ func readSegment(path string, from, limit uint64, expected *uint64, fn func(Reco
 		}
 	}
 	return nil
+}
+
+// Size returns the total size in bytes of the WAL segment files in the
+// log's directory. A segment retention removes meanwhile is not counted.
+func (l *Log) Size() (int64, error) {
+	segs, err := listSegments(l.dir)
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, s := range segs {
+		fi, err := os.Stat(s.path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return 0, fmt.Errorf("wal: %w", err)
+		}
+		total += fi.Size()
+	}
+	return total, nil
 }

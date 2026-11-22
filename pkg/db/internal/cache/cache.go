@@ -11,6 +11,7 @@ package cache
 import (
 	"container/list"
 	"sync"
+	"sync/atomic"
 )
 
 // entryOverhead is the fixed number of bytes charged per entry on top of
@@ -37,6 +38,26 @@ type LRU[V any] struct {
 	sizeOf   func(V) int64
 	ll       *list.List // front = most recently used; elements hold *entry[V]
 	items    map[Key]*list.Element
+
+	hits, misses atomic.Uint64 // Get outcomes since New
+}
+
+// Stats is a snapshot of an LRU's size and its Get outcomes.
+type Stats struct {
+	Bytes    int64  // bytes charged by the cached entries
+	MaxBytes int64  // the byte budget (0: the cache is disabled)
+	Entries  int    // number of cached entries
+	Hits     uint64 // Get calls that returned a value
+	Misses   uint64 // Get calls that did not (also every Get of a disabled cache)
+}
+
+// Stats returns the cache's current size and its hit and miss counts.
+func (c *LRU[V]) Stats() Stats {
+	c.mu.Lock()
+	st := Stats{Bytes: c.used, MaxBytes: c.maxBytes, Entries: len(c.items)}
+	c.mu.Unlock()
+	st.Hits, st.Misses = c.hits.Load(), c.misses.Load()
+	return st
 }
 
 // New returns a concurrency-safe LRU bounded by maxBytes. sizeOf returns
@@ -63,7 +84,18 @@ func entrySize(k Key, valueSize int64) int64 {
 // Get returns the cached value for k. It hits only if the cached entry was
 // stored with the same walOffset; a hit marks the entry most recently used.
 // The returned value is shared with the cache and must not be mutated.
+// Every call counts as a hit or a miss (see Stats).
 func (c *LRU[V]) Get(k Key, walOffset uint64) (V, bool) {
+	v, ok := c.get(k, walOffset)
+	if ok {
+		c.hits.Add(1)
+	} else {
+		c.misses.Add(1)
+	}
+	return v, ok
+}
+
+func (c *LRU[V]) get(k Key, walOffset uint64) (V, bool) {
 	var zero V
 	if c.maxBytes <= 0 {
 		return zero, false

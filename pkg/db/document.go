@@ -140,7 +140,7 @@ func (c *Collection) prepareInsert(doc *Document, id, ts string) (*docWrite, err
 		id = uuid.NewV7().String()
 	}
 	if len(id) > maxIDLen {
-		return nil, fmt.Errorf("inserting document: id is %d bytes, max %d", len(id), maxIDLen)
+		return nil, invalidArgf("inserting document: id is %d bytes, max %d", len(id), maxIDLen)
 	}
 	data := resolveNowData(doc.Data, ts)
 	return &docWrite{id: id, build: func(cur *Document) (*Document, error) {
@@ -371,10 +371,10 @@ func (c *Collection) checkCondition(id string, cur *Document, cond []compiledFil
 // checkDocID checks that id can be stored.
 func checkDocID(id string) error {
 	if id == "" {
-		return errors.New("document id must not be empty")
+		return invalidArgf("document id must not be empty")
 	}
 	if len(id) > maxIDLen {
-		return fmt.Errorf("id is %d bytes, max %d", len(id), maxIDLen)
+		return invalidArgf("id is %d bytes, max %d", len(id), maxIDLen)
 	}
 	return nil
 }

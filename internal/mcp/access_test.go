@@ -314,6 +314,7 @@ func TestAccessTableEveryTool(t *testing.T) {
 		{tool: "count_documents", registered: auth.LevelRead, need: auth.LevelRead, args: in(nil)},
 		{tool: "distinct", registered: auth.LevelRead, need: auth.LevelRead, args: in(map[string]any{"field": "x"})},
 		{tool: "get_document", registered: auth.LevelRead, need: auth.LevelRead, args: in(map[string]any{"id": "d1"})},
+		{tool: "server_stats", registered: auth.LevelRead, need: auth.LevelRead, args: map[string]any{"database": accessDB}},
 
 		{tool: "insert_document", registered: auth.LevelWrite, need: auth.LevelWrite, args: in(map[string]any{"document": map[string]any{"_id": "d2", "x": 2}})},
 		{tool: "update_document", registered: auth.LevelWrite, need: auth.LevelWrite, args: in(map[string]any{"id": "d1", "updates": map[string]any{"x": 5}})},
@@ -364,7 +365,7 @@ func TestAccessTableEveryTool(t *testing.T) {
 	}
 	slices.Sort(listed)
 	slices.Sort(tabled)
-	if len(listed) != 32 || !slices.Equal(listed, tabled) || !slices.Equal(slices.Sorted(maps.Keys(specs)), tabled) {
+	if len(listed) != 33 || !slices.Equal(listed, tabled) || !slices.Equal(slices.Sorted(maps.Keys(specs)), tabled) {
 		t.Fatalf("access table rows %v\nregistered tools %v\nspecs %v\n(add a row for every new tool)", tabled, listed, slices.Sorted(maps.Keys(specs)))
 	}
 
@@ -745,18 +746,18 @@ func TestAuthOffDeleteDatabaseForgetsGrants(t *testing.T) {
 	}
 }
 
-// TestAuthOffToolsListExactly25: with authentication off (stdio, and
-// loopback HTTP with an auth store present) tools/list is exactly the 25
+// TestAuthOffToolsListExactly26: with authentication off (stdio, and
+// loopback HTTP with an auth store present) tools/list is exactly the 26
 // tools every server registers: no whoami, no admin tools, and the list
 // is not marked private.
-func TestAuthOffToolsListExactly25(t *testing.T) {
-	want := make([]string, 0, 25)
+func TestAuthOffToolsListExactly26(t *testing.T) {
+	want := make([]string, 0, 26)
 	for _, tool := range ToolDefinitions() {
 		want = append(want, tool.Name)
 	}
 	slices.Sort(want)
-	if len(want) != 25 {
-		t.Fatalf("ToolDefinitions has %d tools, want 25", len(want))
+	if len(want) != 26 {
+		t.Fatalf("ToolDefinitions has %d tools, want 26", len(want))
 	}
 	check := func(t *testing.T, cs *mcp.ClientSession) {
 		t.Helper()
@@ -792,8 +793,8 @@ func TestAuthOffToolsListExactly25(t *testing.T) {
 	})
 }
 
-// TestAuthToolsListPerPrincipal: with tokens, a server admin lists 32
-// tools and any other user 26 (the admin tools hidden), both marked
+// TestAuthToolsListPerPrincipal: with tokens, a server admin lists 33
+// tools and any other user 27 (the admin tools hidden), both marked
 // private; the hidden tools are still refused when called.
 func TestAuthToolsListPerPrincipal(t *testing.T) {
 	env := newAuthEnv(t)
@@ -805,7 +806,7 @@ func TestAuthToolsListPerPrincipal(t *testing.T) {
 		user   string
 		n      int
 		admins bool
-	}{{"root", 32, true}, {"alice", 26, false}} {
+	}{{"root", 33, true}, {"alice", 27, false}} {
 		t.Run(tt.user, func(t *testing.T) {
 			res, err := env.as(t, tt.user).ListTools(context.Background(), nil)
 			if err != nil {
@@ -831,14 +832,14 @@ func TestAuthToolsListPerPrincipal(t *testing.T) {
 			}
 		})
 	}
-	// Promotion applies at once: the same session now sees 32.
+	// Promotion applies at once: the same session now sees 33.
 	alice := env.as(t, "alice")
-	if n := len(listTools(t, alice)); n != 26 {
+	if n := len(listTools(t, alice)); n != 27 {
 		t.Fatalf("before promotion: %d tools", n)
 	}
 	env.setAccess(t, "alice", true, nil)
-	if n := len(listTools(t, alice)); n != 32 {
-		t.Fatalf("after promotion: %d tools, want 32", n)
+	if n := len(listTools(t, alice)); n != 33 {
+		t.Fatalf("after promotion: %d tools, want 33", n)
 	}
 }
 
@@ -868,8 +869,8 @@ func TestAuthWhoami(t *testing.T) {
 	if u, _ := out["user"].(string); !strings.Contains(u, "no token") || out["server_admin"] != true {
 		t.Fatalf("implicit whoami = %v", out)
 	}
-	if n := len(listTools(t, cs)); n != 32 {
-		t.Fatalf("implicit principal lists %d tools, want 32", n)
+	if n := len(listTools(t, cs)); n != 33 {
+		t.Fatalf("implicit principal lists %d tools, want 33", n)
 	}
 }
 

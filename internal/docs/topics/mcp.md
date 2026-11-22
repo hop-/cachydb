@@ -247,6 +247,7 @@ retry.
 | Writing | `insert_document`, `update_document` (`updates`, `unset`, `inc`, `push`, `add_to_set`, `pull`, `if`, `upsert`), `replace_document`, `delete_document` (`if`) |
 | Writing many (atomic) | `insert_documents` (`documents`), `update_documents` (`query`, `updates`, `unset`, `inc`, `push`, `add_to_set`, `pull`, `limit`, `all`), `delete_documents` (`query`, `limit`, `all`) |
 | Reading | `get_document` (`id`, `fields`), `find_documents` (`filters`, `any`, `sort`, `fields`, `limit`, `skip`, `explain`; result `has_more`, `next_skip`, `plan`), `count_documents`, `distinct` |
+| Statistics | `server_stats` (`database`; per collection documents, data and index bytes, index names; server admins also get WAL size, cache hits and misses, version, uptime) |
 | Users (only when the server requires tokens) | `whoami` (everyone); `list_users`, `create_user`, `set_access`, `create_token`, `revoke_token`, `delete_user` (server admins; hidden from other users) |
 
 `cachydb docs tools` has every schema and an example call; the user tools
@@ -279,6 +280,14 @@ update makes documents stop matching the query (for example, update
 updates the same first documents again. `matched` counts the documents
 selected and `modified` / `deleted` those written; a document another
 writer changed so it no longer matches is skipped.
+
+## Errors
+
+Every tool error starts with a stable code in brackets, for example
+`[not_found]`, `[invalid_argument]`, `[permission_denied]`, or
+`[limit_exceeded]`; branch on it, not on the message. Only arguments that
+fail the input schema come back as `validating "arguments": …` without a
+code. `cachydb docs errors` lists every code and what to do.
 
 ## Self-description
 

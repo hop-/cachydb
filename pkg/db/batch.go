@@ -189,7 +189,7 @@ func (c *Collection) UpdateMany(ctx context.Context, q *Query, u UpdateSpec, lim
 	}
 	defer e.exit()
 	if u.Upsert {
-		return 0, 0, errors.New("updating documents: upsert is not supported by UpdateMany; use UpdateWith")
+		return 0, 0, invalidArgf("updating documents: upsert is not supported by UpdateMany; use UpdateWith")
 	}
 	if p := updateFieldsProblem(u); p != "" {
 		return 0, 0, fmt.Errorf("%w: updating documents: %s", ErrSchemaValidation, p)
@@ -268,7 +268,7 @@ func compileWriteQuery(q *Query, extra Condition, what string) (*Query, *compile
 		q = &Query{}
 	}
 	if len(q.Sort) > 0 || len(q.Fields) > 0 || q.Skip != 0 || q.Limit != 0 {
-		return nil, nil, fmt.Errorf("%s: only the query's filters and any apply; sort, fields, skip, and limit are not allowed (pass the limit to the call)", what)
+		return nil, nil, invalidArgf("%s: only the query's filters and any apply; sort, fields, skip, and limit are not allowed (pass the limit to the call)", what)
 	}
 	wq := &Query{Filters: slices.Concat(q.Filters, extra), Any: q.Any}
 	cq, err := compileQuery(wq)
@@ -336,17 +336,17 @@ func (c *Collection) prepareOp(op *WriteOp, ts string) (*docWrite, error) {
 	switch op.Kind {
 	case OpInsert:
 		if hasUpdate || len(op.If) > 0 {
-			return nil, fmt.Errorf("%s: Update and If must be empty", op.Kind)
+			return nil, invalidArgf("%s: Update and If must be empty", op.Kind)
 		}
 		return c.prepareInsert(op.Document, op.ID, ts)
 	case OpUpdate:
 		if op.Document != nil {
-			return nil, fmt.Errorf("%s: Document must be nil; use Update", op.Kind)
+			return nil, invalidArgf("%s: Document must be nil; use Update", op.Kind)
 		}
 		return c.prepareUpdate(op.ID, op.Update, op.If, ts)
 	case OpReplace:
 		if hasUpdate {
-			return nil, fmt.Errorf("%s: Update must be empty; use Document and If", op.Kind)
+			return nil, invalidArgf("%s: Update must be empty; use Document and If", op.Kind)
 		}
 		id := op.ID
 		if id == "" && op.Document != nil {
@@ -355,11 +355,11 @@ func (c *Collection) prepareOp(op *WriteOp, ts string) (*docWrite, error) {
 		return c.prepareReplace(id, op.Document, op.If, ts)
 	case OpDelete:
 		if op.Document != nil || hasUpdate {
-			return nil, fmt.Errorf("%s: Document and Update must be empty", op.Kind)
+			return nil, invalidArgf("%s: Document and Update must be empty", op.Kind)
 		}
 		return c.prepareDelete(op.ID, op.If, ts)
 	default:
-		return nil, fmt.Errorf("unknown operation kind %d", uint8(op.Kind))
+		return nil, invalidArgf("unknown operation kind %d", uint8(op.Kind))
 	}
 }
 

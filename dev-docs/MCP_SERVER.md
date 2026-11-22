@@ -88,7 +88,7 @@ Every tool has an access level (`internal/mcp/access.go`), passed to
 | Access | Tools |
 | --- | --- |
 | none | `list_databases` (lists only databases the principal can read), `current_database`, `use_database` (the target must be readable; checked before existence) |
-| read | `list_collections`, `describe_collection`, `find_documents`, `get_document`, `count_documents`, `distinct`; `copy_collection` on its source |
+| read | `list_collections`, `describe_collection`, `find_documents`, `get_document`, `count_documents`, `distinct`; `copy_collection` on its source; `server_stats` on its `database` argument (without one it checks no database and shows only readable ones) |
 | write | `insert_document`, `insert_documents`, `update_document`, `update_documents`, `replace_document`, `delete_document`, `delete_documents` |
 | admin | `create_collection`, `update_schema`, `rename_collection`, `delete_collection`, `create_index`, `drop_index`; `copy_collection` on its target (`target_database`, else the source database) |
 | server | `create_database`, `delete_database` (which then calls `Store.ForgetDatabase` whenever the server has a store, also with auth off), and the six admin user tools |
@@ -105,7 +105,10 @@ tools are authorized:
 2. **Database**: inputs with a `database` argument implement
    `databaseArg` (on the pointer); the wrapper resolves it (see below) and
    writes the resolved name back, so the handler acts on exactly the
-   database that was checked. `copy_collection` also implements
+   database that was checked. An input that also implements
+   `allDatabasesArg` (`server_stats`) is the exception: an empty
+   argument means every readable database, so it is not resolved and no
+   database is checked; the handler filters by the principal. `copy_collection` also implements
    `extraAccess` for its target.
 3. **Check**: `Store.Authorize` for each requirement (it re-reads the
    user's current grants, so a revoke applies to the next call). A denied
@@ -125,7 +128,7 @@ none) and the admin tools `list_users`, `create_user`, `set_access`,
 `create_token`, `revoke_token`, `delete_user` (access server, marked
 `adminOnly`). `registerTools` validates them always but registers them
 only when `Config.TokensRequired`, so a server with authentication off
-lists exactly the 25 tools every server registers (the 21 from before plan 013 plus the 4 document tools of stage 5). With tokens required, the
+lists exactly the 26 tools every server registers (the 21 from before plan 013 plus the 4 document tools and `server_stats` of stage 5). With tokens required, the
 receiving middleware `filterToolsList` sets `cacheScope: "private"` on
 every `tools/list` result (the list differs per user) and removes the
 admin tools unless the request's principal (`principalOf`, the same
@@ -212,7 +215,7 @@ transport has no health endpoint.
 
 1. `app.Builder.Build` opens the engine (`db.Open`: lock, recovery).
 2. `NewServer(ctx, engine, defaultDBName, transport, httpAddr, version)`
-   creates the default database if missing, registers the 25 tools (32
+   creates the default database if missing, registers the 26 tools (33
    with tokens required: plus `whoami` and the six admin tools) and the
    9 docs resources, and sets the server instructions and the
    implementation version (the build version, from `cmd.getVersion`).
@@ -238,7 +241,7 @@ resolves its database in this order (`Server.databaseName`, applied by
    principal is the implicit full-access one, which has none);
 4. the server default (`main`).
 
-## Tools (25, plus the user tools)
+## Tools (26, plus the user tools)
 
 Tools are defined once in `internal/mcp/tools.go` (`toolSpecs`): name,
 description, annotations, typed input and output structs, and an example
@@ -257,7 +260,7 @@ Annotations (all tools also set `openWorldHint: false` and a title):
 
 | Tool(s) | readOnly | destructive | idempotent |
 |---------|----------|-------------|------------|
-| `list_databases`, `list_collections`, `find_documents`, `get_document`, `current_database`, `count_documents`, `distinct`, `describe_collection` | true | — | true |
+| `list_databases`, `list_collections`, `find_documents`, `get_document`, `current_database`, `count_documents`, `distinct`, `describe_collection`, `server_stats` | true | — | true |
 | `create_database`, `use_database`, `replace_document`, `update_schema` | false | false | true |
 | `create_collection`, `insert_document`, `insert_documents`, `create_index`, `update_document`, `update_documents`, `rename_collection`, `copy_collection` | false | false | false |
 | `delete_document`, `delete_documents`, `delete_database`, `delete_collection`, `drop_index` | false | true | true |
@@ -265,7 +268,7 @@ Annotations (all tools also set `openWorldHint: false` and a title):
 | Tool | Arguments | Result fields |
 |------|-----------|---------------|
 | `create_database` | `name` | `message`. An existing name succeeds (no-op) |
-| `list_databases` | — | `databases` (sorted; `[]` when empty) |
+| `list_databases` | — | `databases` the caller can read (sorted; `[]` when empty; every database with auth off) |
 | `delete_database` | `name` | `message` |
 | `use_database` | `name` (must exist) | `message`, `current_database` |
 | `current_database` | — | `current_database` (session choice or default) |
@@ -289,6 +292,7 @@ Annotations (all tools also set `openWorldHint: false` and a title):
 | `delete_documents` | `collection`, `query`? (`filters`, `any`), `limit`?, `all`?, `database`? | `matched`, `deleted` |
 | `create_index` | `collection`, `index_name`, `field_name`, `unique`?, `database`? | `message` |
 | `drop_index` | `collection`, `index_name`, `database`? | `message` (`ErrNotFound` if missing) |
+| `server_stats` | `database`? | `databases` [`{name, documents, data_bytes, index_bytes, collections: [{name, documents, data_bytes, index_bytes, indexes}]}`], `server` (admins only) |
 
 `?` = optional. Handlers are thin: each resolves the database (see
 above) and calls one engine method (`UpdateWith`, `Replace`,
@@ -457,6 +461,23 @@ index '<name>' created". `describe_collection` reports `unique: true` on
 such an index (omitted otherwise, so the output for existing indexes is
 unchanged), and `cachydb client export`/`import` carry it (F-016).
 
+### `server_stats`
+
+Plan 013 §7. With `database`, that database (read access checked by
+`authorizeCall`; a missing one is `not_found`); without it, every
+database the principal can read (`p.Can(name, read)`; all with auth off),
+sorted, skipping one dropped meanwhile. Each comes from
+`Database.Stats`: per collection `Collection.Stats` (document count,
+`data_bytes` = the record bytes of its data segments from the index
+file's accounting, which include superseded versions until compaction and
+exclude changes still only in the WAL; `index_bytes` = the `index.db`
+file size; index names), and per database the sums. `server` is set only
+for a server admin or the implicit principal (auth off): `version`,
+`uptime_seconds` (since `New`), `wal_bytes` (`Engine.ServerStats`: the WAL
+segment files), and `cache` (`bytes`, `max_bytes`, `entries`, `hits`,
+`misses`; the counters of `pkg/db/internal/cache`, since `Open`).
+`cachydb utils stats` prints the same offline (see [CLI.md](CLI.md)).
+
 ## Self-description
 
 - **Instructions**: `ServerOptions.Instructions` is `Instructions()` in
@@ -481,15 +502,46 @@ tool error starting `validating "arguments":` that names the property and,
 for enums, lists the valid values (for example `enum: like does not equal
 any of: [eq ne gt gte lt lte in contains has has_any has_all]`). Unknown properties are rejected too
 (`additionalProperties: false`), which catches `filter` instead of
-`query.filters`.
+`query.filters`. These are the only tool errors without a code.
 
 Handler errors are returned to the client as tool errors (`isError: true`)
-whose text names the action and the cause (`toolError` in `server.go`):
+through `toolError` (or `userToolError`), whose text is
+`[<code>] <action>: <cause>[ (hint: …)]` (plan 013 §6, `internal/mcp/errors.go`).
+`errorCode` maps the error with `errors.Is`, in the same order as the hints,
+so the code and the hint agree; the returned `*codedError` wraps the
+described error, so `errors.Is` still finds the engine sentinel. Errors a
+handler finds itself (an empty batch query, a negative `limit`, nothing to
+update, `set_access` argument mistakes) are `invalidArgf` errors, which
+match `db.ErrInvalidArgument`. `ErrorCodes` lists the codes and
+`ErrorCodeOf(text)` parses one (the test helper `call` checks every tool
+error of the suite with it).
+
+| Code | From |
+| --- | --- |
+| `not_found` | `ErrNotFound` |
+| `already_exists` | `ErrExists` |
+| `invalid_name` | `ErrInvalidName` |
+| `invalid_argument` | `ErrInvalidArgument` (invalid query, sort key, `distinct` field, empty or too long id, malformed batch operation; handler argument checks), `ErrInvalidUpdate`, `auth.ErrInvalidLevel`, `auth.ErrLastServerAdmin` |
+| `schema_violation` | `ErrSchemaValidation` |
+| `unique_violation` | `ErrUniqueViolation` |
+| `condition_failed` | `ErrConditionFailed` |
+| `limit_exceeded` | `ErrBatchTooLarge` (the message keeps the limit or the match count) |
+| `permission_denied` | `auth.ErrPermissionDenied`, `auth.ErrUnauthenticated` |
+| `unavailable` | `ErrClosed`, `ErrWALFailed`, `ErrWALCorrupt`, `ErrQueryInterrupted` |
+| `cancelled` | `context.Canceled`, `context.DeadlineExceeded` |
+| `internal` | anything else |
+
+A `*db.BatchItemError` takes the code of the error it wraps;
+`insert_documents` names the item as `documents[<i>]`, and
+`UpdateMany`/`DeleteMany` return the item's error, which names the document.
+
+Message shapes after the code:
 
 | Engine error | Message shape |
 |--------------|---------------|
 | `ErrNotFound` | `<action>: <engine message> (hint: list_databases and list_collections show what exists; …)` |
 | `ErrSchemaValidation` | `<action>: <engine message> (hint: see resource cachydb://docs/schema)` |
+| `ErrInvalidUpdate` | `<action>: <engine message> (hint: get_document shows the field's current value; …)` |
 | `ErrConditionFailed` | `<action>: condition failed: document <id> no longer matches if; re-read it and retry` |
 | `ErrExists`, `ErrInvalidName` | `<action>: <engine message>` |
 | `ErrClosed` | `<action>: the database engine is shut down: …` |

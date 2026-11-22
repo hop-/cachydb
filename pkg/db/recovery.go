@@ -399,8 +399,8 @@ func (c *Collection) rebuildIndex(ctx context.Context) (_ *idxstore.Store, err e
 			return nil
 		}
 		if len(r.ID) > idxstore.MaxIDLen {
-			return fmt.Errorf("collection %q in database %q: a document id of %d bytes in data segment %d is longer than the limit of %d bytes; this version cannot index it",
-				c.name, c.db.name, len(r.ID), loc.Seg, idxstore.MaxIDLen)
+			return withSentinel(ErrIncompatibleDataDir, fmt.Errorf("collection %q in database %q: a document id of %d bytes in data segment %d is longer than the limit of %d bytes; this version cannot index it",
+				c.name, c.db.name, len(r.ID), loc.Seg, idxstore.MaxIDLen))
 		}
 		if prev, ok := newest[r.ID]; ok && prev.ke.WALOffset >= r.WALOffset {
 			return nil
@@ -936,7 +936,7 @@ func (c *Collection) replayDoc(r wal.Record) (bool, error) {
 // hold longer ids, which this version cannot store, so replay fails.
 func checkReplayID(id string) error {
 	if len(id) > maxIDLen {
-		return fmt.Errorf("the document id is %d bytes, longer than the limit of %d bytes; this version cannot store it", len(id), maxIDLen)
+		return withSentinel(ErrIncompatibleDataDir, fmt.Errorf("the document id is %d bytes, longer than the limit of %d bytes; this version cannot store it", len(id), maxIDLen))
 	}
 	return nil
 }

@@ -156,6 +156,7 @@ func TestToolAnnotationsAndOutputSchemas(t *testing.T) {
 		"insert_documents": {},
 		"update_documents": {},
 		"delete_documents": {destructive: true, idempotent: true},
+		"server_stats":     {readOnly: true, idempotent: true},
 	}
 	tools := listTools(t, connect(t, newTestServer(t)))
 	if len(tools) != len(want) {
@@ -246,7 +247,7 @@ func TestToolExamplesAreValid(t *testing.T) {
 		"create_collection", "list_collections", "insert_document", "insert_documents",
 		"get_document", "find_documents", "count_documents", "distinct", "update_document",
 		"update_documents", "replace_document", "create_index", "describe_collection",
-		"update_schema", "copy_collection", "rename_collection", "delete_collection",
+		"server_stats", "update_schema", "copy_collection", "rename_collection", "delete_collection",
 		"drop_index", "delete_documents", "delete_document", "delete_database",
 	}
 	if len(order) != len(examples) {

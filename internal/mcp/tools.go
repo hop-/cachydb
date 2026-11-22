@@ -352,6 +352,51 @@ type CopyCollectionOutput struct {
 	Copied  int    `json:"copied" jsonschema:"Number of documents copied"`
 }
 
+type ServerStatsInput struct {
+	Database string `json:"database,omitempty" jsonschema:"Only this database; omit for every database you can read (the session's database choice does not apply)"`
+}
+
+type ServerStatsOutput struct {
+	Success   bool            `json:"success" jsonschema:"Always true on success"`
+	Databases []DatabaseStats `json:"databases" jsonschema:"The database asked for, or every database the caller can read, sorted by name"`
+	Server    *ServerTotals   `json:"server,omitempty" jsonschema:"Server-wide figures; only for server admins (everyone when the server requires no tokens)"`
+}
+
+// DatabaseStats is one database of server_stats.
+type DatabaseStats struct {
+	Name        string            `json:"name" jsonschema:"Database name"`
+	Documents   int64             `json:"documents" jsonschema:"Documents in all its collections"`
+	DataBytes   int64             `json:"data_bytes" jsonschema:"Sum of the collections' data_bytes"`
+	IndexBytes  int64             `json:"index_bytes" jsonschema:"Sum of the collections' index_bytes"`
+	Collections []CollectionStats `json:"collections" jsonschema:"Its collections, sorted by name"`
+}
+
+// CollectionStats is one collection of server_stats.
+type CollectionStats struct {
+	Name       string   `json:"name" jsonschema:"Collection name"`
+	Documents  int      `json:"documents" jsonschema:"Number of documents"`
+	DataBytes  int64    `json:"data_bytes" jsonschema:"Bytes of records in its data segments (superseded versions until compaction; recent changes still only in the write-ahead log are not counted)"`
+	IndexBytes int64    `json:"index_bytes" jsonschema:"Size of its index file (the id table and every secondary index)"`
+	Indexes    []string `json:"indexes" jsonschema:"Secondary index names, sorted"`
+}
+
+// ServerTotals is the server part of server_stats.
+type ServerTotals struct {
+	Version       string     `json:"version" jsonschema:"Server build version"`
+	UptimeSeconds int64      `json:"uptime_seconds" jsonschema:"Seconds since the server started"`
+	WALBytes      int64      `json:"wal_bytes" jsonschema:"Size of the write-ahead log files"`
+	Cache         CacheTotal `json:"cache" jsonschema:"The document cache"`
+}
+
+// CacheTotal describes the document cache in server_stats.
+type CacheTotal struct {
+	Bytes    int64  `json:"bytes" jsonschema:"Bytes the cached documents take"`
+	MaxBytes int64  `json:"max_bytes" jsonschema:"Cache size limit (0: disabled)"`
+	Entries  int    `json:"entries" jsonschema:"Number of cached documents"`
+	Hits     uint64 `json:"hits" jsonschema:"Document reads served from the cache since start"`
+	Misses   uint64 `json:"misses" jsonschema:"Document reads that went to disk since start"`
+}
+
 // toolSpec is one tool: its definition, the access level it needs, an
 // example call, and how to register its handler.
 type toolSpec struct {
@@ -452,7 +497,7 @@ func newSpec[In, Out any](
 func toolSpecs() []toolSpec {
 	return []toolSpec{
 		newSpec("list_databases",
-			"List every database on this server, sorted by name.",
+			"List the databases you can read, sorted by name (every database when the server requires no tokens).",
 			readOnly("List databases"), accessNone, map[string]any{},
 			func(s *Server) mcp.ToolHandlerFor[ListDatabasesInput, ListDatabasesOutput] {
 				return s.listDatabasesTool
@@ -621,6 +666,11 @@ func toolSpecs() []toolSpec {
 			writing("Drop index", true, true), accessAdmin,
 			map[string]any{"collection": "products", "index_name": "by_name"},
 			func(s *Server) mcp.ToolHandlerFor[DropIndexInput, MessageOutput] { return s.dropIndexTool }),
+		newSpec("server_stats",
+			"Report, for one database or every database you can read, each collection's document count, data bytes, index bytes, and index names, with per-database totals. Server admins (everyone when the server requires no tokens) also get the write-ahead log size, the document cache's size, hits, and misses, the version, and the uptime.",
+			readOnly("Server statistics"), accessRead,
+			map[string]any{"database": "shop"},
+			func(s *Server) mcp.ToolHandlerFor[ServerStatsInput, ServerStatsOutput] { return s.serverStatsTool }),
 	}
 }
 

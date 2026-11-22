@@ -21,7 +21,7 @@ server instructions, and `cachydb://docs/<topic>` resources.
 
 - [DATABASE_ENGINE.md](DATABASE_ENGINE.md) — `pkg/db` public API, documents, schemas, query and index semantics, migrations
 - [STORAGE.md](STORAGE.md) — on-disk layout and formats, WAL, data segments, flush, recovery, compaction, lock order
-- [MCP_SERVER.md](MCP_SERVER.md) — the 25 MCP tools (plus the user tools with tokens), auth modes, tool access, transports, sessions, errors
+- [MCP_SERVER.md](MCP_SERVER.md) — the 26 MCP tools (plus the user tools with tokens), auth modes, tool access, transports, sessions, errors
 - [CLI.md](CLI.md) — commands (incl. `docs`, `version --json`), flags, environment variables, known issues
 - [DEVELOPMENT.md](DEVELOPMENT.md) — coding patterns, testing, benchmarks, known limitations
 
@@ -40,7 +40,7 @@ server instructions, and `cachydb://docs/<topic>` resources.
 │ bootstrap token, Start / Stop   │             │
 └───────────────┬─────────────────┘             │
 ┌───────────────▼─────────────────┐             │
-│ internal/mcp (25 tools + 7 user │             │
+│ internal/mcp (26 tools + 7 user │             │
 │ tools with tokens), tool access │             │
 │ stdio | Streamable HTTP (/mcp)  │             │
 │ per-session use_database        │             │

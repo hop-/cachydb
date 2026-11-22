@@ -184,7 +184,7 @@ func (c *Collection) find(ctx context.Context, q *Query) ([]*Document, int, erro
 
 // retryErr is the error of a query that had to start over too often.
 func (c *Collection) retryErr() error {
-	return fmt.Errorf("collection %q: the query was interrupted by compactions or index changes %d times; retry it", c.name, maxReadRetries+1)
+	return withSentinel(ErrQueryInterrupted, fmt.Errorf("collection %q: the query was interrupted by compactions or index changes %d times; retry it", c.name, maxReadRetries+1))
 }
 
 // compiledQuery is a query compiled once per call: $now values resolved,
@@ -275,7 +275,7 @@ func normalizeSort(keys []SortKey) ([]SortKey, error) {
 	out := make([]SortKey, len(keys))
 	for i, k := range keys {
 		if k.Field == "" {
-			return nil, fmt.Errorf("sort key %d: field must not be empty", i)
+			return nil, invalidArgf("sort key %d: field must not be empty", i)
 		}
 		switch strings.ToLower(k.Order) {
 		case "", orderAsc:
@@ -283,7 +283,7 @@ func normalizeSort(keys []SortKey) ([]SortKey, error) {
 		case orderDesc:
 			k.Order = orderDesc
 		default:
-			return nil, fmt.Errorf("sort key %q: order %q must be asc or desc", k.Field, k.Order)
+			return nil, invalidArgf("sort key %q: order %q must be asc or desc", k.Field, k.Order)
 		}
 		out[i] = k
 	}
@@ -957,7 +957,7 @@ func (c *Collection) Distinct(ctx context.Context, field string, q *Query) ([]an
 // read (0 for the index path).
 func (c *Collection) distinct(ctx context.Context, field string, q *Query) ([]any, int, error) {
 	if field == "" {
-		return nil, 0, fmt.Errorf("distinct: field must not be empty")
+		return nil, 0, invalidArgf("distinct: field must not be empty")
 	}
 	e := c.db.e
 	if err := e.enter(); err != nil {
